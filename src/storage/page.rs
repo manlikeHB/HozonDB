@@ -59,7 +59,17 @@ impl PageManager {
 
     /// Allocate a new page and return its ID
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
-        todo!("Implement this!")
+        let page_id: PageId = self.num_pages;
+        self.num_pages += 1;
+
+        let new_size = (self.num_pages as u64) * (PAGE_SIZE as u64);
+        self.file.set_len(new_size)?;
+
+        let num_pages_bytes = self.num_pages.to_le_bytes();
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file.write_all(&num_pages_bytes)?;
+
+        Ok(page_id)
     }
 
     /// Write data to a specific page
@@ -100,5 +110,30 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_file("test.db");
+    }
+
+    #[test]
+    fn test_allocate_page() {
+        let _ = fs::remove_file("test_alloc.db");
+
+        let mut pm = PageManager::new("test_alloc.db").unwrap();
+        assert_eq!(pm.num_pages(), 1);
+
+        // Allocate first page
+        let page_id = pm.allocate_page().unwrap();
+        assert_eq!(page_id, 1); // Page 0 is header, so first data page is 1
+        assert_eq!(pm.num_pages(), 2);
+
+        // Allocate second page
+        let page_id = pm.allocate_page().unwrap();
+        assert_eq!(page_id, 2);
+        assert_eq!(pm.num_pages(), 3);
+
+        // Close and reopen - should remember the page count
+        drop(pm);
+        let pm = PageManager::new("test_alloc.db").unwrap();
+        assert_eq!(pm.num_pages(), 3);
+
+        let _ = fs::remove_file("test_alloc.db");
     }
 }
