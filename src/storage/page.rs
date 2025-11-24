@@ -110,14 +110,14 @@ impl PageManager {
         self.num_pages += 1;
 
         let new_size = (self.num_pages as u64) * (PAGE_SIZE as u64);
-
-        let mut file = { self.file.lock().unwrap() };
-
-        file.set_len(new_size)?;
-
         let num_pages_bytes = self.num_pages.to_le_bytes();
-        file.seek(SeekFrom::Start(4))?;
-        file.write_all(&num_pages_bytes)?;
+
+        {
+            let mut file = self.file.lock().unwrap();
+            file.set_len(new_size)?;
+            file.seek(SeekFrom::Start(4))?;
+            file.write_all(&num_pages_bytes)?;
+        };
 
         Ok(page_id)
     }
@@ -128,7 +128,7 @@ impl PageManager {
         if page_id >= self.num_pages {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Invalid page ID: {}", page_id),
+                format!("Invalid page ID: {} (max: {})", page_id, self.num_pages - 1),
             ));
         }
 
@@ -140,38 +140,39 @@ impl PageManager {
             ));
         }
 
-        let mut file = { self.file.lock().unwrap() };
-
-        let offset = page_id * PAGE_SIZE as u32;
-        file.seek(SeekFrom::Start(offset as u64))?;
-
+        let offset = (page_id as u64) * (PAGE_SIZE as u64);
         let mut buffer = [0u8; PAGE_SIZE];
         buffer[0..data.len()].copy_from_slice(data);
-        file.write_all(&buffer)?;
-        file.sync_all()?;
+
+        {
+            let mut file = self.file.lock().unwrap();
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&buffer)?;
+            file.sync_all()?;
+        };
 
         Ok(())
     }
 
     /// Read data from a specific page
-    pub fn read_page(&self, page_id: PageId) -> io::Result<Vec<u8>> {
+    pub fn read_page(&self, page_id: PageId) -> io::Result<[u8; PAGE_SIZE]> {
         // Check page ID validity
         if page_id >= self.num_pages {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Invalid page ID: {}", page_id),
+                format!("Invalid page ID: {} (max: {})", page_id, self.num_pages - 1),
             ));
         }
 
-        let mut file = { self.file.lock().unwrap() };
-
-        let offset = page_id * PAGE_SIZE as u32;
-        file.seek(SeekFrom::Start(offset as u64))?;
-
+        let offset = (page_id as u64) * (PAGE_SIZE as u64);
         let mut buf = [0u8; PAGE_SIZE];
-        file.read_exact(&mut buf)?;
+        {
+            let mut file = self.file.lock().unwrap();
+            file.seek(SeekFrom::Start(offset as u64))?;
+            file.read_exact(&mut buf)?;
+        };
 
-        Ok(buf.to_vec())
+        Ok(buf)
     }
 
     /// Get total number of pages
@@ -295,7 +296,7 @@ mod tests {
         let page_id = pm.allocate_page().unwrap();
 
         // Write exactly PAGE_SIZE bytes
-        let data = vec![42u8; PAGE_SIZE];
+        let data = [42u8; PAGE_SIZE];
         pm.write_page(page_id, &data).unwrap();
 
         // Read it back
