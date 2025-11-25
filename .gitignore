@@ -1,1 +1,6 @@
 /target
+
+// Ignore database files and locks
+*.db
+*.hdb
+*.hdb.lock
