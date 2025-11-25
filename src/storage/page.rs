@@ -15,6 +15,15 @@ pub struct PageManager {
 
 impl PageManager {
     /// Create a new database file or open existing one
+    ///
+    /// # Known Limitation
+    /// If the program crashes or is forcefully terminated (Ctrl+C, kill, etc.),
+    /// the lock file will remain on disk. To recover:
+    /// 1. Ensure no other process is using the database
+    /// 2. Manually delete the .lock file: `rm database.hdb.lock`
+    /// 3. Re-open the database
+    ///
+    /// TODO: Implement PID-based stale lock detection
     pub fn new(path: &str) -> io::Result<Self> {
         let lock_path = PathBuf::from(format!("{}.lock", path));
 
