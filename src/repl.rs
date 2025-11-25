@@ -162,12 +162,18 @@ impl Repl {
 
         match db.read_page(page_id) {
             Ok(data) => {
-                for (i, byte) in data.iter().enumerate() {
-                    if byte.eq(&0_u8) {
-                        let text = &data[..=i];
-                        println!("Page {} data: {}", page_id, String::from_utf8_lossy(text));
-                        break;
-                    };
+                // Find first null byte (or use full length)
+                let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+                let text = &data[..end];
+
+                // Try to display as UTF-8, fall back to showing length
+                match std::str::from_utf8(text) {
+                    Ok(s) => println!("Page {} data: {}", page_id, s),
+                    Err(_) => println!(
+                        "Page {} contains binary data ({} bytes)",
+                        page_id,
+                        text.len()
+                    ),
                 }
             }
             Err(e) => eprintln!("Error reading page {}: {}", page_id, e),
