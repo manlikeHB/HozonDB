@@ -12,6 +12,14 @@ pub struct Row {
 }
 
 impl Row {
+    pub fn new(values: Vec<Value>) -> Self {
+        Row { values }
+    }
+
+    pub fn values(&self) -> &Vec<Value> {
+        &self.values
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -81,7 +89,7 @@ impl Row {
                     }
 
                     let text = String::from_utf8(bytes[offset..offset + text_len].to_vec())
-                        .map_err(|e| format!("Invald UTF in Text: {}", e))?;
+                        .map_err(|e| format!("Invalid UTF in Text: {}", e))?;
                     values.push(Value::Text(text));
                     offset += text_len;
                 }
@@ -110,14 +118,12 @@ mod tests {
 
     #[test]
     fn test_row_serialization() {
-        let row = Row {
-            values: vec![
-                Value::Integer(42),
-                Value::Text("Hello".to_string()),
-                Value::Boolean(true),
-                Value::Null,
-            ],
-        };
+        let mut values = Vec::new();
+        values.push(Value::Integer(42));
+        values.push(Value::Text("Hello".to_string()));
+        values.push(Value::Boolean(true));
+        values.push(Value::Null);
+        let row = Row::new(values);
 
         let bytes = row.to_bytes();
         let deserialized_row = Row::from_bytes(&bytes).unwrap();
