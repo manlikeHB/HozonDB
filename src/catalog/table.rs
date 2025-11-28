@@ -132,10 +132,18 @@ impl TableCatalog {
     }
 
     pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
-        if self.tables.remove(name).is_some() {
-            self.save()?;
+        match self.tables.remove(name) {
+            Some(_) => {
+                self.save()?;
+                return Ok(());
+            }
+            None => {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("Table '{}' does not exist", name),
+                ));
+            }
         }
-        Ok(())
     }
 }
 
@@ -411,5 +419,116 @@ mod tests {
         assert!(catalog.tables.contains_key(&long_name));
 
         cleanup("test_long_name");
+    }
+
+    #[test]
+    fn test_get_table_exists() {
+        cleanup("test_get");
+
+        let pm = PageManager::new("test_get.hdb").unwrap();
+        let mut catalog = TableCatalog::new(pm).unwrap();
+
+        let schema = Schema::new("users", vec![Column::new("id", DataType::Integer)]);
+        catalog.create_table(schema).unwrap();
+
+        let result = catalog.get_table("users");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().schema.table_name(), "users");
+
+        cleanup("test_get");
+    }
+
+    #[test]
+    fn test_get_table_not_exists() {
+        cleanup("test_get_none");
+
+        let pm = PageManager::new("test_get_none.hdb").unwrap();
+        let catalog = TableCatalog::new(pm).unwrap();
+
+        assert!(catalog.get_table("nonexistent").is_none());
+
+        cleanup("test_get_none");
+    }
+
+    #[test]
+    fn test_list_tables() {
+        cleanup("test_list");
+
+        let pm = PageManager::new("test_list.hdb").unwrap();
+        let mut catalog = TableCatalog::new(pm).unwrap();
+
+        catalog.create_table(Schema::new("users", vec![])).unwrap();
+        catalog.create_table(Schema::new("orders", vec![])).unwrap();
+        catalog
+            .create_table(Schema::new("products", vec![]))
+            .unwrap();
+
+        let tables = catalog.list_tables();
+        assert_eq!(tables.len(), 3);
+        assert!(tables.contains(&"users".to_string()));
+        assert!(tables.contains(&"orders".to_string()));
+        assert!(tables.contains(&"products".to_string()));
+
+        cleanup("test_list");
+    }
+
+    #[test]
+    fn test_drop_table() {
+        cleanup("test_drop");
+
+        let pm = PageManager::new("test_drop.hdb").unwrap();
+        let mut catalog = TableCatalog::new(pm).unwrap();
+
+        catalog.create_table(Schema::new("users", vec![])).unwrap();
+        catalog.create_table(Schema::new("orders", vec![])).unwrap();
+
+        assert_eq!(catalog.tables.len(), 2);
+
+        catalog.drop_table("users").unwrap();
+
+        assert_eq!(catalog.tables.len(), 1);
+        assert!(catalog.get_table("users").is_none());
+        assert!(catalog.get_table("orders").is_some());
+
+        cleanup("test_drop");
+    }
+
+    #[test]
+    fn test_drop_table_persists() {
+        cleanup("test_drop_persist");
+
+        {
+            let pm = PageManager::new("test_drop_persist.hdb").unwrap();
+            let mut catalog = TableCatalog::new(pm).unwrap();
+
+            catalog.create_table(Schema::new("users", vec![])).unwrap();
+            catalog.create_table(Schema::new("orders", vec![])).unwrap();
+            catalog.drop_table("users").unwrap();
+        }
+
+        // Reload and verify drop persisted
+        {
+            let pm = PageManager::new("test_drop_persist.hdb").unwrap();
+            let catalog = TableCatalog::new(pm).unwrap();
+
+            assert_eq!(catalog.tables.len(), 1);
+            assert!(catalog.get_table("users").is_none());
+            assert!(catalog.get_table("orders").is_some());
+        }
+
+        cleanup("test_drop_persist");
+    }
+
+    #[test]
+    fn test_drop_nonexistent_table() {
+        cleanup("test_drop_none");
+
+        let pm = PageManager::new("test_drop_none.hdb").unwrap();
+        let mut catalog = TableCatalog::new(pm).unwrap();
+
+        let result = catalog.drop_table("nonexistent");
+        assert!(result.is_err()); // Should return error
+
+        cleanup("test_drop_none");
     }
 }
