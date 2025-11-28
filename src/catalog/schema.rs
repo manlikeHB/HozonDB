@@ -14,6 +14,23 @@ pub struct Column {
     data_type: DataType,
 }
 
+impl Column {
+    pub fn new(name: &str, data_type: DataType) -> Self {
+        Column {
+            name: name.to_string(),
+            data_type,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+}
+
 #[derive(Debug)]
 pub struct Schema {
     table_name: String,
