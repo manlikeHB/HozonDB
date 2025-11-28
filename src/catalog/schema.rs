@@ -1,3 +1,5 @@
+use std::io::{self, Error, ErrorKind};
+
 #[derive(Debug)]
 pub enum DataType {
     Integer,
@@ -53,7 +55,7 @@ impl Schema {
         bytes
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
         let mut offset = 0;
 
         // extract table name
@@ -66,15 +68,26 @@ impl Schema {
         offset += 4; // 4 bytes for length
 
         if bytes.len() < offset + table_name_len {
-            return Err("Not enough bytes for table name length".to_string());
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Not enough bytes for table name length".to_string(),
+            ));
         }
         let table_name = String::from_utf8(bytes[offset..offset + table_name_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in table name: {}", e))?;
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid UTF-8 in table name: {}", e),
+                )
+            })?;
         offset += table_name_len;
 
         // extract columns
         if bytes.len() < offset + 4 {
-            return Err("Not enough bytes for number of columns".to_string());
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Not enough bytes for number of columns".to_string(),
+            ));
         }
 
         let num_columns = u32::from_le_bytes([
@@ -88,7 +101,10 @@ impl Schema {
         let mut columns = Vec::new();
         for _ in 0..num_columns {
             if bytes.len() < offset + 4 {
-                return Err("Not enough bytes for column name length".to_string());
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Not enough bytes for column name length".to_string(),
+                ));
             }
             let col_name_len = u32::from_le_bytes([
                 bytes[offset],
@@ -99,15 +115,27 @@ impl Schema {
             offset += 4; // 4 bytes for column name length
 
             if bytes.len() < offset + col_name_len {
-                return Err("Not enough bytes for column name".to_string());
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Not enough bytes for column name".to_string(),
+                ));
             }
 
             let col_name = String::from_utf8(bytes[offset..offset + col_name_len].to_vec())
-                .map_err(|e| format!("Invalid UTF8 in column name: {}", e))?;
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("Invalid UTF8 in column name: {}", e),
+                    )
+                })?;
+
             offset += col_name_len;
 
             if bytes.len() < offset + 1 {
-                return Err("Not enough bytes for data type".to_string());
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Not enough bytes for column data type".to_string(),
+                ));
             }
 
             let data_type = match bytes[offset] {
@@ -126,10 +154,21 @@ impl Schema {
             });
         }
 
-        Ok(Schema {
-            table_name,
-            columns,
-        })
+        Ok((
+            Schema {
+                table_name,
+                columns,
+            },
+            offset,
+        ))
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn columns(&self) -> &Vec<Column> {
+        &self.columns
     }
 }
 
@@ -152,7 +191,7 @@ mod tests {
 
         let schema = Schema::new("users", columns);
         let bytes = schema.to_bytes();
-        let decoded = Schema::from_bytes(&bytes).unwrap();
+        let (decoded, _) = Schema::from_bytes(&bytes).unwrap();
 
         assert_eq!(decoded.table_name, "users");
         assert_eq!(decoded.columns.len(), 2);

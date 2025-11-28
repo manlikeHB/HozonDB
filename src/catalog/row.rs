@@ -1,3 +1,5 @@
+use std::io::{self, Error, ErrorKind};
+
 #[derive(Debug)]
 pub enum Value {
     Integer(i32),
@@ -48,7 +50,7 @@ impl Row {
         bytes
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
         let mut values = Vec::new();
         let mut offset = 0;
 
@@ -59,7 +61,10 @@ impl Row {
             match value_type {
                 0 => {
                     if bytes.len() < offset + 4 {
-                        return Err("Not enough bytes for Integer".to_string());
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "Not enough bytes for Integer".to_string(),
+                        ));
                     }
 
                     let int_val = i32::from_le_bytes([
@@ -73,7 +78,10 @@ impl Row {
                 }
                 1 => {
                     if bytes.len() < offset + 4 {
-                        return Err("Not enough bytes for Text length".to_string());
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "Not enough bytes for Text length".to_string(),
+                        ));
                     }
 
                     let text_len = u32::from_le_bytes([
@@ -85,17 +93,28 @@ impl Row {
                     offset += 4;
 
                     if bytes.len() < offset + text_len {
-                        return Err("Not enough bytes for Text".to_string());
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "Not enough bytes for Text".to_string(),
+                        ));
                     }
 
                     let text = String::from_utf8(bytes[offset..offset + text_len].to_vec())
-                        .map_err(|e| format!("Invalid UTF in Text: {}", e))?;
+                        .map_err(|e| {
+                            Error::new(
+                                ErrorKind::InvalidData,
+                                format!("Invalid UTF-8 in Text value: {}", e),
+                            )
+                        })?;
                     values.push(Value::Text(text));
                     offset += text_len;
                 }
                 2 => {
                     if bytes.len() < offset + 1 {
-                        return Err("Not enough bytes for Boolean".to_string());
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "Not enough bytes for Boolean".to_string(),
+                        ));
                     }
 
                     let bool_val = bytes[offset] != 0;
@@ -105,7 +124,12 @@ impl Row {
                 3 => {
                     values.push(Value::Null);
                 }
-                _ => return Err("Unknown value type".to_string()),
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Unknown value type".to_string(),
+                    ));
+                }
             }
         }
         Ok(Row { values })
