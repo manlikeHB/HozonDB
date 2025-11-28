@@ -1,4 +1,4 @@
-use crate::catalog::schema::{Schema};
+use crate::catalog::schema::Schema;
 use crate::storage::page::PageManager;
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
@@ -122,6 +122,21 @@ impl TableCatalog {
 
         bytes
     }
+
+    pub fn get_table(&self, name: &str) -> Option<&TableMetadata> {
+        self.tables.get(name)
+    }
+
+    pub fn list_tables(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
+
+    pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
+        if self.tables.remove(name).is_some() {
+            self.save()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -227,7 +242,7 @@ mod tests {
             assert_eq!(catalog.tables.len(), 1);
             assert!(catalog.tables.contains_key("users"));
 
-            let metadata = catalog.tables.get("users").unwrap();
+            let metadata = catalog.get_table("users").unwrap();
             assert_eq!(metadata.schema.table_name(), "users");
             assert_eq!(metadata.schema.columns().len(), 2);
         }
@@ -283,13 +298,13 @@ mod tests {
             assert!(catalog.tables.contains_key("products"));
 
             // Verify schema details
-            let users = catalog.tables.get("users").unwrap();
+            let users = catalog.get_table("users").unwrap();
             assert_eq!(users.schema.columns().len(), 1);
 
-            let orders = catalog.tables.get("orders").unwrap();
+            let orders = catalog.get_table("orders").unwrap();
             assert_eq!(orders.schema.columns().len(), 2);
 
-            let products = catalog.tables.get("products").unwrap();
+            let products = catalog.get_table("products").unwrap();
             assert_eq!(products.schema.columns().len(), 2);
         }
 
@@ -313,7 +328,7 @@ mod tests {
             ))
             .unwrap();
 
-        let users_page = catalog.tables.get("users").unwrap().first_page;
+        let users_page = catalog.get_table("users").unwrap().first_page;
         assert_eq!(users_page, initial_pages); // Should allocate next available page
 
         // Create second table
@@ -324,7 +339,7 @@ mod tests {
             ))
             .unwrap();
 
-        let orders_page = catalog.tables.get("orders").unwrap().first_page;
+        let orders_page = catalog.get_table("orders").unwrap().first_page;
         assert_eq!(orders_page, users_page + 1); // Should allocate next page
 
         cleanup("test_page_alloc");
@@ -354,7 +369,7 @@ mod tests {
         let pm = PageManager::new("test_all_types.hdb").unwrap();
         let catalog = TableCatalog::new(pm).unwrap();
 
-        let metadata = catalog.tables.get("test_table").unwrap();
+        let metadata = catalog.get_table("test_table").unwrap();
         assert_eq!(metadata.schema.columns().len(), 4);
 
         cleanup("test_all_types");
