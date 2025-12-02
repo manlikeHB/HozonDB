@@ -6,6 +6,14 @@ use std::sync::Mutex;
 pub const PAGE_SIZE: usize = 4096;
 pub type PageId = u32;
 
+pub const PAGE_METADATA_SIZE: usize = 5;
+pub const PAGE_DATA_START: usize = PAGE_METADATA_SIZE;
+
+// Metadata offsets
+const OFFSET_IS_FULL: usize = 0;
+const OFFSET_LAST_OFFSET: usize = 1;
+const OFFSET_NUM_ROWS: usize = 3;
+
 #[derive(Debug)]
 pub struct PageManager {
     file: Mutex<File>,
@@ -13,17 +21,14 @@ pub struct PageManager {
     num_pages: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct PageMetadata {
+    pub is_full: bool,
+    pub last_offset: usize,
+    pub num_rows: usize,
+}
+
 impl PageManager {
-    /// Create a new database file or open existing one
-    ///
-    /// # Known Limitation
-    /// If the program crashes or is forcefully terminated (Ctrl+C, kill, etc.),
-    /// the lock file will remain on disk. To recover:
-    /// 1. Ensure no other process is using the database
-    /// 2. Manually delete the .lock file: `rm database.hdb.lock`
-    /// 3. Re-open the database
-    ///
-    /// TODO: Implement PID-based stale lock detection
     pub fn new(path: &str) -> io::Result<Self> {
         let lock_path = PathBuf::from(format!("{}.lock", path));
 
@@ -114,6 +119,9 @@ impl PageManager {
     }
 
     /// Allocate a new page and return its ID
+    ///
+    /// Note: Page 0 is reserved for database header and created in new().
+    /// This method allocates pages starting from page 1 with initialized metadata.
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
         let page_id: PageId = self.num_pages;
         self.num_pages += 1;
@@ -121,12 +129,20 @@ impl PageManager {
         let new_size = (self.num_pages as u64) * (PAGE_SIZE as u64);
         let num_pages_bytes = self.num_pages.to_le_bytes();
 
+        // Extend db file size and set new number of pages
         {
             let mut file = self.file.lock().unwrap();
             file.set_len(new_size)?;
             file.seek(SeekFrom::Start(4))?;
             file.write_all(&num_pages_bytes)?;
         };
+
+        // Create page buffer with metadata
+        let mut page_data = [0u8; PAGE_SIZE];
+        Self::init_page_metadata_buffer(&mut page_data);
+
+        // Write initialized page
+        self.write_page(page_id, &page_data)?;
 
         Ok(page_id)
     }
@@ -187,6 +203,58 @@ impl PageManager {
     /// Get total number of pages
     pub fn num_pages(&self) -> u32 {
         self.num_pages
+    }
+
+    fn init_page_metadata_buffer(page_data: &mut [u8; PAGE_SIZE]) {
+        page_data[OFFSET_IS_FULL] = 0;
+        page_data[OFFSET_LAST_OFFSET..OFFSET_LAST_OFFSET + 2]
+            .copy_from_slice(&(PAGE_DATA_START as u16).to_le_bytes());
+        page_data[OFFSET_NUM_ROWS..OFFSET_NUM_ROWS + 2].copy_from_slice(&0u16.to_le_bytes());
+    }
+
+    /// Read metadata from a page
+    pub fn read_page_metadata(&self, page_id: PageId) -> io::Result<PageMetadata> {
+        let page_data = self.read_page(page_id)?;
+        Ok(Self::read_metadata_from_buffer(&page_data))
+    }
+
+    /// Update metadata for a page
+    pub fn update_page_metadata(
+        &mut self,
+        page_id: PageId,
+        metadata: &PageMetadata,
+    ) -> io::Result<()> {
+        let mut page_data = self.read_page(page_id)?;
+        Self::update_metadata_in_buffer(&mut page_data, metadata);
+        self.write_page(page_id, &page_data)?;
+        Ok(())
+    }
+
+    pub fn read_metadata_from_buffer(page_data: &[u8; PAGE_SIZE]) -> PageMetadata {
+        let is_full = page_data[OFFSET_IS_FULL] != 0;
+
+        let last_offset = u16::from_le_bytes([
+            page_data[OFFSET_LAST_OFFSET],
+            page_data[OFFSET_LAST_OFFSET + 1],
+        ]) as usize;
+
+        let num_rows =
+            u16::from_le_bytes([page_data[OFFSET_NUM_ROWS], page_data[OFFSET_NUM_ROWS + 1]])
+                as usize;
+
+        PageMetadata {
+            is_full,
+            last_offset,
+            num_rows,
+        }
+    }
+
+    pub fn update_metadata_in_buffer(page_data: &mut [u8; PAGE_SIZE], metadata: &PageMetadata) {
+        page_data[OFFSET_IS_FULL] = if metadata.is_full { 1 } else { 0 };
+        page_data[OFFSET_LAST_OFFSET..OFFSET_LAST_OFFSET + 2]
+            .copy_from_slice(&(metadata.last_offset as u16).to_le_bytes());
+        page_data[OFFSET_NUM_ROWS..OFFSET_NUM_ROWS + 2]
+            .copy_from_slice(&(metadata.num_rows as u16).to_le_bytes());
     }
 }
 
@@ -346,5 +414,166 @@ mod tests {
 
         let _ = fs::remove_file("test_oversize.db");
         let _ = fs::remove_file("test_oversize.db.lock");
+    }
+
+    #[test]
+    fn test_page_metadata_initialization() {
+        let _ = fs::remove_file("test_metadata_init.db");
+        let _ = fs::remove_file("test_metadata_init.db.lock");
+
+        let mut pm = PageManager::new("test_metadata_init.db").unwrap();
+
+        // Allocate a page (should have initialized metadata)
+        let page_id = pm.allocate_page().unwrap();
+        assert_eq!(page_id, 1);
+
+        // Read metadata
+        let metadata = pm.read_page_metadata(page_id).unwrap();
+
+        // Check initial values
+        assert_eq!(metadata.is_full, false);
+        assert_eq!(metadata.last_offset, PAGE_DATA_START);
+        assert_eq!(metadata.num_rows, 0);
+
+        let _ = fs::remove_file("test_metadata_init.db");
+        let _ = fs::remove_file("test_metadata_init.db.lock");
+    }
+
+    #[test]
+    fn test_page_metadata_update() {
+        let _ = fs::remove_file("test_metadata_update.db");
+        let _ = fs::remove_file("test_metadata_update.db.lock");
+
+        let mut pm = PageManager::new("test_metadata_update.db").unwrap();
+        let page_id = pm.allocate_page().unwrap();
+
+        // Update metadata
+        let new_metadata = PageMetadata {
+            is_full: true,
+            last_offset: 100,
+            num_rows: 5,
+        };
+        pm.update_page_metadata(page_id, &new_metadata).unwrap();
+
+        // Read it back
+        let read_metadata = pm.read_page_metadata(page_id).unwrap();
+
+        assert_eq!(read_metadata.is_full, true);
+        assert_eq!(read_metadata.last_offset, 100);
+        assert_eq!(read_metadata.num_rows, 5);
+
+        let _ = fs::remove_file("test_metadata_update.db");
+        let _ = fs::remove_file("test_metadata_update.db.lock");
+    }
+
+    #[test]
+    fn test_page_metadata_persistence() {
+        let _ = fs::remove_file("test_metadata_persist.db");
+        let _ = fs::remove_file("test_metadata_persist.db.lock");
+
+        {
+            let mut pm = PageManager::new("test_metadata_persist.db").unwrap();
+            let page_id = pm.allocate_page().unwrap();
+
+            // Update metadata
+            let metadata = PageMetadata {
+                is_full: false,
+                last_offset: 250,
+                num_rows: 10,
+            };
+            pm.update_page_metadata(page_id, &metadata).unwrap();
+        } // pm dropped, file closed
+
+        // Reopen database
+        {
+            let pm = PageManager::new("test_metadata_persist.db").unwrap();
+            let metadata = pm.read_page_metadata(1).unwrap();
+
+            // Metadata should persist
+            assert_eq!(metadata.is_full, false);
+            assert_eq!(metadata.last_offset, 250);
+            assert_eq!(metadata.num_rows, 10);
+        }
+
+        let _ = fs::remove_file("test_metadata_persist.db");
+        let _ = fs::remove_file("test_metadata_persist.db.lock");
+    }
+
+    #[test]
+    fn test_multiple_pages_have_separate_metadata() {
+        let _ = fs::remove_file("test_multi_meta.db");
+        let _ = fs::remove_file("test_multi_meta.db.lock");
+
+        let mut pm = PageManager::new("test_multi_meta.db").unwrap();
+
+        // Allocate two pages
+        let page1 = pm.allocate_page().unwrap();
+        let page2 = pm.allocate_page().unwrap();
+
+        // Update page1 metadata
+        let meta1 = PageMetadata {
+            is_full: true,
+            last_offset: 100,
+            num_rows: 3,
+        };
+        pm.update_page_metadata(page1, &meta1).unwrap();
+
+        // Update page2 metadata
+        let meta2 = PageMetadata {
+            is_full: false,
+            last_offset: 200,
+            num_rows: 7,
+        };
+        pm.update_page_metadata(page2, &meta2).unwrap();
+
+        // Read back and verify they're independent
+        let read_meta1 = pm.read_page_metadata(page1).unwrap();
+        let read_meta2 = pm.read_page_metadata(page2).unwrap();
+
+        assert_eq!(read_meta1.num_rows, 3);
+        assert_eq!(read_meta2.num_rows, 7);
+        assert_eq!(read_meta1.last_offset, 100);
+        assert_eq!(read_meta2.last_offset, 200);
+
+        let _ = fs::remove_file("test_multi_meta.db");
+        let _ = fs::remove_file("test_multi_meta.db.lock");
+    }
+
+    #[test]
+    fn test_page_metadata_does_not_affect_data_area() {
+        let _ = fs::remove_file("test_meta_data.db");
+        let _ = fs::remove_file("test_meta_data.db.lock");
+
+        let mut pm = PageManager::new("test_meta_data.db").unwrap();
+        let page_id = pm.allocate_page().unwrap();
+
+        // Write some data to the page (in data area)
+        let mut page_data = pm.read_page(page_id).unwrap();
+        let test_data = b"Hello, World!";
+        page_data[PAGE_DATA_START..PAGE_DATA_START + test_data.len()].copy_from_slice(test_data);
+        pm.write_page(page_id, &page_data).unwrap();
+
+        // Update metadata
+        let metadata = PageMetadata {
+            is_full: false,
+            last_offset: PAGE_DATA_START + test_data.len(),
+            num_rows: 1,
+        };
+        pm.update_page_metadata(page_id, &metadata).unwrap();
+
+        // Read page and verify data is intact
+        let page_data = pm.read_page(page_id).unwrap();
+        assert_eq!(
+            &page_data[PAGE_DATA_START..PAGE_DATA_START + test_data.len()],
+            test_data
+        );
+
+        // Verify metadata is correct
+        let meta = pm.read_page_metadata(page_id).unwrap();
+        assert_eq!(meta.num_rows, 1);
+        assert_eq!(meta.last_offset, PAGE_DATA_START + test_data.len());
+
+        let _ = fs::remove_file("test_meta_data.db");
+        let _ = fs::remove_file("test_meta_data.db.lock");
     }
 }
