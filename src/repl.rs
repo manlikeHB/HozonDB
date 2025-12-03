@@ -68,11 +68,6 @@ impl Repl {
         match command {
             ".help" => self.cmd_help(),
             ".open" => self.cmd_open(&parts),
-            // ".pages" => self.cmd_pages(),
-            // ".allocate" => self.cmd_allocate(),
-            // ".read" => self.cmd_read(&parts),
-            // ".write" => self.cmd_write(&parts),
-            // ".dump" => self.cmd_dump(&parts),
             _ => {
                 eprintln!("Unknown command: '{}'. Type '.help' for usage.", command);
                 Ok(())
@@ -124,11 +119,6 @@ impl Repl {
         println!("Available commands:");
         println!("  .help              - Show this help message");
         println!("  .open <file>       - Open or create a database file");
-        println!("  .pages             - List all pages in the database");
-        println!("  .allocate          - Allocate a new page");
-        println!("  .write <id> <text> - Write text to a page");
-        println!("  .read <id>         - Read data from a page");
-        println!("  .dump <id>         - Show raw bytes of a page (hex)");
         println!("  .exit              - Exit the program");
         Ok(())
     }
@@ -150,158 +140,6 @@ impl Repl {
         println!("Opened database file: {}", filename);
         Ok(())
     }
-
-    // fn cmd_pages(&self) -> io::Result<()> {
-    //     let db = match Self::get_db(&self) {
-    //         Ok(db) => db,
-    //         Err(_) => return Ok(()),
-    //     };
-    //     println!("Total pages: {}", db.num_pages());
-
-    //     Ok(())
-    // }
-
-    // fn cmd_allocate(&mut self) -> io::Result<()> {
-    //     let db = match Self::get_db_mut(self) {
-    //         Ok(db) => db,
-    //         Err(_) => return Ok(()),
-    //     };
-    //     let page_id = db.allocate_page()?;
-    //     println!("Allocated new page with ID: {}", page_id);
-    //     Ok(())
-    // }
-
-    // fn cmd_write(&mut self, parts: &[&str]) -> io::Result<()> {
-    //     let db = match self.get_db_mut() {
-    //         Ok(db) => db,
-    //         Err(_) => return Ok(()),
-    //     };
-
-    //     if parts.len() < 3 {
-    //         eprintln!("Usage: .write <page_id> <text>");
-    //         return Ok(());
-    //     }
-
-    //     let page_id: u32 = match parts[1].parse() {
-    //         Ok(id) => id,
-    //         Err(_) => {
-    //             eprintln!("Invalid page ID: {}", parts[1]);
-    //             return Ok(());
-    //         }
-    //     };
-
-    //     let data = parts[2..].join(" ").into_bytes();
-    //     match db.write_page(page_id, &data) {
-    //         Ok(_) => println!("Wrote {} bytes to page {}", data.len(), page_id),
-    //         Err(e) => eprintln!("Error writing to page {}: {}", page_id, e),
-    //     }
-
-    //     Ok(())
-    // }
-
-    // fn cmd_read(&mut self, parts: &[&str]) -> io::Result<()> {
-    //     let db = match self.get_db() {
-    //         Ok(db) => db,
-    //         Err(_) => return Ok(()),
-    //     };
-
-    //     if parts.len() != 2 {
-    //         eprintln!("Usage: .read <page_id>");
-    //         return Ok(());
-    //     };
-
-    //     let page_id: u32 = match parts[1].parse() {
-    //         Ok(id) => id,
-    //         Err(_) => {
-    //             eprintln!("Invalid page ID: {}", parts[1]);
-    //             return Ok(());
-    //         }
-    //     };
-
-    //     match db.read_page(page_id) {
-    //         Ok(data) => {
-    //             // Find first null byte (or use full length)
-    //             let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    //             let text = &data[..end];
-
-    //             // Try to display as UTF-8, fall back to showing length
-    //             match std::str::from_utf8(text) {
-    //                 Ok(s) => println!("Page {} data: {}", page_id, s),
-    //                 Err(_) => println!(
-    //                     "Page {} contains binary data ({} bytes)",
-    //                     page_id,
-    //                     text.len()
-    //                 ),
-    //             }
-    //         }
-    //         Err(e) => eprintln!("Error reading page {}: {}", page_id, e),
-    //     }
-
-    //     Ok(())
-    // }
-
-    // fn cmd_dump(&mut self, parts: &[&str]) -> io::Result<()> {
-    //     let db = match self.get_db_mut() {
-    //         Ok(db) => db,
-    //         Err(_) => return Ok(()),
-    //     };
-
-    //     if parts.len() != 2 {
-    //         eprintln!("Usage: .dump <page_id>");
-    //         return Ok(());
-    //     }
-
-    //     let page_id: u32 = match parts[1].parse() {
-    //         Ok(id) => id,
-    //         Err(_) => {
-    //             eprintln!("Invalid page ID: {}", parts[1]);
-    //             return Ok(());
-    //         }
-    //     };
-
-    //     let data = db.read_page(page_id)?;
-
-    //     println!("Page {} (showing first 256 bytes):", page_id);
-    //     for (i, chunk) in data[..256].chunks(16).enumerate() {
-    //         print!("{:04x}: ", i * 16);
-    //         for byte in chunk {
-    //             print!("{:02x} ", byte);
-    //         }
-
-    //         // ASCII representation
-    //         print!(" |");
-    //         for byte in chunk {
-    //             if *byte >= 32 && *byte <= 126 {
-    //                 print!("{}", *byte as char);
-    //             } else {
-    //                 print!(".");
-    //             }
-    //         }
-    //         println!("|");
-    //     }
-
-    //     Ok(())
-    // }
-
-    // fn get_db(&self) -> io::Result<&PageManager> {
-    //     match self.db.as_ref() {
-    //         Some(db) => Ok(db),
-    //         None => {
-    //             eprintln!("No database is open. Use '.open <file>' to open a database.");
-    //             Err(io::Error::new(io::ErrorKind::Other, "No database open"))
-    //         }
-    //     }
-    // }
-
-    // fn get_db_mut(&mut self) -> io::Result<&mut PageManager> {
-    //     match self.db.as_mut() {
-    //         Some(db) => Ok(db),
-    //         None => {
-    //             eprintln!("No database is open. Use '.open <file>' to open a database.");
-    //             Err(io::Error::new(io::ErrorKind::Other, "No database open"))
-    //         }
-    //     }
-    // }
 }
 
 #[cfg(test)]
@@ -315,278 +153,378 @@ mod tests {
         let _ = fs::remove_file(format!("{}.hdb.lock", basename));
     }
 
-    // #[test]
-    // fn test_new_repl_has_no_database() {
-    //     let repl = Repl::new();
-    //     assert!(repl.db.is_none());
-    // }
-
-    // #[test]
-    // fn test_open_creates_database() {
-    //     cleanup("test_open");
-
-    //     let mut repl = Repl::new();
-    //     let result = repl.execute_command(".open test_open.hdb");
-
-    //     assert!(result.is_ok());
-    //     assert!(repl.db.is_some());
-
-    //     // Verify file exists
-    //     assert!(std::path::Path::new("test_open.hdb").exists());
-
-    //     cleanup("test_open");
-    // }
-
-    // #[test]
-    // fn test_open_existing_database() {
-    //     cleanup("test_existing");
-
-    //     // Create database first
-    //     let mut repl1 = Repl::new();
-    //     repl1.execute_command(".open test_existing.hdb").unwrap();
-    //     drop(repl1); // Close it
-
-    //     // Open existing
-    //     let mut repl2 = Repl::new();
-    //     let result = repl2.execute_command(".open test_existing.hdb");
-
-    //     assert!(result.is_ok());
-    //     assert!(repl2.db.is_some());
-
-    //     cleanup("test_existing");
-    // }
-
-    // #[test]
-    // fn test_open_without_filename() {
-    //     let mut repl = Repl::new();
-    //     let result = repl.execute_command(".open");
-
-    //     // Should succeed but do nothing (prints usage)
-    //     assert!(result.is_ok());
-    //     assert!(repl.db.is_none());
-    // }
-
-    // #[test]
-    // fn test_pages_without_open_database() {
-    //     let mut repl = Repl::new();
-    //     let result = repl.execute_command(".pages");
-
-    //     // Should succeed but print error message
-    //     assert!(result.is_ok());
-    // }
-
-    // #[test]
-    // fn test_pages_shows_count() {
-    //     cleanup("test_pages");
-
-    //     let mut repl = Repl::new();
-    //     repl.execute_command(".open test_pages.hdb").unwrap();
-
-    //     let result = repl.execute_command(".pages");
-    //     assert!(result.is_ok());
-
-    //     cleanup("test_pages");
-    // }
-
-    // #[test]
-    // fn test_allocate_without_database() {
-    //     let mut repl = Repl::new();
-    //     let result = repl.execute_command(".allocate");
-
-    //     assert!(result.is_ok()); // Doesn't error, just prints message
-    // }
-
-    // #[test]
-    // fn test_allocate_page() {
-    //     cleanup("test_alloc");
-
-    //     let mut repl = Repl::new();
-    //     repl.execute_command(".open test_alloc.hdb").unwrap();
-
-    //     let result = repl.execute_command(".allocate");
-    //     assert!(result.is_ok());
-
-    //     // Verify page was allocated
-    //     assert_eq!(repl.db.as_ref().unwrap().num_pages(), 2);
-
-    //     cleanup("test_alloc");
-    // }
-
     #[test]
-    fn test_write_without_database() {
-        let mut repl = Repl::new();
-        let result = repl.execute_command(".write 1 test");
-
-        assert!(result.is_ok()); // Handles gracefully
+    fn test_new_repl_has_no_executor() {
+        let repl = Repl::new();
+        assert!(repl.executor.is_none());
     }
 
     #[test]
-    fn test_write_without_page_id() {
-        cleanup("test_write_args");
+    fn test_open_creates_executor() {
+        cleanup("test_repl_open");
 
         let mut repl = Repl::new();
-        repl.execute_command(".open test_write_args.hdb").unwrap();
+        let result = repl.execute_command(".open test_repl_open.hdb");
 
-        let result = repl.execute_command(".write");
-        assert!(result.is_ok()); // Prints usage
+        assert!(result.is_ok());
+        assert!(repl.executor.is_some());
 
-        cleanup("test_write_args");
+        cleanup("test_repl_open");
     }
 
     #[test]
-    fn test_write_invalid_page_id() {
-        cleanup("test_write_invalid");
+    fn test_open_existing_database() {
+        cleanup("test_repl_existing");
+
+        // Create database first
+        {
+            let mut repl = Repl::new();
+            repl.execute_command(".open test_repl_existing.hdb")
+                .unwrap();
+            repl.execute_command("CREATE TABLE users (id INTEGER);")
+                .unwrap();
+        }
+
+        // Open existing
+        {
+            let mut repl = Repl::new();
+            let result = repl.execute_command(".open test_repl_existing.hdb");
+            assert!(result.is_ok());
+            assert!(repl.executor.is_some());
+        }
+
+        cleanup("test_repl_existing");
+    }
+
+    #[test]
+    fn test_open_without_filename() {
+        let mut repl = Repl::new();
+        let result = repl.execute_command(".open");
+
+        assert!(result.is_ok()); // Doesn't error, just prints usage
+        assert!(repl.executor.is_none());
+    }
+
+    #[test]
+    fn test_sql_without_open_database() {
+        let mut repl = Repl::new();
+        let result = repl.execute_command("CREATE TABLE users (id INTEGER);");
+
+        assert!(result.is_ok()); // Handles gracefully, prints error message
+    }
+
+    #[test]
+    fn test_create_table() {
+        cleanup("test_repl_create");
 
         let mut repl = Repl::new();
-        repl.execute_command(".open test_write_invalid.hdb")
+        repl.execute_command(".open test_repl_create.hdb").unwrap();
+
+        let result = repl.execute_command("CREATE TABLE users (id INTEGER, name TEXT);");
+        assert!(result.is_ok());
+
+        cleanup("test_repl_create");
+    }
+
+    #[test]
+    fn test_insert_row() {
+        cleanup("test_repl_insert");
+
+        let mut repl = Repl::new();
+        repl.execute_command(".open test_repl_insert.hdb").unwrap();
+        repl.execute_command("CREATE TABLE users (id INTEGER, name TEXT);")
             .unwrap();
 
-        let result = repl.execute_command(".write abc test");
-        assert!(result.is_ok()); // Prints error about invalid ID
-
-        cleanup("test_write_invalid");
-    }
-
-    #[test]
-    fn test_write_and_read() {
-        cleanup("test_rw");
-
-        let mut repl = Repl::new();
-        repl.execute_command(".open test_rw.hdb").unwrap();
-        repl.execute_command(".allocate").unwrap();
-
-        // Write data
-        let result = repl.execute_command(".write 1 Hello World");
+        let result = repl.execute_command("INSERT INTO users VALUES (1, 'Alice');");
         assert!(result.is_ok());
 
-        // Read should succeed
-        let result = repl.execute_command(".read 1");
+        cleanup("test_repl_insert");
+    }
+
+    #[test]
+    fn test_select_all() {
+        cleanup("test_repl_select");
+
+        let mut repl = Repl::new();
+        repl.execute_command(".open test_repl_select.hdb").unwrap();
+        repl.execute_command("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        repl.execute_command("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        repl.execute_command("INSERT INTO users VALUES (2, 'Bob');")
+            .unwrap();
+
+        let result = repl.execute_command("SELECT * FROM users;");
         assert!(result.is_ok());
 
-        cleanup("test_rw");
+        cleanup("test_repl_select");
     }
 
     #[test]
-    fn test_write_multi_word_text() {
-        cleanup("test_multi");
+    fn test_select_specific_columns() {
+        cleanup("test_repl_select_cols");
 
         let mut repl = Repl::new();
-        repl.execute_command(".open test_multi.hdb").unwrap();
-        repl.execute_command(".allocate").unwrap();
+        repl.execute_command(".open test_repl_select_cols.hdb")
+            .unwrap();
+        repl.execute_command("CREATE TABLE users (id INTEGER, name TEXT, email TEXT);")
+            .unwrap();
+        repl.execute_command("INSERT INTO users VALUES (1, 'Alice', 'alice@test.com');")
+            .unwrap();
 
-        let result = repl.execute_command(".write 1 This is a longer message");
+        let result = repl.execute_command("SELECT name, id FROM users;");
         assert!(result.is_ok());
 
-        cleanup("test_multi");
+        cleanup("test_repl_select_cols");
     }
 
     #[test]
-    fn test_read_without_database() {
-        let mut repl = Repl::new();
-        let result = repl.execute_command(".read 1");
+    fn test_invalid_sql_syntax() {
+        cleanup("test_repl_invalid");
 
-        assert!(result.is_ok()); // Handles gracefully
+        let mut repl = Repl::new();
+        repl.execute_command(".open test_repl_invalid.hdb").unwrap();
+
+        // Missing semicolon
+        let result = repl.execute_command("CREATE TABLE users (id INTEGER)");
+        assert!(result.is_err());
+
+        cleanup("test_repl_invalid");
     }
 
     #[test]
-    fn test_read_without_page_id() {
-        cleanup("test_read_args");
+    fn test_insert_wrong_type() {
+        cleanup("test_repl_type_err");
 
         let mut repl = Repl::new();
-        repl.execute_command(".open test_read_args.hdb").unwrap();
+        repl.execute_command(".open test_repl_type_err.hdb")
+            .unwrap();
+        repl.execute_command("CREATE TABLE users (id INTEGER);")
+            .unwrap();
 
-        let result = repl.execute_command(".read");
-        assert!(result.is_ok()); // Prints usage
+        // Try to insert text into integer column
+        let result = repl.execute_command("INSERT INTO users VALUES ('not a number');");
+        assert!(result.is_err());
 
-        cleanup("test_read_args");
+        cleanup("test_repl_type_err");
     }
 
     #[test]
-    fn test_read_invalid_page_id() {
-        cleanup("test_read_invalid");
+    fn test_select_nonexistent_table() {
+        cleanup("test_repl_no_table");
 
         let mut repl = Repl::new();
-        repl.execute_command(".open test_read_invalid.hdb").unwrap();
+        repl.execute_command(".open test_repl_no_table.hdb")
+            .unwrap();
 
-        let result = repl.execute_command(".read abc");
-        assert!(result.is_ok()); // Prints error
+        let result = repl.execute_command("SELECT * FROM nonexistent;");
+        assert!(result.is_err());
 
-        cleanup("test_read_invalid");
+        cleanup("test_repl_no_table");
     }
 
     #[test]
-    fn test_read_nonexistent_page() {
-        cleanup("test_read_none");
+    fn test_multiple_operations() {
+        cleanup("test_repl_multi");
 
         let mut repl = Repl::new();
-        repl.execute_command(".open test_read_none.hdb").unwrap();
+        repl.execute_command(".open test_repl_multi.hdb").unwrap();
 
-        let result = repl.execute_command(".read 999");
-        assert!(result.is_ok()); // Error handled in command
+        // Create
+        repl.execute_command("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
 
-        cleanup("test_read_none");
+        // Insert multiple
+        repl.execute_command("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        repl.execute_command("INSERT INTO users VALUES (2, 'Bob');")
+            .unwrap();
+        repl.execute_command("INSERT INTO users VALUES (3, 'Charlie');")
+            .unwrap();
+
+        // Select
+        let result = repl.execute_command("SELECT * FROM users;");
+        assert!(result.is_ok());
+
+        cleanup("test_repl_multi");
+    }
+
+    #[test]
+    fn test_case_insensitive_keywords() {
+        cleanup("test_repl_case");
+
+        let mut repl = Repl::new();
+        repl.execute_command(".open test_repl_case.hdb").unwrap();
+
+        // Lowercase keywords should work
+        repl.execute_command("create table users (id integer);")
+            .unwrap();
+        repl.execute_command("insert into users values (1);")
+            .unwrap();
+        let result = repl.execute_command("select * from users;");
+        assert!(result.is_ok());
+
+        cleanup("test_repl_case");
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let mut repl = Repl::new();
+        let result = repl.execute_command("");
+
+        assert!(result.is_ok()); // Should handle gracefully
+    }
+
+    #[test]
+    fn test_whitespace_only() {
+        let mut repl = Repl::new();
+        let result = repl.execute_command("   ");
+
+        assert!(result.is_ok()); // Should handle gracefully
+    }
+
+    #[test]
+    fn test_unknown_meta_command() {
+        let mut repl = Repl::new();
+        let result = repl.execute_command(".unknown");
+
+        assert!(result.is_ok()); // Doesn't error, just prints message
     }
 
     #[test]
     fn test_help_command() {
-        let mut repl = Repl::new();
-        let result = repl.execute_command(".help");
+        let repl = Repl::new();
+        let result = repl.cmd_help();
 
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_unknown_command() {
-        let mut repl = Repl::new();
-        let result = repl.execute_command(".unknown");
+    fn test_persistence_across_sessions() {
+        cleanup("test_repl_persist");
 
-        assert!(result.is_ok()); // Prints error message but doesn't fail
+        // First session: create and insert
+        {
+            let mut repl = Repl::new();
+            repl.execute_command(".open test_repl_persist.hdb").unwrap();
+            repl.execute_command("CREATE TABLE users (id INTEGER, name TEXT);")
+                .unwrap();
+            repl.execute_command("INSERT INTO users VALUES (1, 'Alice');")
+                .unwrap();
+        } // Repl dropped, files closed
+
+        // Second session: verify data persists
+        {
+            let mut repl = Repl::new();
+            repl.execute_command(".open test_repl_persist.hdb").unwrap();
+
+            // Should be able to select from existing table
+            let result = repl.execute_command("SELECT * FROM users;");
+            assert!(result.is_ok());
+
+            // Should be able to insert more data
+            let result = repl.execute_command("INSERT INTO users VALUES (2, 'Bob');");
+            assert!(result.is_ok());
+        }
+
+        cleanup("test_repl_persist");
     }
 
     #[test]
-    fn test_empty_command() {
-        let mut repl = Repl::new();
-        let result = repl.execute_command("");
+    fn test_multiple_tables() {
+        cleanup("test_repl_multi_tables");
 
-        assert!(result.is_ok()); // Ignores empty
+        let mut repl = Repl::new();
+        repl.execute_command(".open test_repl_multi_tables.hdb")
+            .unwrap();
+
+        // Create multiple tables
+        repl.execute_command("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        repl.execute_command("CREATE TABLE orders (id INTEGER, user_id INTEGER);")
+            .unwrap();
+
+        // Insert into both
+        repl.execute_command("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        repl.execute_command("INSERT INTO orders VALUES (100, 1);")
+            .unwrap();
+
+        // Select from both
+        let result1 = repl.execute_command("SELECT * FROM users;");
+        let result2 = repl.execute_command("SELECT * FROM orders;");
+
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+
+        cleanup("test_repl_multi_tables");
     }
 
     #[test]
-    fn test_command_with_extra_whitespace() {
-        cleanup("test_whitespace");
+    fn test_all_data_types() {
+        cleanup("test_repl_types");
 
         let mut repl = Repl::new();
-        repl.execute_command(".open test_whitespace.hdb").unwrap();
-        repl.execute_command(".allocate").unwrap();
+        repl.execute_command(".open test_repl_types.hdb").unwrap();
 
-        // Multiple spaces between arguments
-        let result = repl.execute_command(".write   1    test   data");
+        repl.execute_command(
+            "CREATE TABLE test (int_col INTEGER, text_col TEXT, bool_col BOOLEAN, null_col NULL);",
+        )
+        .unwrap();
+
+        repl.execute_command("INSERT INTO test VALUES (42, 'hello', true, NULL);")
+            .unwrap();
+
+        let result = repl.execute_command("SELECT * FROM test;");
         assert!(result.is_ok());
 
-        cleanup("test_whitespace");
+        cleanup("test_repl_types");
     }
 
-    // #[test]
-    // fn test_sequential_operations() {
-    //     cleanup("test_seq");
+    #[test]
+    fn test_sql_with_extra_whitespace() {
+        cleanup("test_repl_whitespace");
 
-    //     let mut repl = Repl::new();
+        let mut repl = Repl::new();
+        repl.execute_command(".open test_repl_whitespace.hdb")
+            .unwrap();
 
-    //     // Open
-    //     repl.execute_command(".open test_seq.hdb").unwrap();
-    //     assert_eq!(repl.db.as_ref().unwrap().num_pages(), 1);
+        // SQL with extra spaces and newlines
+        let result = repl.execute_command("  CREATE   TABLE   users  (id INTEGER)  ;  ");
+        assert!(result.is_ok());
 
-    //     // Allocate
-    //     repl.execute_command(".allocate").unwrap();
-    //     assert_eq!(repl.db.as_ref().unwrap().num_pages(), 2);
+        cleanup("test_repl_whitespace");
+    }
 
-    //     // Write
-    //     repl.execute_command(".write 1 test").unwrap();
+    #[test]
+    fn test_insert_empty_string() {
+        cleanup("test_repl_empty_str");
 
-    //     // Read
-    //     let result = repl.execute_command(".read 1");
-    //     assert!(result.is_ok());
+        let mut repl = Repl::new();
+        repl.execute_command(".open test_repl_empty_str.hdb")
+            .unwrap();
+        repl.execute_command("CREATE TABLE users (name TEXT);")
+            .unwrap();
 
-    //     cleanup("test_seq");
-    // }
+        let result = repl.execute_command("INSERT INTO users VALUES ('');");
+        assert!(result.is_ok());
+
+        cleanup("test_repl_empty_str");
+    }
+
+    #[test]
+    fn test_insert_special_characters() {
+        cleanup("test_repl_special");
+
+        let mut repl = Repl::new();
+        repl.execute_command(".open test_repl_special.hdb").unwrap();
+        repl.execute_command("CREATE TABLE users (name TEXT);")
+            .unwrap();
+
+        // Test various special characters in strings
+        let result = repl.execute_command("INSERT INTO users VALUES ('Hello, World!');");
+        assert!(result.is_ok());
+
+        cleanup("test_repl_special");
+    }
 }
