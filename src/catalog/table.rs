@@ -1,10 +1,20 @@
 use crate::catalog::schema::Schema;
-use crate::storage::page::PageManager;
+use crate::storage::page::{PageManager, PageMetadata};
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 pub struct TableMetadata {
     schema: Schema,
     first_page: u32,
+}
+
+impl TableMetadata {
+    pub fn first_page(&self) -> u32 {
+        self.first_page
+    }
+
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
 }
 
 pub struct TableCatalog {
@@ -13,19 +23,17 @@ pub struct TableCatalog {
 }
 
 impl TableCatalog {
-    pub fn new(page_manager: PageManager) -> io::Result<Self> {
-        // try reading existing catalog
-        let catalog_data = match page_manager.read_page(1u32) {
-            Ok(data) => data,
-            Err(e) if e.kind() == ErrorKind::InvalidInput => {
-                // no existing catalog, return empty
-                [0u8; 4096] // page size is 4096 bytes
-            }
-            Err(e) => return Err(e),
-        };
+    pub fn new(mut page_manager: PageManager) -> io::Result<Self> {
+        // If this is a new database (only page 0 exists), allocate page 1 for catalog
+        if page_manager.num_pages() == 1 {
+            page_manager.allocate_page()?;
+        }
 
+        let catalog_data = page_manager.read_page(1u32)?;
+
+        // check if catalog is empty
         if catalog_data.iter().all(|&b| b == 0) {
-            // empty catalog
+            // empty catalog - new db
             return Ok(TableCatalog {
                 tables: HashMap::new(),
                 page_manager,
@@ -42,6 +50,7 @@ impl TableCatalog {
             ));
         }
 
+        // Reconstruct catalog
         let num_tables = u32::from_le_bytes([
             catalog_data[offset],
             catalog_data[offset + 1],
@@ -94,7 +103,7 @@ impl TableCatalog {
 
         self.tables.insert(table_name, table_metadata);
 
-        // save to disk
+        // save catalog
         self.save()?;
 
         Ok(())
@@ -144,6 +153,30 @@ impl TableCatalog {
                 ));
             }
         }
+    }
+
+    pub fn read_page(&self, page_id: u32) -> io::Result<[u8; 4096]> {
+        self.page_manager.read_page(page_id)
+    }
+
+    pub fn write_page(&mut self, page_id: u32, data: &[u8]) -> io::Result<()> {
+        self.page_manager.write_page(page_id, data)
+    }
+
+    pub fn read_page_metadata(&self, page_id: u32) -> io::Result<PageMetadata> {
+        self.page_manager.read_page_metadata(page_id)
+    }
+
+    pub fn update_page_metadata(
+        &mut self,
+        page_id: u32,
+        metadata: &PageMetadata,
+    ) -> io::Result<()> {
+        self.page_manager.update_page_metadata(page_id, metadata)
+    }
+
+    pub fn number_of_pages(&self) -> u32 {
+        self.page_manager.num_pages()
     }
 }
 
