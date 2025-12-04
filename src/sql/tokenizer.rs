@@ -89,6 +89,8 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                     } else {
                         tokens.push(Token::LessThan);
                     }
+                } else {
+                    tokens.push(Token::LessThan);
                 }
             }
             '>' => {
@@ -98,7 +100,10 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                         chars.next(); // consume the equals sign
                         tokens.push(Token::GreaterThanOrEqual);
                     } else {
-                    tokens.push(Token::GreaterThan); }
+                        tokens.push(Token::GreaterThan);
+                    }
+                } else {
+                    tokens.push(Token::GreaterThan);
                 }
             }
             '!' => {
@@ -294,8 +299,7 @@ mod tests {
 
     #[test]
     fn test_tokenize_comparison_logical() {
-        let sql = "< > <= >= != AND OR"; 
-        // let sql = "<="; 
+        let sql = "< > <= >= != AND OR";
         let tokens = tokenize(sql).unwrap();
 
         assert_eq!(tokens[0], Token::LessThan);
