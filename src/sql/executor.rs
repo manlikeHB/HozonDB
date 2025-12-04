@@ -37,6 +37,7 @@ impl Executor {
             Statement::Select {
                 table_name,
                 columns,
+                where_clause,
             } => self.execute_select(table_name, columns),
         }
     }
@@ -346,6 +347,7 @@ mod tests {
             .execute(Statement::Select {
                 table_name: "users".to_string(),
                 columns: SelectColumns::All,
+                where_clause: None,
             })
             .unwrap();
 
@@ -475,6 +477,7 @@ mod tests {
             .execute(Statement::Select {
                 table_name: "users".to_string(),
                 columns: SelectColumns::All,
+                where_clause: None,
             })
             .unwrap();
 
@@ -526,6 +529,7 @@ mod tests {
             .execute(Statement::Select {
                 table_name: "users".to_string(),
                 columns: SelectColumns::Specific(vec!["name".to_string(), "id".to_string()]),
+                where_clause: None,
             })
             .unwrap();
 
@@ -575,6 +579,7 @@ mod tests {
         let result = executor.execute(Statement::Select {
             table_name: "users".to_string(),
             columns: SelectColumns::Specific(vec!["nonexistent".to_string()]),
+            where_clause: None,
         });
 
         assert!(result.is_err());
@@ -599,6 +604,7 @@ mod tests {
             .execute(Statement::Select {
                 table_name: "users".to_string(),
                 columns: SelectColumns::All,
+                where_clause: None,
             })
             .unwrap();
 
@@ -650,6 +656,7 @@ mod tests {
             .execute(Statement::Select {
                 table_name: "test".to_string(),
                 columns: SelectColumns::All,
+                where_clause: None,
             })
             .unwrap();
 
@@ -740,6 +747,7 @@ mod tests {
             .execute(Statement::Select {
                 table_name: "users".to_string(),
                 columns: SelectColumns::All,
+                where_clause: None,
             })
             .unwrap();
 

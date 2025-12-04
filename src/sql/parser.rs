@@ -15,6 +15,7 @@ pub enum Statement {
     Select {
         table_name: String,
         columns: SelectColumns,
+        where_clause: Option<Expr>,
     },
 }
 
@@ -22,6 +23,31 @@ pub enum Statement {
 pub enum SelectColumns {
     All,
     Specific(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Literal(Value),
+    Column(String),
+    BinaryOp {
+        left: Box<Expr>,
+        op: BinaryOperator,
+        right: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryOperator {
+    // Comparison
+    Equals,
+    NotEquals,
+    LessThan,
+    GreaterThan,
+    LessOrEqual,
+    GreaterOrEqual,
+    // logical
+    And,
+    Or,
 }
 
 pub struct Parser {
@@ -274,6 +300,7 @@ impl Parser {
         Ok(Statement::Select {
             table_name,
             columns,
+            where_clause: None,
         })
     }
 }
@@ -344,6 +371,7 @@ mod tests {
             Statement::Select {
                 table_name,
                 columns,
+                where_clause: None,
             } => {
                 assert_eq!(table_name, "users");
                 assert_eq!(columns, SelectColumns::All);
@@ -363,6 +391,7 @@ mod tests {
             Statement::Select {
                 table_name,
                 columns,
+                where_clause: None,
             } => {
                 assert_eq!(table_name, "users");
                 match columns {

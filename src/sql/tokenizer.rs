@@ -32,12 +32,12 @@ pub enum Token {
     RightParen, // )
     Equals,     // =
 
-    //
-    LessThan,           // <
-    GreaterThan,        // >
-    GreaterThanOrEqual, // >=
-    LessThanOrEqual,    // <=
-    NotEquals,          // !=
+    // Comparison
+    LessThan,       // <
+    GreaterThan,    // >
+    GreaterOrEqual, // >=
+    LessOrEqual,    // <=
+    NotEquals,      // !=
 
     // Logical
     And,
@@ -85,7 +85,7 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                 if let Some(&c) = chars.peek() {
                     if c == '=' {
                         chars.next(); // consume the equals sign
-                        tokens.push(Token::LessThanOrEqual);
+                        tokens.push(Token::LessOrEqual);
                     } else {
                         tokens.push(Token::LessThan);
                     }
@@ -98,7 +98,7 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                 if let Some(&c) = chars.peek() {
                     if c == '=' {
                         chars.next(); // consume the equals sign
-                        tokens.push(Token::GreaterThanOrEqual);
+                        tokens.push(Token::GreaterOrEqual);
                     } else {
                         tokens.push(Token::GreaterThan);
                     }
@@ -304,8 +304,8 @@ mod tests {
 
         assert_eq!(tokens[0], Token::LessThan);
         assert_eq!(tokens[1], Token::GreaterThan);
-        assert_eq!(tokens[2], Token::LessThanOrEqual);
-        assert_eq!(tokens[3], Token::GreaterThanOrEqual);
+        assert_eq!(tokens[2], Token::LessOrEqual);
+        assert_eq!(tokens[3], Token::GreaterOrEqual);
         assert_eq!(tokens[4], Token::NotEquals);
         assert_eq!(tokens[5], Token::And);
         assert_eq!(tokens[6], Token::Or);
