@@ -32,6 +32,17 @@ pub enum Token {
     RightParen, // )
     Equals,     // =
 
+    //
+    LessThan,           // <
+    GreaterThan,        // >
+    GreaterThanOrEqual, // >=
+    LessThanOrEqual,    // <=
+    NotEquals,          // !=
+
+    // Logical
+    And,
+    Or,
+
     // Special
     Eof, // End of input
 }
@@ -68,6 +79,36 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
             '=' => {
                 tokens.push(Token::Equals);
                 chars.next();
+            }
+            '<' => {
+                chars.next(); // consume < 
+                if let Some(&c) = chars.peek() {
+                    if c == '=' {
+                        chars.next(); // consume the equals sign
+                        tokens.push(Token::LessThanOrEqual);
+                    } else {
+                        tokens.push(Token::LessThan);
+                    }
+                }
+            }
+            '>' => {
+                chars.next();
+                if let Some(&c) = chars.peek() {
+                    if c == '=' {
+                        chars.next(); // consume the equals sign
+                        tokens.push(Token::GreaterThanOrEqual);
+                    } else {
+                    tokens.push(Token::GreaterThan); }
+                }
+            }
+            '!' => {
+                chars.next();
+                if let Some(&c) = chars.peek() {
+                    if c == '=' {
+                        chars.next(); // consume the equals
+                        tokens.push(Token::NotEquals);
+                    }
+                }
             }
             '\'' => {
                 chars.next(); // consume opening quote
@@ -135,6 +176,8 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                     "NULL" => Token::Null,
                     "TRUE" => Token::BoolLiteral(true),
                     "FALSE" => Token::BoolLiteral(false),
+                    "AND" => Token::And,
+                    "OR" => Token::Or,
                     _ => Token::Identifier(word),
                 };
 
@@ -247,5 +290,20 @@ mod tests {
 
         assert_eq!(tokens[2], Token::BoolLiteral(true));
         assert_eq!(tokens[4], Token::BoolLiteral(false));
+    }
+
+    #[test]
+    fn test_tokenize_comparison_logical() {
+        let sql = "< > <= >= != AND OR"; 
+        // let sql = "<="; 
+        let tokens = tokenize(sql).unwrap();
+
+        assert_eq!(tokens[0], Token::LessThan);
+        assert_eq!(tokens[1], Token::GreaterThan);
+        assert_eq!(tokens[2], Token::LessThanOrEqual);
+        assert_eq!(tokens[3], Token::GreaterThanOrEqual);
+        assert_eq!(tokens[4], Token::NotEquals);
+        assert_eq!(tokens[5], Token::And);
+        assert_eq!(tokens[6], Token::Or);
     }
 }
