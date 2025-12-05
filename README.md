@@ -25,5 +25,3 @@ hozondb> .exit
 ## About
 
 Learning project built in public.
-
-[Follow the journey on LinkedIn](linkedin.com/in/manlikehb)
