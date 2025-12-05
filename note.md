@@ -1,11 +1,11 @@
 ### TODO
 - Implement PID-based stale lock detection
+- Handle when a page is full
+- Better error handling?
+- Documentation
 
 ### Concerns
 - Should new created db files be automatically added to `.gitignore`?
-- Handle page full
-
-
 
 ### sql statement
 ```javascript
