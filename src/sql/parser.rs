@@ -295,13 +295,106 @@ impl Parser {
 
         self.expect(Token::From)?;
         let table_name = self.get_table_name()?;
+
+        let where_clause = if matches!(self.peek(), Some(Token::Where)) {
+            self.advance(); // consume WHERE token
+            match self.parse_or_expr() {
+                Ok(exp) => Some(exp),
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
         self.expect(Token::Semicolon)?;
 
         Ok(Statement::Select {
             table_name,
             columns,
-            where_clause: None,
+            where_clause,
         })
+    }
+
+    /// for parsing the operands, for determining the values/columns in a comparison
+    /// It is of the highest precedence
+    fn parse_operand(&mut self) -> io::Result<Expr> {
+        match self.consume() {
+            Some(Token::Identifier(c)) => Ok(Expr::Column(c)),
+            Some(Token::NumberLiteral(n)) => Ok(Expr::Literal(Value::Integer(n))),
+            Some(Token::StringLiteral(s)) => Ok(Expr::Literal(Value::Text(s))),
+            Some(Token::BoolLiteral(b)) => Ok(Expr::Literal(Value::Boolean(b))),
+            Some(Token::Null) => Ok(Expr::Literal(Value::Null)),
+            _ => Err(Error::new(ErrorKind::InvalidData, "Expected an operand")),
+        }
+    }
+
+    /// for building a comparison Expr
+    /// left == operand, op == Binary Operator, right == operand
+    fn parse_comparison(&mut self) -> io::Result<Expr> {
+        let left = self.parse_operand()?;
+
+        let op = match self.peek() {
+            Some(Token::Equals) => BinaryOperator::Equals,
+            Some(Token::NotEquals) => BinaryOperator::NotEquals,
+            Some(Token::LessThan) => BinaryOperator::LessThan,
+            Some(Token::GreaterThan) => BinaryOperator::GreaterThan,
+            Some(Token::LessOrEqual) => BinaryOperator::LessOrEqual,
+            Some(Token::GreaterOrEqual) => BinaryOperator::GreaterOrEqual,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Expected a comparison operator",
+                ));
+            }
+        };
+
+        self.advance();
+        let right = self.parse_operand()?;
+
+        Ok(Expr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        })
+    }
+
+    /// for parsing an AND expr
+    /// calls `parse_comparison` to build the left and right Expr for an AND Expr
+    fn parse_and_expr(&mut self) -> io::Result<Expr> {
+        let mut left = self.parse_comparison()?;
+
+        while matches!(self.peek(), Some(Token::And)) {
+            self.advance();
+            let right = self.parse_comparison()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOperator::And,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    /// entry point for parsing where clause,
+    /// as it is of the lowest precedence so it get's evaluated last
+    /// it calls a higher precedence function `parse_and_expr`
+    fn parse_or_expr(&mut self) -> io::Result<Expr> {
+        let mut left = self.parse_and_expr()?;
+
+        while matches!(self.peek(), Some(Token::Or)) {
+            self.advance();
+            let right = self.parse_and_expr()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOperator::Or,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
     }
 }
 
@@ -405,5 +498,388 @@ mod tests {
             }
             _ => panic!("Expected Select statement"),
         }
+    }
+
+    #[test]
+    fn test_parse_where_simple_equals() {
+        let sql = "SELECT * FROM users WHERE id = 1;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select {
+                table_name,
+                where_clause,
+                ..
+            } => {
+                assert_eq!(table_name, "users");
+                assert!(where_clause.is_some());
+
+                match where_clause.unwrap() {
+                    Expr::BinaryOp { left, op, right } => {
+                        assert!(matches!(*left, Expr::Column(_)));
+                        assert_eq!(op, BinaryOperator::Equals);
+                        assert!(matches!(*right, Expr::Literal(_)));
+                    }
+                    _ => panic!("Expected BinaryOp"),
+                }
+            }
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_all_comparison_operators() {
+        let test_cases = vec![
+            ("SELECT * FROM users WHERE id = 1;", BinaryOperator::Equals),
+            (
+                "SELECT * FROM users WHERE id != 1;",
+                BinaryOperator::NotEquals,
+            ),
+            (
+                "SELECT * FROM users WHERE id < 1;",
+                BinaryOperator::LessThan,
+            ),
+            (
+                "SELECT * FROM users WHERE id > 1;",
+                BinaryOperator::GreaterThan,
+            ),
+            (
+                "SELECT * FROM users WHERE id <= 1;",
+                BinaryOperator::LessOrEqual,
+            ),
+            (
+                "SELECT * FROM users WHERE id >= 1;",
+                BinaryOperator::GreaterOrEqual,
+            ),
+        ];
+
+        for (sql, expected_op) in test_cases {
+            let tokens = tokenize(sql).unwrap();
+            let mut parser = Parser::new(tokens);
+            let statement = parser.parse().unwrap();
+
+            match statement {
+                Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                    Expr::BinaryOp { op, .. } => {
+                        assert_eq!(op, expected_op, "Failed for SQL: {}", sql);
+                    }
+                    _ => panic!("Expected BinaryOp for SQL: {}", sql),
+                },
+                _ => panic!("Expected Select statement for SQL: {}", sql),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_where_with_text_literal() {
+        let sql = "SELECT * FROM users WHERE name = 'Alice';";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                Expr::BinaryOp { left, right, .. } => match (*left, *right) {
+                    (Expr::Column(col), Expr::Literal(Value::Text(text))) => {
+                        assert_eq!(col, "name");
+                        assert_eq!(text, "Alice");
+                    }
+                    _ => panic!("Expected Column and Text literal"),
+                },
+                _ => panic!("Expected BinaryOp"),
+            },
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_with_boolean() {
+        let sql = "SELECT * FROM users WHERE active = true;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                Expr::BinaryOp { right, .. } => {
+                    assert!(matches!(*right, Expr::Literal(Value::Boolean(true))));
+                }
+                _ => panic!("Expected BinaryOp"),
+            },
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_simple_and() {
+        let sql = "SELECT * FROM users WHERE id = 1 AND name = 'Alice';";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                Expr::BinaryOp { op, left, right } => {
+                    assert_eq!(op, BinaryOperator::And);
+                    // Left should be "id = 1"
+                    assert!(matches!(
+                        *left,
+                        Expr::BinaryOp {
+                            op: BinaryOperator::Equals,
+                            ..
+                        }
+                    ));
+                    // Right should be "name = 'Alice'"
+                    assert!(matches!(*right, Expr::BinaryOp { .. }));
+                }
+                _ => panic!("Expected BinaryOp with AND"),
+            },
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_simple_or() {
+        let sql = "SELECT * FROM users WHERE id = 1 OR id = 2;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                Expr::BinaryOp { op, left, right } => {
+                    assert_eq!(op, BinaryOperator::Or);
+                    assert!(matches!(*left, Expr::BinaryOp { .. }));
+                    assert!(matches!(*right, Expr::BinaryOp { .. }));
+                }
+                _ => panic!("Expected BinaryOp with OR"),
+            },
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_multiple_and() {
+        let sql = "SELECT * FROM users WHERE id > 1 AND age < 30 AND active = true;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => {
+                assert!(where_clause.is_some());
+                // Should have nested AND operations
+                match where_clause.unwrap() {
+                    Expr::BinaryOp { op, .. } => {
+                        assert_eq!(op, BinaryOperator::And);
+                    }
+                    _ => panic!("Expected BinaryOp"),
+                }
+            }
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_multiple_or() {
+        let sql = "SELECT * FROM users WHERE id = 1 OR id = 2 OR id = 3;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                Expr::BinaryOp { op, .. } => {
+                    assert_eq!(op, BinaryOperator::Or);
+                }
+                _ => panic!("Expected BinaryOp"),
+            },
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_and_or_precedence() {
+        // Should parse as: id = 1 OR (age > 18 AND active = true)
+        let sql = "SELECT * FROM users WHERE id = 1 OR age > 18 AND active = true;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                Expr::BinaryOp { op, left, right } => {
+                    // Top level should be OR
+                    assert_eq!(op, BinaryOperator::Or);
+
+                    // Left should be simple comparison "id = 1"
+                    match *left {
+                        Expr::BinaryOp { op, .. } => {
+                            assert_eq!(op, BinaryOperator::Equals);
+                        }
+                        _ => panic!("Expected Equals comparison on left"),
+                    }
+
+                    // Right should be AND expression
+                    match *right {
+                        Expr::BinaryOp { op, .. } => {
+                            assert_eq!(op, BinaryOperator::And);
+                        }
+                        _ => panic!("Expected AND on right"),
+                    }
+                }
+                _ => panic!("Expected BinaryOp"),
+            },
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_complex_precedence() {
+        // Should parse as: (id = 1 AND age > 18) OR (name = 'Alice' AND active = true)
+        let sql =
+            "SELECT * FROM users WHERE id = 1 AND age > 18 OR name = 'Alice' AND active = true;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                Expr::BinaryOp { op, left, right } => {
+                    // Top level should be OR
+                    assert_eq!(op, BinaryOperator::Or);
+
+                    // Both sides should be AND expressions
+                    match (*left, *right) {
+                        (
+                            Expr::BinaryOp { op: left_op, .. },
+                            Expr::BinaryOp { op: right_op, .. },
+                        ) => {
+                            assert_eq!(left_op, BinaryOperator::And);
+                            assert_eq!(right_op, BinaryOperator::And);
+                        }
+                        _ => panic!("Expected AND on both sides"),
+                    }
+                }
+                _ => panic!("Expected BinaryOp"),
+            },
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_without_where() {
+        let sql = "SELECT * FROM users;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => {
+                assert!(where_clause.is_none());
+            }
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_with_specific_columns() {
+        let sql = "SELECT id, name FROM users WHERE age > 18;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select {
+                columns,
+                where_clause,
+                ..
+            } => {
+                // Check columns
+                match columns {
+                    SelectColumns::Specific(cols) => {
+                        assert_eq!(cols.len(), 2);
+                        assert_eq!(cols[0], "id");
+                        assert_eq!(cols[1], "name");
+                    }
+                    _ => panic!("Expected specific columns"),
+                }
+
+                // Check WHERE clause
+                assert!(where_clause.is_some());
+            }
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_with_null() {
+        let sql = "SELECT * FROM users WHERE data = NULL;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                Expr::BinaryOp { right, .. } => {
+                    assert!(matches!(*right, Expr::Literal(Value::Null)));
+                }
+                _ => panic!("Expected BinaryOp"),
+            },
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_negative_number() {
+        let sql = "SELECT * FROM users WHERE balance < -100;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Select { where_clause, .. } => match where_clause.unwrap() {
+                Expr::BinaryOp { right, .. } => match *right {
+                    Expr::Literal(Value::Integer(n)) => {
+                        assert_eq!(n, -100);
+                    }
+                    _ => panic!("Expected negative integer"),
+                },
+                _ => panic!("Expected BinaryOp"),
+            },
+            _ => panic!("Expected Select statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_error_missing_operand() {
+        let sql = "SELECT * FROM users WHERE id =;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_where_error_missing_operator() {
+        let sql = "SELECT * FROM users WHERE id 1;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_where_error_invalid_token() {
+        let sql = "SELECT * FROM users WHERE * = 1;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_err());
     }
 }
