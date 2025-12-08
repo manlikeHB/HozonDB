@@ -17,6 +17,9 @@ pub enum Statement {
         columns: SelectColumns,
         where_clause: Option<Expr>,
     },
+    DropTable {
+        name: String,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -98,6 +101,7 @@ impl Parser {
                 Token::Create => self.parse_create_table(),
                 Token::Insert => self.parse_insert(),
                 Token::Select => self.parse_select(),
+                Token::Drop => self.parse_drop_table(),
                 _ => Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("Unexpected token: {:?}", token),
@@ -395,6 +399,15 @@ impl Parser {
         }
 
         Ok(left)
+    }
+
+    fn parse_drop_table(&mut self) -> io::Result<Statement> {
+        self.expect(Token::Drop)?;
+        self.expect(Token::Table)?;
+
+        let table_name = self.get_table_name()?;
+
+        Ok(Statement::DropTable { name: table_name })
     }
 }
 
@@ -881,5 +894,20 @@ mod tests {
         let result = parser.parse();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_drop_table() {
+        let sql = "DROP TABLE users;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::DropTable { name } => {
+                assert_eq!(name, "users");
+            }
+            _ => panic!("Expected DropTable statement"),
+        }
     }
 }

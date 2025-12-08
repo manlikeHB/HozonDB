@@ -11,6 +11,7 @@ pub enum Token {
     Insert,
     Into,
     Values,
+    Drop,
 
     // Data types
     Integer,
@@ -183,6 +184,7 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                     "FALSE" => Token::BoolLiteral(false),
                     "AND" => Token::And,
                     "OR" => Token::Or,
+                    "DROP" => Token::Drop,
                     _ => Token::Identifier(word),
                 };
 
@@ -309,5 +311,13 @@ mod tests {
         assert_eq!(tokens[4], Token::NotEquals);
         assert_eq!(tokens[5], Token::And);
         assert_eq!(tokens[6], Token::Or);
+    }
+
+    #[test]
+    fn test_tokenize_drop_table() {
+        let sql = "Drop";
+        let tokens = tokenize(sql).unwrap();
+
+        assert_eq!(tokens[0], Token::Drop);
     }
 }
