@@ -6,7 +6,7 @@ use crate::{
         schema::{Column, Schema},
         table::TableCatalog,
     },
-    sql::parser::{SelectColumns, Statement},
+    sql::parser::{BinaryOperator, Expr, SelectColumns, Statement},
     storage::page::{PAGE_DATA_START, PAGE_SIZE, PageManager, PageMetadata},
 };
 
@@ -38,7 +38,7 @@ impl Executor {
                 table_name,
                 columns,
                 where_clause,
-            } => self.execute_select(table_name, columns),
+            } => self.execute_select(table_name, columns, where_clause),
         }
     }
 
@@ -144,6 +144,7 @@ impl Executor {
         &mut self,
         table_name: String,
         select_columns: SelectColumns,
+        where_clause: Option<Expr>,
     ) -> io::Result<ExecutionResult> {
         // Get table metadata
         let (first_page, columns) = match self.catalog.get_table(&table_name) {
@@ -180,11 +181,30 @@ impl Executor {
             offset += byte_consumed;
         }
 
+        // filter rows based on the where clause
+        let filtered_rows: Vec<Row> = rows
+            .into_iter()
+            .filter_map(|row| {
+                if let Some(ref expr) = where_clause {
+                    match evaluate_expr(expr, &row, &all_column_names) {
+                        Ok(true) => Some(row),
+                        Ok(false) => None,
+                        Err(e) => {
+                            eprintln!("Warning: Error evaluating WHERE clause: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    Some(row)
+                }
+            })
+            .collect();
+
         // Handle column selection
         match select_columns {
             SelectColumns::All => Ok(ExecutionResult::Rows {
                 columns: all_column_names,
-                rows,
+                rows: filtered_rows,
             }),
             SelectColumns::Specific(requested_cols) => {
                 // Find indices of requested columns
@@ -210,7 +230,7 @@ impl Executor {
                 }
 
                 // Project rows to only include selected columns
-                let projected_rows: Vec<Row> = rows
+                let projected_rows: Vec<Row> = filtered_rows
                     .iter()
                     .map(|row| {
                         let values: Vec<Value> = column_indices
@@ -227,6 +247,111 @@ impl Executor {
                 })
             }
         }
+    }
+}
+
+fn get_value(expr: &Expr, row: &Row, col_names: &[String]) -> io::Result<Value> {
+    match expr {
+        Expr::Literal(v) => Ok(v.clone()),
+        Expr::Column(n) => {
+            let index = match col_names.iter().position(|x| x == n) {
+                Some(i) => i,
+                None => return Err(Error::new(ErrorKind::InvalidData, "Column doesn't exist")),
+            };
+
+            row.get_value(index)
+                .cloned()
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "No row"))
+        }
+        Expr::BinaryOp { .. } => Err(Error::new(ErrorKind::InvalidData, "Unexpected Binary Op")),
+    }
+}
+
+fn evaluate_expr(expr: &Expr, row: &Row, col_names: &[String]) -> io::Result<bool> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                let left = evaluate_expr(left, row, col_names)?;
+                let right = evaluate_expr(right, row, col_names)?;
+                Ok(left && right)
+            }
+            BinaryOperator::Or => {
+                let left = evaluate_expr(left, row, col_names)?;
+                let right = evaluate_expr(right, row, col_names)?;
+                Ok(left || right)
+            }
+            BinaryOperator::Equals
+            | BinaryOperator::NotEquals
+            | BinaryOperator::LessThan
+            | BinaryOperator::GreaterThan
+            | BinaryOperator::LessOrEqual
+            | BinaryOperator::GreaterOrEqual => {
+                let left_val = get_value(left, row, col_names)?;
+                let right_val = get_value(right, row, col_names)?;
+                compare_values(&left_val, &right_val, op)
+            }
+        },
+        _ => {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Expected BinaryOp in WHERE clause",
+            ));
+        }
+    }
+}
+
+fn compare_values(left: &Value, right: &Value, op: &BinaryOperator) -> io::Result<bool> {
+    match (left, right) {
+        (Value::Integer(a), Value::Integer(b)) => Ok(match op {
+            BinaryOperator::Equals => a == b,
+            BinaryOperator::NotEquals => a != b,
+            BinaryOperator::LessThan => a < b,
+            BinaryOperator::GreaterThan => a > b,
+            BinaryOperator::LessOrEqual => a <= b,
+            BinaryOperator::GreaterOrEqual => a >= b,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid operator for integers",
+                ));
+            }
+        }),
+        (Value::Text(a), Value::Text(b)) => Ok(match op {
+            BinaryOperator::Equals => a == b,
+            BinaryOperator::NotEquals => a != b,
+            BinaryOperator::LessThan => a < b,
+            BinaryOperator::GreaterThan => a > b,
+            BinaryOperator::LessOrEqual => a <= b,
+            BinaryOperator::GreaterOrEqual => a >= b,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid operator for text",
+                ));
+            }
+        }),
+        (Value::Boolean(a), Value::Boolean(b)) => Ok(match op {
+            BinaryOperator::Equals => a == b,
+            BinaryOperator::NotEquals => a != b,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Booleans only support = and !=",
+                ));
+            }
+        }),
+        (Value::Null, Value::Null) => {
+            // SQL standard: NULL = NULL is false
+            Ok(false)
+        }
+        (Value::Null, _) | (_, Value::Null) => {
+            // NULL compared to anything is false
+            Ok(false)
+        }
+        _ => Err(Error::new(
+            ErrorKind::InvalidData,
+            "Type mismatch in comparison",
+        )),
     }
 }
 
@@ -761,5 +886,486 @@ mod tests {
         }
 
         cleanup("test_exec_nulls");
+    }
+
+    #[test]
+    fn test_where_equals_integer() {
+        cleanup("test_where_eq_int");
+        let mut executor = create_test_executor("test_where_eq_int");
+
+        // Setup
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("name", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(2), Value::Text("Bob".to_string())],
+            })
+            .unwrap();
+
+        // Test WHERE id = 2
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(2))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values()[1] {
+                    Value::Text(name) => assert_eq!(name, "Bob"),
+                    _ => panic!("Expected Text"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_where_eq_int");
+    }
+
+    #[test]
+    fn test_where_equals_text() {
+        cleanup("test_where_eq_text");
+        let mut executor = create_test_executor("test_where_eq_text");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("name", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(2), Value::Text("Bob".to_string())],
+            })
+            .unwrap();
+
+        // Test WHERE name = 'Alice'
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("name".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Text("Alice".to_string()))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values()[0] {
+                    Value::Integer(id) => assert_eq!(*id, 1),
+                    _ => panic!("Expected Integer"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_where_eq_text");
+    }
+
+    #[test]
+    fn test_where_greater_than() {
+        cleanup("test_where_gt");
+        let mut executor = create_test_executor("test_where_gt");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("age", DataType::Integer),
+                ],
+            })
+            .unwrap();
+
+        for i in 1..=5 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i), Value::Integer(20 + i)],
+                })
+                .unwrap();
+        }
+
+        // Test WHERE age > 23
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("age".to_string())),
+                    op: BinaryOperator::GreaterThan,
+                    right: Box::new(Expr::Literal(Value::Integer(23))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2); // ages 24 and 25
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_where_gt");
+    }
+
+    #[test]
+    fn test_where_less_than() {
+        cleanup("test_where_lt");
+        let mut executor = create_test_executor("test_where_lt");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![Column::new("id", DataType::Integer)],
+            })
+            .unwrap();
+
+        for i in 1..=5 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i * 10)],
+                })
+                .unwrap();
+        }
+
+        // Test WHERE id < 30
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::LessThan,
+                    right: Box::new(Expr::Literal(Value::Integer(30))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2); // 10 and 20
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_where_lt");
+    }
+
+    #[test]
+    fn test_where_and_simple() {
+        cleanup("test_where_and");
+        let mut executor = create_test_executor("test_where_and");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("age", DataType::Integer),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1), Value::Integer(25)],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(2), Value::Integer(30)],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(3), Value::Integer(35)],
+            })
+            .unwrap();
+
+        // Test WHERE id > 1 AND age < 35
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::GreaterThan,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                    op: BinaryOperator::And,
+                    right: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("age".to_string())),
+                        op: BinaryOperator::LessThan,
+                        right: Box::new(Expr::Literal(Value::Integer(35))),
+                    }),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1); // Only id=2, age=30
+                match &rows[0].values()[0] {
+                    Value::Integer(id) => assert_eq!(*id, 2),
+                    _ => panic!("Expected Integer"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_where_and");
+    }
+
+    #[test]
+    fn test_where_or_simple() {
+        cleanup("test_where_or");
+        let mut executor = create_test_executor("test_where_or");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![Column::new("id", DataType::Integer)],
+            })
+            .unwrap();
+
+        for i in 1..=5 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i)],
+                })
+                .unwrap();
+        }
+
+        // Test WHERE id = 1 OR id = 5
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                    op: BinaryOperator::Or,
+                    right: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(5))),
+                    }),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2); // id=1 and id=5
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_where_or");
+    }
+
+    #[test]
+    fn test_where_no_matches() {
+        cleanup("test_where_none");
+        let mut executor = create_test_executor("test_where_none");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![Column::new("id", DataType::Integer)],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1)],
+            })
+            .unwrap();
+
+        // Test WHERE id = 999 (doesn't exist)
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(999))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0); // No matches
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_where_none");
+    }
+
+    #[test]
+    fn test_where_with_specific_columns() {
+        cleanup("test_where_cols");
+        let mut executor = create_test_executor("test_where_cols");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("name", DataType::Text),
+                    Column::new("age", DataType::Integer),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![
+                    Value::Integer(1),
+                    Value::Text("Alice".to_string()),
+                    Value::Integer(25),
+                ],
+            })
+            .unwrap();
+
+        // Test SELECT name FROM users WHERE id = 1
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::Specific(vec!["name".to_string()]),
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(1))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { columns, rows } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0], "name");
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values()[0] {
+                    Value::Text(name) => assert_eq!(name, "Alice"),
+                    _ => panic!("Expected Text"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_where_cols");
+    }
+
+    #[test]
+    fn test_where_boolean() {
+        cleanup("test_where_bool");
+        let mut executor = create_test_executor("test_where_bool");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("name", DataType::Text),
+                    Column::new("active", DataType::Boolean),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Text("Alice".to_string()), Value::Boolean(true)],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Text("Bob".to_string()), Value::Boolean(false)],
+            })
+            .unwrap();
+
+        // Test WHERE active = true
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("active".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Boolean(true))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values()[0] {
+                    Value::Text(name) => assert_eq!(name, "Alice"),
+                    _ => panic!("Expected Text"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_where_bool");
     }
 }
