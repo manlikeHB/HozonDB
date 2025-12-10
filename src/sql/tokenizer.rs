@@ -12,6 +12,7 @@ pub enum Token {
     Into,
     Values,
     Drop,
+    Delete,
 
     // Data types
     Integer,
@@ -185,6 +186,7 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                     "AND" => Token::And,
                     "OR" => Token::Or,
                     "DROP" => Token::Drop,
+                    "DELETE" => Token::Delete,
                     _ => Token::Identifier(word),
                 };
 
@@ -319,5 +321,13 @@ mod tests {
         let tokens = tokenize(sql).unwrap();
 
         assert_eq!(tokens[0], Token::Drop);
+    }
+
+    #[test]
+    fn test_tokenize_delete_table() {
+        let sql = "Delete";
+        let tokens = tokenize(sql).unwrap();
+
+        assert_eq!(tokens[0], Token::Delete);
     }
 }

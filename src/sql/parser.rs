@@ -20,6 +20,10 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    Delete {
+        table_name: String,
+        where_clause: Option<Expr>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -102,6 +106,7 @@ impl Parser {
                 Token::Insert => self.parse_insert(),
                 Token::Select => self.parse_select(),
                 Token::Drop => self.parse_drop_table(),
+                Token::Delete => self.parse_delete(),
                 _ => Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("Unexpected token: {:?}", token),
@@ -410,6 +415,31 @@ impl Parser {
         self.expect(Token::Semicolon)?;
 
         Ok(Statement::DropTable { name: table_name })
+    }
+
+    fn parse_delete(&mut self) -> io::Result<Statement> {
+        self.expect(Token::Delete)?;
+        self.expect(Token::From)?;
+        let table_name = self.get_table_name()?;
+
+        let where_clause = if matches!(self.peek(), Some(Token::Where)) {
+            self.advance();
+            match self.parse_or_expr() {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
+        self.expect(Token::Semicolon)?;
+
+        Ok(Statement::Delete {
+            table_name,
+            where_clause,
+        })
     }
 }
 
@@ -910,6 +940,53 @@ mod tests {
                 assert_eq!(name, "users");
             }
             _ => panic!("Expected DropTable statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete() {
+        let sql = "DELETE FROM users;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Delete {
+                table_name,
+                where_clause,
+            } => {
+                assert_eq!(table_name, "users");
+                assert!(where_clause.is_none());
+            }
+            _ => panic!("Expected Delete statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_with_where_clause() {
+        let sql = "DELETE FROM users WHERE id = 1;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Delete {
+                table_name,
+                where_clause,
+            } => {
+                assert_eq!(table_name, "users");
+                assert!(where_clause.is_some());
+
+                match where_clause.unwrap() {
+                    Expr::BinaryOp { left, op, right } => {
+                        assert!(matches!(*left, Expr::Column(_)));
+                        assert_eq!(op, BinaryOperator::Equals);
+                        assert!(matches!(*right, Expr::Literal(_)));
+                    }
+                    _ => panic!("Expected BinaryOp"),
+                }
+            }
+            _ => panic!("Expected Delete statement"),
         }
     }
 }
