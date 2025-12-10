@@ -407,6 +407,8 @@ impl Parser {
 
         let table_name = self.get_table_name()?;
 
+        self.expect(Token::Semicolon)?;
+
         Ok(Statement::DropTable { name: table_name })
     }
 }
