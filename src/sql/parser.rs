@@ -24,6 +24,11 @@ pub enum Statement {
         table_name: String,
         where_clause: Option<Expr>,
     },
+    Update {
+        table_name: String,
+        assignments: Vec<(String, Value)>,
+        where_clause: Option<Expr>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -107,6 +112,7 @@ impl Parser {
                 Token::Select => self.parse_select(),
                 Token::Drop => self.parse_drop_table(),
                 Token::Delete => self.parse_delete(),
+                Token::Update => self.parse_update(),
                 _ => Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("Unexpected token: {:?}", token),
@@ -438,6 +444,77 @@ impl Parser {
 
         Ok(Statement::Delete {
             table_name,
+            where_clause,
+        })
+    }
+
+    fn parse_update(&mut self) -> io::Result<Statement> {
+        self.expect(Token::Update)?;
+        let table_name = self.get_table_name()?;
+        self.expect(Token::Set)?;
+
+        let mut assignments: Vec<(String, Value)> = Vec::new();
+
+        loop {
+            match self.peek() {
+                Some(Token::Identifier(_)) => {
+                    let col_name = match self.consume() {
+                        Some(Token::Identifier(n)) => n,
+                        _ => {
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                "Expected a column name",
+                            ));
+                        }
+                    };
+
+                    self.expect(Token::Equals)?;
+
+                    let assignment = match self.consume() {
+                        Some(Token::StringLiteral(s)) => Value::Text(s),
+                        Some(Token::NumberLiteral(n)) => Value::Integer(n),
+                        Some(Token::BoolLiteral(b)) => Value::Boolean(b),
+                        Some(Token::Null) => Value::Null,
+                        _ => {
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                format!("Expected a value for {}", col_name),
+                            ));
+                        }
+                    };
+
+                    assignments.push((col_name, assignment));
+                }
+                Some(Token::Comma) => {
+                    self.advance();
+                    continue;
+                }
+                Some(Token::Where) | Some(Token::Semicolon) => {
+                    break;
+                }
+                _ => {
+                    return Err(Error::new(ErrorKind::InvalidData, "Expected a column name"));
+                }
+            }
+        }
+
+        let where_clause = if matches!(self.peek(), Some(Token::Where)) {
+            self.advance();
+            match self.parse_or_expr() {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
+        self.expect(Token::Semicolon)?;
+
+        Ok(Statement::Update {
+            table_name,
+            assignments,
             where_clause,
         })
     }
@@ -975,6 +1052,77 @@ mod tests {
                 where_clause,
             } => {
                 assert_eq!(table_name, "users");
+                assert!(where_clause.is_some());
+
+                match where_clause.unwrap() {
+                    Expr::BinaryOp { left, op, right } => {
+                        assert!(matches!(*left, Expr::Column(_)));
+                        assert_eq!(op, BinaryOperator::Equals);
+                        assert!(matches!(*right, Expr::Literal(_)));
+                    }
+                    _ => panic!("Expected BinaryOp"),
+                }
+            }
+            _ => panic!("Expected Delete statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_with_where_clause() {
+        let sql = "UPDATE users SET age = 30 WHERE id = 1;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Update {
+                table_name,
+                assignments,
+                where_clause,
+            } => {
+                assert_eq!(table_name, "users");
+
+                let (col, value) = &assignments[0];
+                assert_eq!(col, "age");
+                assert_eq!(value, &Value::Integer(30));
+
+                assert!(where_clause.is_some());
+
+                match where_clause.unwrap() {
+                    Expr::BinaryOp { left, op, right } => {
+                        assert!(matches!(*left, Expr::Column(_)));
+                        assert_eq!(op, BinaryOperator::Equals);
+                        assert!(matches!(*right, Expr::Literal(_)));
+                    }
+                    _ => panic!("Expected BinaryOp"),
+                }
+            }
+            _ => panic!("Expected Delete statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_double_columns() {
+        let sql = "UPDATE users SET name = 'Bob', age = 25 WHERE id = 2;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Update {
+                table_name,
+                assignments,
+                where_clause,
+            } => {
+                assert_eq!(table_name, "users");
+
+                let (col, value) = &assignments[0];
+                assert_eq!(col, "name");
+                assert_eq!(value, &Value::Text("Bob".to_string()));
+                let (col, value) = &assignments[1];
+                assert_eq!(col, "age");
+                assert_eq!(value, &Value::Integer(25));
+
                 assert!(where_clause.is_some());
 
                 match where_clause.unwrap() {

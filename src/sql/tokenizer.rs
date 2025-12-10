@@ -13,6 +13,8 @@ pub enum Token {
     Values,
     Drop,
     Delete,
+    Update,
+    Set,
 
     // Data types
     Integer,
@@ -187,6 +189,8 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                     "OR" => Token::Or,
                     "DROP" => Token::Drop,
                     "DELETE" => Token::Delete,
+                    "UPDATE" => Token::Update,
+                    "SET" => Token::Set,
                     _ => Token::Identifier(word),
                 };
 
@@ -324,10 +328,27 @@ mod tests {
     }
 
     #[test]
-    fn test_tokenize_delete_table() {
+    fn test_tokenize_delete() {
         let sql = "Delete";
         let tokens = tokenize(sql).unwrap();
 
         assert_eq!(tokens[0], Token::Delete);
+    }
+
+    #[test]
+    fn test_tokenize_update() {
+        let sql = "UPDATE users SET age = 30 WHERE id = 1";
+        let tokens = tokenize(sql).unwrap();
+
+        assert_eq!(tokens[0], Token::Update);
+        assert_eq!(tokens[1], Token::Identifier("users".to_string()));
+        assert_eq!(tokens[2], Token::Set);
+        assert_eq!(tokens[3], Token::Identifier("age".to_string()));
+        assert_eq!(tokens[4], Token::Equals);
+        assert_eq!(tokens[5], Token::NumberLiteral(30));
+        assert_eq!(tokens[6], Token::Where);
+        assert_eq!(tokens[7], Token::Identifier("id".to_string()));
+        assert_eq!(tokens[8], Token::Equals);
+        assert_eq!(tokens[9], Token::NumberLiteral(1));
     }
 }

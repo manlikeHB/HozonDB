@@ -3,7 +3,7 @@ use std::io::{self, Error, ErrorKind};
 use crate::{
     catalog::{
         row::{Row, Value},
-        schema::{Column, Schema},
+        schema::{Column, DataType, Schema},
         table::TableCatalog,
     },
     sql::parser::{BinaryOperator, Expr, SelectColumns, Statement},
@@ -44,6 +44,11 @@ impl Executor {
                 table_name,
                 where_clause,
             } => self.execute_delete(table_name, where_clause),
+            Statement::Update {
+                table_name,
+                assignments,
+                where_clause,
+            } => self.execute_update(table_name, assignments, where_clause),
         }
     }
 
@@ -347,6 +352,157 @@ impl Executor {
                 "{} {} deleted.",
                 num_rows,
                 if num_rows > 1 { "rows" } else { "row" },
+            ),
+        })
+    }
+
+    fn execute_update(
+        &mut self,
+        table_name: String,
+        assignments: Vec<(String, Value)>,
+        where_clause: Option<Expr>,
+    ) -> io::Result<ExecutionResult> {
+        // Get table metadata
+        let (first_page, columns) = match self.catalog.get_table(&table_name) {
+            Some(meta) => (meta.first_page(), meta.schema().columns()),
+            None => {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("Table '{}' does not exist", table_name),
+                ));
+            }
+        };
+
+        // Extract column names
+        let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
+
+        // Validate assignments (column exists + type matches)
+        for (col_name, value) in &assignments {
+            let col_index = all_column_names
+                .iter()
+                .position(|c| c == col_name)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "Column '{}' does not exist in table '{}'",
+                            col_name, table_name
+                        ),
+                    )
+                })?;
+
+            let column = &columns[col_index];
+            let valid = match (value, column.data_type()) {
+                (Value::Integer(_), DataType::Integer) => true,
+                (Value::Text(_), DataType::Text) => true,
+                (Value::Boolean(_), DataType::Boolean) => true,
+                (Value::Null, _) => true,
+                _ => false,
+            };
+
+            if !valid {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "Type mismatch for column '{}': expected {:?}, got {:?}",
+                        col_name,
+                        column.data_type(),
+                        value
+                    ),
+                ));
+            }
+        }
+
+        // Read page data
+        let mut page_data = self.catalog.read_page(first_page)?;
+        let page_meta = PageManager::read_metadata_from_buffer(&page_data);
+
+        // Check if table is empty
+        if page_meta.num_rows == 0 {
+            return Ok(ExecutionResult::Success {
+                message: "0 rows updated.".to_string(),
+            });
+        }
+
+        // Parse all rows from the page
+        let mut rows = Vec::new();
+        let mut offset = PAGE_DATA_START;
+
+        for _ in 0..page_meta.num_rows {
+            let (row, byte_consumed) = Row::from_bytes(&page_data[offset..])?;
+            rows.push(row);
+            offset += byte_consumed;
+        }
+
+        // Update rows based on WHERE clause
+        let mut updated_count = 0;
+        let updated_rows: Vec<Row> = rows
+            .into_iter()
+            .map(|row| {
+                let should_update = if let Some(ref expr) = where_clause {
+                    match evaluate_expr(expr, &row, &all_column_names) {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(e) => {
+                            eprintln!("Warning: Error evaluating WHERE clause: {}", e);
+                            false
+                        }
+                    }
+                } else {
+                    true // No WHERE = update all
+                };
+
+                if should_update {
+                    let mut updated_values = row.values().clone();
+
+                    // Apply assignments
+                    for (col_name, val) in &assignments {
+                        if let Some(index) = all_column_names.iter().position(|c| c == col_name) {
+                            updated_values[index] = val.clone();
+                        }
+                    }
+
+                    updated_count += 1;
+                    Row::new(updated_values)
+                } else {
+                    row
+                }
+            })
+            .collect();
+
+        // Serialize updated rows
+        let mut offset = PAGE_DATA_START;
+        for row in &updated_rows {
+            let row_bytes = row.to_bytes();
+
+            // Check if row fits
+            if offset + row_bytes.len() > PAGE_SIZE {
+                return Err(Error::new(
+                    ErrorKind::OutOfMemory,
+                    "Updated rows exceed page size - multi-page support not implemented",
+                ));
+            }
+
+            page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
+            offset += row_bytes.len();
+        }
+
+        // Update metadata
+        let metadata = PageMetadata {
+            is_full: page_meta.is_full,
+            last_offset: offset,
+            num_rows: updated_rows.len(),
+        };
+        PageManager::update_metadata_in_buffer(&mut page_data, &metadata);
+
+        // Write page back
+        self.catalog.write_page(first_page, &page_data)?;
+
+        Ok(ExecutionResult::Success {
+            message: format!(
+                "{} {} updated.",
+                updated_count,
+                if updated_count == 1 { "row" } else { "rows" }
             ),
         })
     }
@@ -2148,5 +2304,649 @@ mod tests {
         }
 
         cleanup("test_delete_insert");
+    }
+
+    #[test]
+    fn test_update_single_column() {
+        cleanup("test_update_single");
+        let mut executor = create_test_executor("test_update_single");
+
+        // Setup
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("name", DataType::Text),
+                    Column::new("age", DataType::Integer),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![
+                    Value::Integer(1),
+                    Value::Text("Alice".to_string()),
+                    Value::Integer(25),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![
+                    Value::Integer(2),
+                    Value::Text("Bob".to_string()),
+                    Value::Integer(30),
+                ],
+            })
+            .unwrap();
+
+        // Update WHERE id = 1
+        let result = executor
+            .execute(Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("age".to_string(), Value::Integer(26))],
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(1))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Success { message } => {
+                assert!(message.contains("1 row"));
+            }
+            _ => panic!("Expected Success result"),
+        }
+
+        // Verify update
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(1))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values()[2] {
+                    Value::Integer(age) => assert_eq!(*age, 26),
+                    _ => panic!("Expected Integer"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_single");
+    }
+
+    #[test]
+    fn test_update_multiple_columns() {
+        cleanup("test_update_multi");
+        let mut executor = create_test_executor("test_update_multi");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("name", DataType::Text),
+                    Column::new("age", DataType::Integer),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![
+                    Value::Integer(1),
+                    Value::Text("Alice".to_string()),
+                    Value::Integer(25),
+                ],
+            })
+            .unwrap();
+
+        // Update multiple columns
+        let result = executor
+            .execute(Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![
+                    ("name".to_string(), Value::Text("Alicia".to_string())),
+                    ("age".to_string(), Value::Integer(26)),
+                ],
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(1))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Success { message } => {
+                assert!(message.contains("1 row"));
+            }
+            _ => panic!("Expected Success result"),
+        }
+
+        // Verify both columns updated
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match (&rows[0].values()[1], &rows[0].values()[2]) {
+                    (Value::Text(name), Value::Integer(age)) => {
+                        assert_eq!(name, "Alicia");
+                        assert_eq!(*age, 26);
+                    }
+                    _ => panic!("Expected Text and Integer"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_multi");
+    }
+
+    #[test]
+    fn test_update_multiple_rows() {
+        cleanup("test_update_multi_rows");
+        let mut executor = create_test_executor("test_update_multi_rows");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("age", DataType::Integer),
+                    Column::new("active", DataType::Boolean),
+                ],
+            })
+            .unwrap();
+
+        for i in 1..=5 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Integer(i),
+                        Value::Integer(20 + i),
+                        Value::Boolean(true),
+                    ],
+                })
+                .unwrap();
+        }
+
+        // Update WHERE age > 23
+        let result = executor
+            .execute(Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("active".to_string(), Value::Boolean(false))],
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("age".to_string())),
+                    op: BinaryOperator::GreaterThan,
+                    right: Box::new(Expr::Literal(Value::Integer(23))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Success { message } => {
+                assert!(message.contains("2 rows")); // ages 24 and 25
+            }
+            _ => panic!("Expected Success result"),
+        }
+
+        // Verify correct rows updated
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("active".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Boolean(false))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_multi_rows");
+    }
+
+    #[test]
+    fn test_update_all_rows() {
+        cleanup("test_update_all");
+        let mut executor = create_test_executor("test_update_all");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("active", DataType::Boolean),
+                ],
+            })
+            .unwrap();
+
+        for i in 1..=3 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i), Value::Boolean(true)],
+                })
+                .unwrap();
+        }
+
+        // UPDATE without WHERE clause
+        let result = executor
+            .execute(Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("active".to_string(), Value::Boolean(false))],
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Success { message } => {
+                assert!(message.contains("3 rows"));
+            }
+            _ => panic!("Expected Success result"),
+        }
+
+        // Verify all rows updated
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                for row in rows {
+                    match &row.values()[1] {
+                        Value::Boolean(active) => assert_eq!(*active, false),
+                        _ => panic!("Expected Boolean"),
+                    }
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_all");
+    }
+
+    #[test]
+    fn test_update_no_matches() {
+        cleanup("test_update_none");
+        let mut executor = create_test_executor("test_update_none");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("age", DataType::Integer),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1), Value::Integer(25)],
+            })
+            .unwrap();
+
+        // Update WHERE id = 999 (doesn't exist)
+        let result = executor
+            .execute(Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("age".to_string(), Value::Integer(30))],
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(999))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Success { message } => {
+                assert!(message.contains("0 row"));
+            }
+            _ => panic!("Expected Success result"),
+        }
+
+        // Verify row unchanged
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values()[1] {
+                    Value::Integer(age) => assert_eq!(*age, 25),
+                    _ => panic!("Expected Integer"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_none");
+    }
+
+    #[test]
+    fn test_update_nonexistent_table() {
+        cleanup("test_update_no_table");
+        let mut executor = create_test_executor("test_update_no_table");
+
+        let result = executor.execute(Statement::Update {
+            table_name: "nonexistent".to_string(),
+            assignments: vec![("age".to_string(), Value::Integer(30))],
+            where_clause: None,
+        });
+
+        assert!(result.is_err());
+
+        cleanup("test_update_no_table");
+    }
+
+    #[test]
+    fn test_update_nonexistent_column() {
+        cleanup("test_update_bad_col");
+        let mut executor = create_test_executor("test_update_bad_col");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![Column::new("id", DataType::Integer)],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1)],
+            })
+            .unwrap();
+
+        // Try to update non-existent column
+        let result = executor.execute(Statement::Update {
+            table_name: "users".to_string(),
+            assignments: vec![("nonexistent".to_string(), Value::Integer(30))],
+            where_clause: None,
+        });
+
+        assert!(result.is_err());
+
+        cleanup("test_update_bad_col");
+    }
+
+    #[test]
+    fn test_update_type_mismatch() {
+        cleanup("test_update_type_err");
+        let mut executor = create_test_executor("test_update_type_err");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("age", DataType::Integer),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1), Value::Integer(25)],
+            })
+            .unwrap();
+
+        // Try to set integer column to text
+        let result = executor.execute(Statement::Update {
+            table_name: "users".to_string(),
+            assignments: vec![("age".to_string(), Value::Text("not a number".to_string()))],
+            where_clause: None,
+        });
+
+        assert!(result.is_err());
+
+        cleanup("test_update_type_err");
+    }
+
+    #[test]
+    fn test_update_with_complex_where() {
+        cleanup("test_update_complex");
+        let mut executor = create_test_executor("test_update_complex");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("age", DataType::Integer),
+                    Column::new("active", DataType::Boolean),
+                ],
+            })
+            .unwrap();
+
+        let test_data = vec![(1, 25, true), (2, 30, true), (3, 35, false), (4, 28, true)];
+
+        for (id, age, active) in test_data {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Integer(id),
+                        Value::Integer(age),
+                        Value::Boolean(active),
+                    ],
+                })
+                .unwrap();
+        }
+
+        // Update WHERE age > 27 AND active = true
+        let result = executor
+            .execute(Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("active".to_string(), Value::Boolean(false))],
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("age".to_string())),
+                        op: BinaryOperator::GreaterThan,
+                        right: Box::new(Expr::Literal(Value::Integer(27))),
+                    }),
+                    op: BinaryOperator::And,
+                    right: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("active".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Boolean(true))),
+                    }),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Success { message } => {
+                assert!(message.contains("2 rows")); // Bob (30, true) and Diana (28, true)
+            }
+            _ => panic!("Expected Success result"),
+        }
+
+        cleanup("test_update_complex");
+    }
+
+    #[test]
+    fn test_update_persistence() {
+        cleanup("test_update_persist");
+
+        // Update in first session
+        {
+            let mut executor = create_test_executor("test_update_persist");
+
+            executor
+                .execute(Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("age", DataType::Integer),
+                    ],
+                })
+                .unwrap();
+
+            for i in 1..=3 {
+                executor
+                    .execute(Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Integer(20 + i)],
+                    })
+                    .unwrap();
+            }
+
+            // Update id = 2
+            executor
+                .execute(Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("age".to_string(), Value::Integer(99))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(2))),
+                    }),
+                })
+                .unwrap();
+        }
+
+        // Verify update persisted
+        {
+            let mut executor = create_test_executor("test_update_persist");
+
+            let result = executor
+                .execute(Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(2))),
+                    }),
+                })
+                .unwrap();
+
+            match result {
+                ExecutionResult::Rows { rows, .. } => {
+                    assert_eq!(rows.len(), 1);
+                    match &rows[0].values()[1] {
+                        Value::Integer(age) => assert_eq!(*age, 99),
+                        _ => panic!("Expected Integer"),
+                    }
+                }
+                _ => panic!("Expected Rows result"),
+            }
+        }
+
+        cleanup("test_update_persist");
+    }
+
+    #[test]
+    fn test_update_text_column() {
+        cleanup("test_update_text");
+        let mut executor = create_test_executor("test_update_text");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("name", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        executor
+            .execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+            })
+            .unwrap();
+
+        // Update text column
+        let result = executor
+            .execute(Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("name".to_string(), Value::Text("Alicia".to_string()))],
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(1))),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Success { message } => {
+                assert!(message.contains("1 row"));
+            }
+            _ => panic!("Expected Success result"),
+        }
+
+        // Verify text updated
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values()[1] {
+                    Value::Text(name) => assert_eq!(name, "Alicia"),
+                    _ => panic!("Expected Text"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_text");
     }
 }

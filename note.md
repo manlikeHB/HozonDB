@@ -28,4 +28,6 @@ INSERT INTO users VALUES (1, 'Alice', 25, true);
 INSERT INTO users VALUES (2, 'Bob', 30, true);
 INSERT INTO users VALUES (3, 'Charlie', 35, false);
 INSERT INTO users VALUES (4, 'Diana', 28, true);
+
+SELECT * FROM users;
 ```
