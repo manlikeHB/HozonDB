@@ -284,10 +284,10 @@ impl Executor {
         // Extract column names
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
-        // check if there are any rows in this table //TODO
+        // check if there are any rows in this table
         if page_meta.num_rows == 0 {
             return Ok(ExecutionResult::Success {
-                message: format!("{} table is empty", table_name),
+                message: "0 rows deleted".to_string(),
             });
         }
 
