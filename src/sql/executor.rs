@@ -1,3 +1,4 @@
+use crate::sql::evaluator::evaluate_expr;
 use std::io::{self, Error, ErrorKind};
 
 use crate::{
@@ -6,7 +7,7 @@ use crate::{
         schema::{Column, DataType, Schema},
         table::TableCatalog,
     },
-    sql::parser::{BinaryOperator, Expr, SelectColumns, Statement},
+    sql::parser::{Expr, SelectColumns, Statement},
     storage::page::{PAGE_DATA_START, PAGE_SIZE, PageManager, PageMetadata},
 };
 
@@ -28,6 +29,62 @@ pub enum ExecutionResult {
 impl Executor {
     pub fn new(catalog: TableCatalog) -> Self {
         Executor { catalog }
+    }
+
+    /// Read all rows from a page
+    fn read_rows_from_page(page_data: &[u8], num_rows: usize) -> io::Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        let mut offset = PAGE_DATA_START;
+
+        for _ in 0..num_rows {
+            let (row, bytes_consumed) = Row::from_bytes(&page_data[offset..])?;
+            rows.push(row);
+            offset += bytes_consumed;
+        }
+
+        Ok(rows)
+    }
+
+    /// Write rows to page buffer and update metadata
+    /// Returns the final offset after writing all rows
+    fn write_rows_to_page(
+        page_data: &mut [u8; 4096],
+        rows: &[Row],
+        mut offset: usize,
+        page_meta: &PageMetadata,
+        on_insert: bool,
+    ) -> io::Result<usize> {
+        // let mut offset = PAGE_DATA_START;
+
+        // Serialize rows
+        for row in rows {
+            let row_bytes = row.to_bytes();
+
+            // Check if row fits
+            if offset + row_bytes.len() > PAGE_SIZE {
+                return Err(Error::new(
+                    ErrorKind::OutOfMemory,
+                    "Rows exceed page size - multi-page support not implemented",
+                ));
+            }
+
+            page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
+            offset += row_bytes.len();
+        }
+
+        // Update metadata
+        let metadata = PageMetadata {
+            is_full: page_meta.is_full,
+            last_offset: offset,
+            num_rows: if on_insert {
+                page_meta.num_rows + rows.len()
+            } else {
+                rows.len()
+            },
+        };
+        PageManager::update_metadata_in_buffer(page_data, &metadata);
+
+        Ok(offset)
     }
 
     pub fn execute(&mut self, statement: Statement) -> io::Result<ExecutionResult> {
@@ -90,16 +147,7 @@ impl Executor {
 
         // Validate data types
         for (value, column) in values.iter().zip(columns.iter()) {
-            let valid = match (value, column.data_type()) {
-                (Value::Integer(_), crate::catalog::schema::DataType::Integer) => true,
-                (Value::Text(_), crate::catalog::schema::DataType::Text) => true,
-                (Value::Boolean(_), crate::catalog::schema::DataType::Boolean) => true,
-                (Value::Null, crate::catalog::schema::DataType::Null) => true,
-                (Value::Null, _) => true, // NULL can go in any column
-                _ => false,
-            };
-
-            if !valid {
+            if !validate_value_type(value, column.data_type()) {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     format!(
@@ -116,31 +164,16 @@ impl Executor {
         let mut page_data = self.catalog.read_page(first_page)?;
 
         let page_meta = PageManager::read_metadata_from_buffer(&page_data);
+
+        // write new rows to page
         let offset = page_meta.last_offset;
-
-        // Serialize new row
-        let row_bytes = Row::new(values).to_bytes();
-
-        // Check if it fits
-        // TODO: multiple page support
-        if offset + row_bytes.len() > PAGE_SIZE {
-            return Err(Error::new(
-                ErrorKind::OutOfMemory,
-                "Page full - multiple page support not yet implemented",
-            ));
-        }
-
-        // Write row bytes to page
-        // TODO: update is_full based on when page is actually full
-        page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
-        let metadata = PageMetadata {
-            is_full: page_meta.is_full,
-            last_offset: offset + row_bytes.len(),
-            num_rows: page_meta.num_rows + 1,
-        };
-
-        // update page metadata
-        PageManager::update_metadata_in_buffer(&mut page_data, &metadata);
+        Self::write_rows_to_page(
+            &mut page_data,
+            &[Row::new(values)],
+            offset,
+            &page_meta,
+            true,
+        )?;
 
         // Write page back
         self.catalog.write_page(first_page, &page_data)?;
@@ -182,14 +215,7 @@ impl Executor {
         }
 
         // Parse all rows from the page
-        let mut rows = Vec::new();
-        let mut offset = PAGE_DATA_START;
-
-        for _ in 0..page_meta.num_rows {
-            let (row, byte_consumed) = Row::from_bytes(&page_data[offset..])?;
-            rows.push(row);
-            offset += byte_consumed;
-        }
+        let rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
 
         // filter rows based on the where clause
         let filtered_rows: Vec<Row> = rows
@@ -297,14 +323,7 @@ impl Executor {
         }
 
         // Parse all rows from the page
-        let mut rows = Vec::new();
-        let mut offset = PAGE_DATA_START;
-
-        for _ in 0..page_meta.num_rows {
-            let (row, byte_consumed) = Row::from_bytes(&page_data[offset..])?;
-            rows.push(row);
-            offset += byte_consumed;
-        }
+        let rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
 
         // filter rows based on the where clause
         let filtered_rows: Vec<Row> = rows
@@ -325,23 +344,9 @@ impl Executor {
             })
             .collect();
 
-        // Serialize remaining rows
-        let mut offset = PAGE_DATA_START;
-        for row in &filtered_rows {
-            let row_bytes = row.to_bytes();
-
-            page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
-            offset += row_bytes.len();
-        }
-
-        let metadata = PageMetadata {
-            is_full: page_meta.is_full, //TODO helper to determine if page full
-            last_offset: offset,
-            num_rows: filtered_rows.len(),
-        };
-
-        // update page metadata
-        PageManager::update_metadata_in_buffer(&mut page_data, &metadata);
+        // write filtered rows to page
+        let offset = PAGE_DATA_START;
+        Self::write_rows_to_page(&mut page_data, &filtered_rows, offset, &page_meta, false)?;
 
         // Write page back
         self.catalog.write_page(first_page, &page_data)?;
@@ -392,15 +397,8 @@ impl Executor {
                 })?;
 
             let column = &columns[col_index];
-            let valid = match (value, column.data_type()) {
-                (Value::Integer(_), DataType::Integer) => true,
-                (Value::Text(_), DataType::Text) => true,
-                (Value::Boolean(_), DataType::Boolean) => true,
-                (Value::Null, _) => true,
-                _ => false,
-            };
 
-            if !valid {
+            if !validate_value_type(value, column.data_type()) {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     format!(
@@ -425,14 +423,7 @@ impl Executor {
         }
 
         // Parse all rows from the page
-        let mut rows = Vec::new();
-        let mut offset = PAGE_DATA_START;
-
-        for _ in 0..page_meta.num_rows {
-            let (row, byte_consumed) = Row::from_bytes(&page_data[offset..])?;
-            rows.push(row);
-            offset += byte_consumed;
-        }
+        let rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
 
         // Update rows based on WHERE clause
         let mut updated_count = 0;
@@ -470,30 +461,9 @@ impl Executor {
             })
             .collect();
 
-        // Serialize updated rows
-        let mut offset = PAGE_DATA_START;
-        for row in &updated_rows {
-            let row_bytes = row.to_bytes();
-
-            // Check if row fits
-            if offset + row_bytes.len() > PAGE_SIZE {
-                return Err(Error::new(
-                    ErrorKind::OutOfMemory,
-                    "Updated rows exceed page size - multi-page support not implemented",
-                ));
-            }
-
-            page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
-            offset += row_bytes.len();
-        }
-
-        // Update metadata
-        let metadata = PageMetadata {
-            is_full: page_meta.is_full,
-            last_offset: offset,
-            num_rows: updated_rows.len(),
-        };
-        PageManager::update_metadata_in_buffer(&mut page_data, &metadata);
+        // write updated rows to page
+        let offset = PAGE_DATA_START;
+        Self::write_rows_to_page(&mut page_data, &updated_rows, offset, &page_meta, false)?;
 
         // Write page back
         self.catalog.write_page(first_page, &page_data)?;
@@ -508,108 +478,14 @@ impl Executor {
     }
 }
 
-fn get_value(expr: &Expr, row: &Row, col_names: &[String]) -> io::Result<Value> {
-    match expr {
-        Expr::Literal(v) => Ok(v.clone()),
-        Expr::Column(n) => {
-            let index = match col_names.iter().position(|x| x == n) {
-                Some(i) => i,
-                None => return Err(Error::new(ErrorKind::InvalidData, "Column doesn't exist")),
-            };
-
-            row.get_value(index)
-                .cloned()
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "No row"))
-        }
-        Expr::BinaryOp { .. } => Err(Error::new(ErrorKind::InvalidData, "Unexpected Binary Op")),
-    }
-}
-
-fn evaluate_expr(expr: &Expr, row: &Row, col_names: &[String]) -> io::Result<bool> {
-    match expr {
-        Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::And => {
-                let left = evaluate_expr(left, row, col_names)?;
-                let right = evaluate_expr(right, row, col_names)?;
-                Ok(left && right)
-            }
-            BinaryOperator::Or => {
-                let left = evaluate_expr(left, row, col_names)?;
-                let right = evaluate_expr(right, row, col_names)?;
-                Ok(left || right)
-            }
-            BinaryOperator::Equals
-            | BinaryOperator::NotEquals
-            | BinaryOperator::LessThan
-            | BinaryOperator::GreaterThan
-            | BinaryOperator::LessOrEqual
-            | BinaryOperator::GreaterOrEqual => {
-                let left_val = get_value(left, row, col_names)?;
-                let right_val = get_value(right, row, col_names)?;
-                compare_values(&left_val, &right_val, op)
-            }
-        },
-        _ => {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "Expected BinaryOp in WHERE clause",
-            ));
-        }
-    }
-}
-
-fn compare_values(left: &Value, right: &Value, op: &BinaryOperator) -> io::Result<bool> {
-    match (left, right) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(match op {
-            BinaryOperator::Equals => a == b,
-            BinaryOperator::NotEquals => a != b,
-            BinaryOperator::LessThan => a < b,
-            BinaryOperator::GreaterThan => a > b,
-            BinaryOperator::LessOrEqual => a <= b,
-            BinaryOperator::GreaterOrEqual => a >= b,
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "Invalid operator for integers",
-                ));
-            }
-        }),
-        (Value::Text(a), Value::Text(b)) => Ok(match op {
-            BinaryOperator::Equals => a == b,
-            BinaryOperator::NotEquals => a != b,
-            BinaryOperator::LessThan => a < b,
-            BinaryOperator::GreaterThan => a > b,
-            BinaryOperator::LessOrEqual => a <= b,
-            BinaryOperator::GreaterOrEqual => a >= b,
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "Invalid operator for text",
-                ));
-            }
-        }),
-        (Value::Boolean(a), Value::Boolean(b)) => Ok(match op {
-            BinaryOperator::Equals => a == b,
-            BinaryOperator::NotEquals => a != b,
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "Booleans only support = and !=",
-                ));
-            }
-        }),
-        (Value::Null, Value::Null) => {
-            // SQL standard: NULL = NULL is false
-            Ok(false)
-        }
-        (Value::Null, _) | (_, Value::Null) => {
-            // NULL compared to anything is false
-            Ok(false)
-        }
-        _ => Err(Error::new(
-            ErrorKind::InvalidData,
-            "Type mismatch in comparison",
-        )),
+/// Validate that a value matches the expected data type
+pub fn validate_value_type(value: &Value, data_type: &DataType) -> bool {
+    match (value, data_type) {
+        (Value::Integer(_), DataType::Integer) => true,
+        (Value::Text(_), DataType::Text) => true,
+        (Value::Boolean(_), DataType::Boolean) => true,
+        (Value::Null, _) => true, // NULL can go in any column
+        _ => false,
     }
 }
 
@@ -617,6 +493,7 @@ fn compare_values(left: &Value, right: &Value, op: &BinaryOperator) -> io::Resul
 mod tests {
     use super::*;
     use crate::catalog::schema::{Column, DataType};
+    use crate::sql::parser::BinaryOperator;
     use crate::storage::page::PageManager;
     use std::fs;
 
