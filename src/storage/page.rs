@@ -6,13 +6,16 @@ use std::sync::Mutex;
 pub const PAGE_SIZE: usize = 4096;
 pub type PageId = u32;
 
-pub const PAGE_METADATA_SIZE: usize = 5;
+pub const PAGE_METADATA_SIZE: usize = 9;
 pub const PAGE_DATA_START: usize = PAGE_METADATA_SIZE;
+
+const NULL_PAGE: u32 = 0xFFFFFFFF; // Sentinel value for Option::None
 
 // Metadata offsets
 const OFFSET_IS_FULL: usize = 0;
 const OFFSET_LAST_OFFSET: usize = 1;
 const OFFSET_NUM_ROWS: usize = 3;
+const OFFSET_NEXT_PAGE: usize = 5;
 
 #[derive(Debug)]
 pub struct PageManager {
@@ -26,6 +29,7 @@ pub struct PageMetadata {
     pub is_full: bool,
     pub last_offset: usize,
     pub num_rows: usize,
+    pub next_page: Option<u32>,
 }
 
 impl PageManager {
@@ -214,6 +218,7 @@ impl PageManager {
         page_data[OFFSET_LAST_OFFSET..OFFSET_LAST_OFFSET + 2]
             .copy_from_slice(&(PAGE_DATA_START as u16).to_le_bytes());
         page_data[OFFSET_NUM_ROWS..OFFSET_NUM_ROWS + 2].copy_from_slice(&0u16.to_le_bytes());
+        page_data[OFFSET_NEXT_PAGE..OFFSET_NEXT_PAGE + 4].copy_from_slice(&NULL_PAGE.to_le_bytes());
     }
 
     /// Read metadata from a page
@@ -246,10 +251,22 @@ impl PageManager {
             u16::from_le_bytes([page_data[OFFSET_NUM_ROWS], page_data[OFFSET_NUM_ROWS + 1]])
                 as usize;
 
+        let next_page = u32::from_le_bytes([
+            page_data[OFFSET_NEXT_PAGE],
+            page_data[OFFSET_NEXT_PAGE + 1],
+            page_data[OFFSET_NEXT_PAGE + 2],
+            page_data[OFFSET_NEXT_PAGE + 3],
+        ]);
+
         PageMetadata {
             is_full,
             last_offset,
             num_rows,
+            next_page: if matches!(next_page, NULL_PAGE) {
+                None
+            } else {
+                Some(next_page)
+            },
         }
     }
 
@@ -259,6 +276,9 @@ impl PageManager {
             .copy_from_slice(&(metadata.last_offset as u16).to_le_bytes());
         page_data[OFFSET_NUM_ROWS..OFFSET_NUM_ROWS + 2]
             .copy_from_slice(&(metadata.num_rows as u16).to_le_bytes());
+
+        let next_page = metadata.next_page.unwrap_or(NULL_PAGE);
+        page_data[OFFSET_NEXT_PAGE..OFFSET_NEXT_PAGE + 4].copy_from_slice(&next_page.to_le_bytes());
     }
 }
 
@@ -458,6 +478,7 @@ mod tests {
             is_full: true,
             last_offset: 100,
             num_rows: 5,
+            next_page: None,
         };
         pm.update_page_metadata(page_id, &new_metadata).unwrap();
 
@@ -486,6 +507,7 @@ mod tests {
                 is_full: false,
                 last_offset: 250,
                 num_rows: 10,
+                next_page: None,
             };
             pm.update_page_metadata(page_id, &metadata).unwrap();
         } // pm dropped, file closed
@@ -521,6 +543,7 @@ mod tests {
             is_full: true,
             last_offset: 100,
             num_rows: 3,
+            next_page: None,
         };
         pm.update_page_metadata(page1, &meta1).unwrap();
 
@@ -529,6 +552,7 @@ mod tests {
             is_full: false,
             last_offset: 200,
             num_rows: 7,
+            next_page: None,
         };
         pm.update_page_metadata(page2, &meta2).unwrap();
 
@@ -564,6 +588,7 @@ mod tests {
             is_full: false,
             last_offset: PAGE_DATA_START + test_data.len(),
             num_rows: 1,
+            next_page: None,
         };
         pm.update_page_metadata(page_id, &metadata).unwrap();
 

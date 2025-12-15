@@ -1,4 +1,4 @@
-use crate::sql::evaluator::evaluate_expr;
+use crate::{sql::evaluator::evaluate_expr, storage::page::PageId};
 use std::io::{self, Error, ErrorKind};
 
 use crate::{
@@ -45,16 +45,39 @@ impl Executor {
         Ok(rows)
     }
 
-    /// Write rows to page buffer and update metadata
-    /// Returns the final offset after writing all rows
+    // Read all rows from a table
+    // which possible spans across multiple pages
+    fn read_all_table_rows(&self, first_page: u32) -> io::Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        let mut cur_page = first_page;
+
+        loop {
+            // Read page data
+            let page_data = self.catalog.read_page(cur_page)?;
+            let page_meta = PageManager::read_metadata_from_buffer(&page_data);
+
+            // Parse all rows from the page
+            let mut new_rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
+            rows.append(&mut new_rows);
+
+            if let Some(next_page) = page_meta.next_page {
+                cur_page = next_page;
+            } else {
+                break;
+            }
+        }
+
+        Ok(rows)
+    }
+
+    /// Write rows to a single page buffer
+    /// Returns the number of rows written and final offset when page is full
     fn write_rows_to_page(
         page_data: &mut [u8; 4096],
         rows: &[Row],
         mut offset: usize,
-        page_meta: &PageMetadata,
-        on_insert: bool,
-    ) -> io::Result<usize> {
-        // let mut offset = PAGE_DATA_START;
+    ) -> io::Result<(usize, usize)> {
+        let mut rows_written = 0;
 
         // Serialize rows
         for row in rows {
@@ -62,29 +85,64 @@ impl Executor {
 
             // Check if row fits
             if offset + row_bytes.len() > PAGE_SIZE {
-                return Err(Error::new(
-                    ErrorKind::OutOfMemory,
-                    "Rows exceed page size - multi-page support not implemented",
-                ));
+                // stop here and return rows written and last offset
+                break;
             }
 
+            // write row
             page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
             offset += row_bytes.len();
+            rows_written += 1;
         }
 
-        // Update metadata
-        let metadata = PageMetadata {
-            is_full: page_meta.is_full,
-            last_offset: offset,
-            num_rows: if on_insert {
-                page_meta.num_rows + rows.len()
-            } else {
-                rows.len()
-            },
-        };
-        PageManager::update_metadata_in_buffer(page_data, &metadata);
+        Ok((rows_written, offset))
+    }
 
-        Ok(offset)
+    /// writes rows of a table to as many pages as is required
+    fn write_all_table_rows(&mut self, first_page: PageId, rows: &[Row]) -> io::Result<()> {
+        let mut current_page_id = first_page;
+        let mut remaining_rows = rows; // shrinks as we write
+
+        loop {
+            let mut page_data = [0u8; PAGE_SIZE];
+
+            // Write as many rows as fit
+            let (rows_written, final_offset) =
+                Self::write_rows_to_page(&mut page_data, remaining_rows, PAGE_DATA_START)?;
+
+            // Update page metadata
+            let has_more_rows = rows_written < remaining_rows.len();
+            let next_page = if has_more_rows {
+                // Need another page - allocate it
+                let new_page = self.catalog.allocate_page()?;
+                Some(new_page)
+            } else {
+                None // Last page
+            };
+
+            let metadata = PageMetadata {
+                is_full: has_more_rows,
+                last_offset: final_offset,
+                num_rows: rows_written,
+                next_page,
+            };
+            PageManager::update_metadata_in_buffer(&mut page_data, &metadata);
+
+            // Write page to disk
+            self.catalog.write_page(current_page_id, &page_data)?;
+
+            // Move to remaining rows
+            remaining_rows = &remaining_rows[rows_written..];
+
+            // Move to next page if needed
+            if let Some(next) = next_page {
+                current_page_id = next;
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn execute(&mut self, statement: Statement) -> io::Result<ExecutionResult> {
@@ -160,23 +218,14 @@ impl Executor {
             }
         }
 
-        // Read existing page data
-        let mut page_data = self.catalog.read_page(first_page)?;
+        // Read all existing rows
+        let mut all_rows = self.read_all_table_rows(first_page)?;
 
-        let page_meta = PageManager::read_metadata_from_buffer(&page_data);
+        // Add new row
+        all_rows.push(Row::new(values));
 
-        // write new rows to page
-        let offset = page_meta.last_offset;
-        Self::write_rows_to_page(
-            &mut page_data,
-            &[Row::new(values)],
-            offset,
-            &page_meta,
-            true,
-        )?;
-
-        // Write page back
-        self.catalog.write_page(first_page, &page_data)?;
+        // Rewrite everything // TODO: append new row instead of rewriting everything
+        self.write_all_table_rows(first_page, &all_rows)?;
 
         Ok(ExecutionResult::Success {
             message: "1 row inserted.".to_string(),
@@ -200,22 +249,18 @@ impl Executor {
             }
         };
 
-        // Read page data
-        let page_data = self.catalog.read_page(first_page)?;
-        let page_meta = PageManager::read_metadata_from_buffer(&page_data);
+        let rows = self.read_all_table_rows(first_page)?;
+
         // Extract column names
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
         // check if there are any rows in this table
-        if page_meta.num_rows == 0 {
+        if rows.len() == 0 {
             return Ok(ExecutionResult::Rows {
                 columns: all_column_names,
                 rows: Vec::<Row>::new(),
             });
         }
-
-        // Parse all rows from the page
-        let rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
 
         // filter rows based on the where clause
         let filtered_rows: Vec<Row> = rows
@@ -309,21 +354,19 @@ impl Executor {
             }
         };
 
-        // Read page data
-        let mut page_data = self.catalog.read_page(first_page)?;
-        let page_meta = PageManager::read_metadata_from_buffer(&page_data);
+        // get all rows
+        let rows = self.read_all_table_rows(first_page)?;
+        let rows_len = rows.len();
+
         // Extract column names
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
         // check if there are any rows in this table
-        if page_meta.num_rows == 0 {
+        if rows_len == 0 {
             return Ok(ExecutionResult::Success {
                 message: "0 rows deleted".to_string(),
             });
         }
-
-        // Parse all rows from the page
-        let rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
 
         // filter rows based on the where clause
         let filtered_rows: Vec<Row> = rows
@@ -344,14 +387,9 @@ impl Executor {
             })
             .collect();
 
-        // write filtered rows to page
-        let offset = PAGE_DATA_START;
-        Self::write_rows_to_page(&mut page_data, &filtered_rows, offset, &page_meta, false)?;
+        self.write_all_table_rows(first_page, &filtered_rows)?;
 
-        // Write page back
-        self.catalog.write_page(first_page, &page_data)?;
-
-        let num_rows = page_meta.num_rows - filtered_rows.len();
+        let num_rows = rows_len - filtered_rows.len();
         Ok(ExecutionResult::Success {
             message: format!(
                 "{} {} deleted.",
@@ -411,19 +449,14 @@ impl Executor {
             }
         }
 
-        // Read page data
-        let mut page_data = self.catalog.read_page(first_page)?;
-        let page_meta = PageManager::read_metadata_from_buffer(&page_data);
+        let rows = self.read_all_table_rows(first_page)?;
 
         // Check if table is empty
-        if page_meta.num_rows == 0 {
+        if rows.len() == 0 {
             return Ok(ExecutionResult::Success {
                 message: "0 rows updated.".to_string(),
             });
         }
-
-        // Parse all rows from the page
-        let rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
 
         // Update rows based on WHERE clause
         let mut updated_count = 0;
@@ -462,11 +495,7 @@ impl Executor {
             .collect();
 
         // write updated rows to page
-        let offset = PAGE_DATA_START;
-        Self::write_rows_to_page(&mut page_data, &updated_rows, offset, &page_meta, false)?;
-
-        // Write page back
-        self.catalog.write_page(first_page, &page_data)?;
+        self.write_all_table_rows(first_page, &updated_rows)?;
 
         Ok(ExecutionResult::Success {
             message: format!(
@@ -2825,5 +2854,557 @@ mod tests {
         }
 
         cleanup("test_update_text");
+    }
+
+    #[test]
+    fn test_insert_beyond_one_page() {
+        cleanup("test_multi_insert");
+        let mut executor = create_test_executor("test_multi_insert");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("data", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        // Insert 100 rows with large text (~90 bytes per row)
+        // This should span multiple pages (4KB page / 90 bytes ≈ 45 rows per page)
+        for i in 0..100 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Integer(i),
+                        Value::Text("x".repeat(80)), // 80 character string
+                    ],
+                })
+                .unwrap();
+        }
+
+        // Verify all rows are readable
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 100);
+
+                // Verify first row
+                match (&rows[0].values()[0], &rows[0].values()[1]) {
+                    (Value::Integer(id), Value::Text(data)) => {
+                        assert_eq!(*id, 0);
+                        assert_eq!(data.len(), 80);
+                    }
+                    _ => panic!("Unexpected value types"),
+                }
+
+                // Verify last row
+                match (&rows[99].values()[0], &rows[99].values()[1]) {
+                    (Value::Integer(id), Value::Text(data)) => {
+                        assert_eq!(*id, 99);
+                        assert_eq!(data.len(), 80);
+                    }
+                    _ => panic!("Unexpected value types"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_multi_insert");
+    }
+
+    #[test]
+    fn test_page_chain_metadata() {
+        cleanup("test_page_chain");
+        let mut executor = create_test_executor("test_page_chain");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("data", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        // Insert enough data for multiple pages
+        for i in 0..100 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                })
+                .unwrap();
+        }
+
+        // Manually verify page chain
+        let first_page = executor.catalog.get_table("users").unwrap().first_page();
+
+        let mut current_page = first_page;
+        let mut page_count = 0;
+        let mut visited = std::collections::HashSet::new();
+
+        loop {
+            // Prevent infinite loops
+            assert!(visited.insert(current_page), "Circular page chain detected");
+
+            page_count += 1;
+
+            let page_data = executor.catalog.read_page(current_page).unwrap();
+            let page_meta = PageManager::read_metadata_from_buffer(&page_data);
+
+            // Each page should have rows
+            assert!(page_meta.num_rows > 0, "Page {} has 0 rows", current_page);
+
+            match page_meta.next_page {
+                Some(next) => {
+                    current_page = next;
+                }
+                None => {
+                    // Last page
+                    break;
+                }
+            }
+        }
+
+        // Should have multiple pages
+        assert!(
+            page_count >= 2,
+            "Expected multiple pages, got {}",
+            page_count
+        );
+
+        cleanup("test_page_chain");
+    }
+
+    #[test]
+    fn test_select_from_multi_page_table() {
+        cleanup("test_select_multi");
+        let mut executor = create_test_executor("test_select_multi");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("data", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        // Insert 150 rows
+        for i in 0..150 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i), Value::Text("test".to_string())],
+                })
+                .unwrap();
+        }
+
+        // Test: SELECT * returns all rows
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 150);
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        // Test: SELECT with WHERE spanning pages
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::GreaterThan,
+                        right: Box::new(Expr::Literal(Value::Integer(50))),
+                    }),
+                    op: BinaryOperator::And,
+                    right: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::LessThan,
+                        right: Box::new(Expr::Literal(Value::Integer(100))),
+                    }),
+                }),
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 49); // 51-99 inclusive = 49 rows
+
+                // Verify all rows in correct range
+                for row in rows {
+                    match &row.values()[0] {
+                        Value::Integer(id) => {
+                            assert!(*id > 50 && *id < 100);
+                        }
+                        _ => panic!("Expected integer"),
+                    }
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_select_multi");
+    }
+
+    #[test]
+    fn test_delete_from_multi_page_table() {
+        cleanup("test_delete_multi");
+        let mut executor = create_test_executor("test_delete_multi");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("data", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        // Insert 150 rows
+        for i in 0..150 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                })
+                .unwrap();
+        }
+
+        // Delete rows from middle: WHERE id >= 50 AND id < 100
+        executor
+            .execute(Statement::Delete {
+                table_name: "users".to_string(),
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::GreaterOrEqual,
+                        right: Box::new(Expr::Literal(Value::Integer(50))),
+                    }),
+                    op: BinaryOperator::And,
+                    right: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::LessThan,
+                        right: Box::new(Expr::Literal(Value::Integer(100))),
+                    }),
+                }),
+            })
+            .unwrap();
+
+        // Verify correct rows remain: 0-49 and 100-149 = 100 rows
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 100);
+
+                // Verify no rows in deleted range
+                for row in &rows {
+                    match &row.values()[0] {
+                        Value::Integer(id) => {
+                            assert!(*id < 50 || *id >= 100, "Found deleted row with id {}", id);
+                        }
+                        _ => panic!("Expected integer"),
+                    }
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_delete_multi");
+    }
+
+    #[test]
+    fn test_update_in_multi_page_table() {
+        cleanup("test_update_multi");
+        let mut executor = create_test_executor("test_update_multi");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("data", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        // Insert 100 rows
+        for i in 0..100 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i), Value::Text("original".to_string())],
+                })
+                .unwrap();
+        }
+
+        // Update subset: SET data = 'UPDATED' WHERE id < 30
+        executor
+            .execute(Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("data".to_string(), Value::Text("UPDATED".to_string()))],
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::LessThan,
+                    right: Box::new(Expr::Literal(Value::Integer(30))),
+                }),
+            })
+            .unwrap();
+
+        // Verify only first 30 rows are updated
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 100);
+
+                for row in rows {
+                    match (&row.values()[0], &row.values()[1]) {
+                        (Value::Integer(id), Value::Text(data)) => {
+                            if *id < 30 {
+                                assert_eq!(data, "UPDATED", "Row {} should be updated", id);
+                            } else {
+                                assert_eq!(data, "original", "Row {} should not be updated", id);
+                            }
+                        }
+                        _ => panic!("Unexpected value types"),
+                    }
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_multi");
+    }
+
+    #[test]
+    fn test_multi_page_persistence() {
+        cleanup("test_multi_persist");
+
+        // Session 1: Create multi-page table
+        {
+            let mut executor = create_test_executor("test_multi_persist");
+
+            executor
+                .execute(Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("data", DataType::Text),
+                    ],
+                })
+                .unwrap();
+
+            for i in 0..100 {
+                executor
+                    .execute(Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                    })
+                    .unwrap();
+            }
+        } // Drop executor, close database
+
+        // Session 2: Reopen and verify all rows present
+        {
+            let mut executor = create_test_executor("test_multi_persist");
+
+            let result = executor
+                .execute(Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                })
+                .unwrap();
+
+            match result {
+                ExecutionResult::Rows { rows, .. } => {
+                    assert_eq!(rows.len(), 100);
+
+                    // Verify data integrity
+                    for (i, row) in rows.iter().enumerate() {
+                        match &row.values()[0] {
+                            Value::Integer(id) => {
+                                assert_eq!(*id, i as i32);
+                            }
+                            _ => panic!("Expected integer"),
+                        }
+                    }
+                }
+                _ => panic!("Expected Rows result"),
+            }
+        }
+
+        cleanup("test_multi_persist");
+    }
+
+    #[test]
+    fn test_multiple_tables_multi_page() {
+        cleanup("test_multi_tables_mp");
+        let mut executor = create_test_executor("test_multi_tables_mp");
+
+        // Create table1
+        executor
+            .execute(Statement::CreateTable {
+                name: "table1".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("data", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        // Create table2
+        executor
+            .execute(Statement::CreateTable {
+                name: "table2".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("info", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        // Insert 80 rows into table1
+        for i in 0..80 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "table1".to_string(),
+                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                })
+                .unwrap();
+        }
+
+        // Insert 120 rows into table2
+        for i in 0..120 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "table2".to_string(),
+                    values: vec![Value::Integer(i), Value::Text("y".repeat(80))],
+                })
+                .unwrap();
+        }
+
+        // Verify table1
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "table1".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 80);
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        // Verify table2
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "table2".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 120);
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_multi_tables_mp");
+    }
+
+    #[test]
+    fn test_delete_all_from_multi_page() {
+        cleanup("test_delete_all_mp");
+        let mut executor = create_test_executor("test_delete_all_mp");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("data", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        // Insert 100 rows (multi-page)
+        for i in 0..100 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                })
+                .unwrap();
+        }
+
+        // Delete all (no WHERE clause)
+        executor
+            .execute(Statement::Delete {
+                table_name: "users".to_string(),
+                where_clause: None,
+            })
+            .unwrap();
+
+        // Verify table is empty
+        let result = executor
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            })
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0);
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_delete_all_mp");
     }
 }

@@ -1,5 +1,5 @@
 use crate::catalog::schema::Schema;
-use crate::storage::page::{PageManager, PageMetadata};
+use crate::storage::page::{PageId, PageManager, PageMetadata};
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 pub struct TableMetadata {
@@ -177,6 +177,10 @@ impl TableCatalog {
 
     pub fn number_of_pages(&self) -> u32 {
         self.page_manager.num_pages()
+    }
+
+    pub fn allocate_page(&mut self) -> io::Result<PageId> {
+        self.page_manager.allocate_page()
     }
 }
 

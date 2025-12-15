@@ -8,8 +8,8 @@ A SQLite-like database built from scratch in Rust 🦀.
 - Phase 2: SQL support (CREATE TABLE, INSERT, SELECT) ✅
 - Phase 3: WHERE clauses ✅
 - Phase 4: More SQL support (DROP TABLE, DELETE and UPDATE) ✅
-- Phase 5: Multi-Page Support 🔨
-- Phase 6: Manual Compaction 📅
+- Phase 5: Multi-Page Support ✅
+- Phase 6: Manual Compaction 🔨
 - Phase 6: Indexing 📅
 
 ## Quick Start
