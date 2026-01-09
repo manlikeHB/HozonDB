@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub const PAGE_SIZE: usize = 4096;
+pub const HEADER_SIZE: usize = 12;
 pub type PageId = u32;
+pub const MAGIC_NUMBER: u32 = 0x484F5A4E; // 
 
 pub const PAGE_METADATA_SIZE: usize = 9;
 pub const PAGE_DATA_START: usize = PAGE_METADATA_SIZE;
@@ -22,6 +24,7 @@ pub struct PageManager {
     file: Mutex<File>,
     lock_path: PathBuf,
     num_pages: u32,
+    first_free_page: Option<PageId>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +53,7 @@ impl PageManager {
             file.read_exact(&mut magic_bytes)?;
             let magic_number = u32::from_le_bytes(magic_bytes);
 
-            if magic_number != 0x484F5A4E {
+            if magic_number != MAGIC_NUMBER {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Invalid magic number",
@@ -62,10 +65,20 @@ impl PageManager {
             file.read_exact(&mut num_pages_bytes)?;
             let num_pages = u32::from_le_bytes(num_pages_bytes);
 
+            // Read first free page id
+            let mut f_f_page_bytes = [0u8; 4];
+            file.read_exact(&mut f_f_page_bytes)?;
+            let first_free_page = u32::from_le_bytes(f_f_page_bytes);
+
             Ok(PageManager {
                 file: Mutex::new(file),
                 num_pages: num_pages,
                 lock_path,
+                first_free_page: if first_free_page == NULL_PAGE {
+                    None
+                } else {
+                    Some(first_free_page)
+                },
             })
         } else {
             let mut file = OpenOptions::new()
@@ -75,16 +88,64 @@ impl PageManager {
                 .open(path)?;
 
             let mut headers = [0u8; PAGE_SIZE];
-            headers[0..4].copy_from_slice(&0x484F5A4E_u32.to_le_bytes());
-            headers[4..8].copy_from_slice(&1u32.to_le_bytes());
+            headers[0..4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes()); // magic number
+            headers[4..8].copy_from_slice(&1u32.to_le_bytes()); // number of pages
+            headers[8..12].copy_from_slice(&NULL_PAGE.to_le_bytes()); // free pages linked list first page = None
             file.write_all(&headers)?;
 
             Ok(PageManager {
                 file: Mutex::new(file),
                 num_pages: 1,
                 lock_path,
+                first_free_page: None,
             })
         }
+    }
+
+    /// Write header (magic, num_pages, first_free_page) to page 0 (header)
+    fn write_header(&mut self) -> io::Result<()> {
+        let mut headers = [0u8; HEADER_SIZE];
+        headers[0..4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes()); // magic number
+        headers[4..8].copy_from_slice(&self.num_pages().to_le_bytes()); // number of pages
+        headers[8..12].copy_from_slice(&self.first_free_page.unwrap_or(NULL_PAGE).to_le_bytes()); // free pages linked list first page
+
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(0))?; // go to start
+        file.write_all(&headers)?;
+        file.sync_all()?;
+
+        Ok(())
+    }
+
+    /// Write next_free pointer to a free page
+    fn write_free_page(&mut self, page_id: PageId, next_free: Option<PageId>) -> io::Result<()> {
+        let mut page_buffer = [0u8; PAGE_SIZE];
+        page_buffer[0..4].copy_from_slice(&next_free.unwrap_or(NULL_PAGE).to_le_bytes());
+        self.write_page(page_id, &page_buffer)?;
+        Ok(())
+    }
+
+    /// Read next_free pointer from a free page // TODO: make private
+    pub fn read_next_free(&self, page_id: PageId) -> io::Result<Option<PageId>> {
+        let page_data = self.read_page(page_id)?;
+        let next_page =
+            u32::from_le_bytes([page_data[0], page_data[1], page_data[2], page_data[3]]);
+        if next_page == NULL_PAGE {
+            Ok(None)
+        } else {
+            Ok(Some(next_page))
+        }
+    }
+
+    /// Add a page to the free list
+    pub fn free_page(&mut self, page_id: PageId) -> io::Result<()> {
+        // get current head of free pages list and make it the next page
+        self.write_free_page(page_id, self.first_free_page)?;
+
+        // update head to new free page
+        self.first_free_page = Some(page_id);
+        self.write_header()?; // update header
+        Ok(())
     }
 
     /// Try to acquire the lock file
@@ -127,6 +188,27 @@ impl PageManager {
     /// Note: Page 0 is reserved for database header and created in new().
     /// This method allocates pages starting from page 1 with initialized metadata.
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
+        // check if there are free pages
+        if let Some(free_page_id) = self.first_free_page {
+            let next_free = self.read_next_free(free_page_id)?;
+            // update next free page in header
+            self.first_free_page = next_free;
+            self.write_header()?;
+
+            // Update page metadata to default since it's being re-allocated as a new page
+            let page_meta = PageMetadata {
+                is_full: false,
+                last_offset: PAGE_DATA_START,
+                num_rows: 0,
+                next_page: None,
+            };
+
+            self.update_page_metadata(free_page_id, &page_meta)?;
+
+            return Ok(free_page_id);
+        }
+
+        // No free pages - extend database
         let page_id: PageId = self.num_pages;
         self.num_pages += 1;
 
@@ -138,7 +220,7 @@ impl PageManager {
             let mut file = self.file.lock().unwrap();
             file.set_len(new_size)?;
             file.seek(SeekFrom::Start(4))?;
-            file.write_all(&num_pages_bytes)?;
+            file.write_all(&num_pages_bytes)?; // update number of pages in header
         };
 
         let mut page_data = [0u8; PAGE_SIZE];
@@ -148,6 +230,9 @@ impl PageManager {
             // Create page buffer with metadata
             Self::init_page_metadata_buffer(&mut page_data);
         }
+
+        // update header on disk!
+        self.write_header()?;
 
         // Write initialized page
         self.write_page(page_id, &page_data)?;
@@ -262,7 +347,7 @@ impl PageManager {
             is_full,
             last_offset,
             num_rows,
-            next_page: if matches!(next_page, NULL_PAGE) {
+            next_page: if next_page == NULL_PAGE {
                 None
             } else {
                 Some(next_page)
@@ -280,6 +365,10 @@ impl PageManager {
         let next_page = metadata.next_page.unwrap_or(NULL_PAGE);
         page_data[OFFSET_NEXT_PAGE..OFFSET_NEXT_PAGE + 4].copy_from_slice(&next_page.to_le_bytes());
     }
+
+    pub fn first_free_page(&self) -> Option<PageId> {
+        self.first_free_page
+    }
 }
 
 impl Drop for PageManager {
@@ -294,6 +383,11 @@ impl Drop for PageManager {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn cleanup(basename: &str) {
+        let _ = fs::remove_file(format!("{}.hdb", basename));
+        let _ = fs::remove_file(format!("{}.hdb.lock", basename));
+    }
 
     #[test]
     fn test_page_manager_new() {
@@ -606,5 +700,324 @@ mod tests {
 
         let _ = fs::remove_file("test_meta_data.db");
         let _ = fs::remove_file("test_meta_data.db.lock");
+    }
+
+    #[test]
+    fn test_header_with_free_list() {
+        cleanup("test_header_free");
+
+        // Create new database
+        let pm = PageManager::new("test_header_free.hdb").unwrap();
+
+        // Verify initial state
+        assert_eq!(pm.num_pages(), 1);
+        assert_eq!(pm.first_free_page, None);
+
+        drop(pm);
+
+        // Reopen and verify header persisted
+        let pm = PageManager::new("test_header_free.hdb").unwrap();
+        assert_eq!(pm.num_pages(), 1);
+        assert_eq!(pm.first_free_page, None);
+
+        cleanup("test_header_free");
+    }
+
+    #[test]
+    fn test_free_page_adds_to_list() {
+        cleanup("test_free_add");
+        let mut pm = PageManager::new("test_free_add.hdb").unwrap();
+
+        // Allocate a page
+        let page1 = pm.allocate_page().unwrap();
+        assert_eq!(page1, 1);
+        assert_eq!(pm.first_free_page, None);
+
+        // Free the page
+        pm.free_page(page1).unwrap();
+        assert_eq!(pm.first_free_page, Some(1));
+
+        cleanup("test_free_add");
+    }
+
+    #[test]
+    fn test_allocate_reuses_freed_page() {
+        cleanup("test_reuse");
+        let mut pm = PageManager::new("test_reuse.hdb").unwrap();
+
+        // Allocate 3 pages
+        let page1 = pm.allocate_page().unwrap();
+        let page2 = pm.allocate_page().unwrap();
+        let page3 = pm.allocate_page().unwrap();
+
+        assert_eq!(page1, 1);
+        assert_eq!(page2, 2);
+        assert_eq!(page3, 3);
+        assert_eq!(pm.num_pages(), 4); // 0, 1, 2, 3
+
+        // Free page 2
+        pm.free_page(page2).unwrap();
+        assert_eq!(pm.first_free_page, Some(2));
+
+        // Next allocation should reuse page 2
+        let page4 = pm.allocate_page().unwrap();
+        assert_eq!(page4, 2);
+        assert_eq!(pm.first_free_page, None);
+        assert_eq!(pm.num_pages(), 4); // Didn't grow
+
+        cleanup("test_reuse");
+    }
+
+    #[test]
+    fn test_free_list_lifo_order() {
+        cleanup("test_lifo");
+        let mut pm = PageManager::new("test_lifo.hdb").unwrap();
+
+        // Allocate 3 pages
+        let page1 = pm.allocate_page().unwrap();
+        let page2 = pm.allocate_page().unwrap();
+        let page3 = pm.allocate_page().unwrap();
+
+        // Free in order: 1, 2, 3
+        pm.free_page(page1).unwrap();
+        pm.free_page(page2).unwrap();
+        pm.free_page(page3).unwrap();
+
+        // Free list: 3 → 2 → 1 → NULL (LIFO)
+        assert_eq!(pm.first_free_page, Some(3));
+
+        // Allocate should return in LIFO order: 3, 2, 1
+        let realloc1 = pm.allocate_page().unwrap();
+        assert_eq!(realloc1, 3);
+
+        let realloc2 = pm.allocate_page().unwrap();
+        assert_eq!(realloc2, 2);
+
+        let realloc3 = pm.allocate_page().unwrap();
+        assert_eq!(realloc3, 1);
+
+        // List should be empty now
+        assert_eq!(pm.first_free_page, None);
+
+        cleanup("test_lifo");
+    }
+
+    #[test]
+    fn test_free_list_persistence() {
+        cleanup("test_free_persist");
+
+        // Session 1: Create free list
+        {
+            let mut pm = PageManager::new("test_free_persist.hdb").unwrap();
+
+            let _ = pm.allocate_page().unwrap();
+            let page2 = pm.allocate_page().unwrap();
+            let page3 = pm.allocate_page().unwrap();
+
+            pm.free_page(page2).unwrap();
+            pm.free_page(page3).unwrap();
+
+            assert_eq!(pm.first_free_page, Some(3));
+        } // Close database
+
+        // Session 2: Verify free list persisted
+        {
+            let mut pm = PageManager::new("test_free_persist.hdb").unwrap();
+
+            // Free list should still be: 3 → 2 → NULL
+            assert_eq!(pm.first_free_page, Some(3));
+
+            // Allocate should reuse page 3
+            let page = pm.allocate_page().unwrap();
+            assert_eq!(page, 3);
+
+            // Now first_free should be 2
+            assert_eq!(pm.first_free_page, Some(2));
+        }
+
+        cleanup("test_free_persist");
+    }
+
+    #[test]
+    fn test_allocate_when_free_list_empty() {
+        cleanup("test_empty_free");
+        let mut pm = PageManager::new("test_empty_free.hdb").unwrap();
+
+        // Free list is empty initially
+        assert_eq!(pm.first_free_page, None);
+
+        // Allocate should extend database
+        let page1 = pm.allocate_page().unwrap();
+        assert_eq!(page1, 1);
+        assert_eq!(pm.num_pages(), 2);
+
+        cleanup("test_empty_free");
+    }
+
+    #[test]
+    fn test_multiple_free_and_allocate_cycles() {
+        cleanup("test_cycles");
+        let mut pm = PageManager::new("test_cycles.hdb").unwrap();
+
+        // Allocate 5 pages
+        for _ in 0..5 {
+            pm.allocate_page().unwrap();
+        }
+        assert_eq!(pm.num_pages(), 6); // 0, 1, 2, 3, 4, 5
+
+        // Free pages 2, 3, 4
+        pm.free_page(2).unwrap();
+        pm.free_page(3).unwrap();
+        pm.free_page(4).unwrap();
+
+        // Allocate 2 pages (should reuse 4, 3)
+        let p1 = pm.allocate_page().unwrap();
+        let p2 = pm.allocate_page().unwrap();
+        assert_eq!(p1, 4);
+        assert_eq!(p2, 3);
+
+        // Free list: 2 → NULL
+        assert_eq!(pm.first_free_page, Some(2));
+
+        // Free page 5
+        pm.free_page(5).unwrap();
+
+        // Free list: 5 → 2 → NULL
+        assert_eq!(pm.first_free_page, Some(5));
+
+        // Allocate 3 pages (should reuse 5, 2, then extend to 6)
+        let p3 = pm.allocate_page().unwrap();
+        let p4 = pm.allocate_page().unwrap();
+        let p5 = pm.allocate_page().unwrap();
+
+        assert_eq!(p3, 5);
+        assert_eq!(p4, 2);
+        assert_eq!(p5, 6); // Extended
+
+        assert_eq!(pm.first_free_page, None);
+        assert_eq!(pm.num_pages(), 7);
+
+        cleanup("test_cycles");
+    }
+
+    #[test]
+    fn test_free_same_page_twice() {
+        cleanup("test_double_free");
+        let mut pm = PageManager::new("test_double_free.hdb").unwrap();
+
+        let page1 = pm.allocate_page().unwrap();
+
+        // Free page 1
+        pm.free_page(page1).unwrap();
+        assert_eq!(pm.first_free_page, Some(1));
+
+        // Free page 1 again (should still work, creates duplicate in list)
+        // Note: In production, you'd prevent this, but for now it's allowed
+        pm.free_page(page1).unwrap();
+        assert_eq!(pm.first_free_page, Some(1));
+
+        // This creates a cycle: 1 → 1 → 1 → ...
+        // Allocate will return page 1 twice (bug, but that's expected for now)
+        let p1 = pm.allocate_page().unwrap();
+        let p2 = pm.allocate_page().unwrap();
+        assert_eq!(p1, 1);
+        assert_eq!(p2, 1); // Same page!
+
+        cleanup("test_double_free");
+    }
+
+    #[test]
+    fn test_write_header_updates_num_pages() {
+        cleanup("test_header_update");
+        let mut pm = PageManager::new("test_header_update.hdb").unwrap();
+
+        // Allocate page (increases num_pages)
+        pm.allocate_page().unwrap();
+        assert_eq!(pm.num_pages(), 2);
+
+        // Manually verify header on disk
+        drop(pm);
+        let pm = PageManager::new("test_header_update.hdb").unwrap();
+        assert_eq!(pm.num_pages(), 2); // Should persist
+
+        cleanup("test_header_update");
+    }
+
+    #[test]
+    fn test_write_header_updates_first_free() {
+        cleanup("test_header_first_free");
+        let mut pm = PageManager::new("test_header_first_free.hdb").unwrap();
+
+        let page1 = pm.allocate_page().unwrap();
+        pm.free_page(page1).unwrap();
+
+        assert_eq!(pm.first_free_page, Some(1));
+
+        // Verify persistence
+        drop(pm);
+        let pm = PageManager::new("test_header_first_free.hdb").unwrap();
+        assert_eq!(pm.first_free_page, Some(1));
+
+        cleanup("test_header_first_free");
+    }
+
+    #[test]
+    fn test_free_list_chain_integrity() {
+        cleanup("test_chain");
+        let mut pm = PageManager::new("test_chain.hdb").unwrap();
+
+        // Allocate 5 pages
+        for _ in 0..5 {
+            pm.allocate_page().unwrap();
+        }
+
+        // Free pages to create chain: 5 → 3 → 1 → NULL
+        pm.free_page(1).unwrap();
+        pm.free_page(3).unwrap();
+        pm.free_page(5).unwrap();
+
+        // Manually verify chain by reading pages
+        assert_eq!(pm.first_free_page, Some(5));
+
+        let next1 = pm.read_next_free(5).unwrap();
+        assert_eq!(next1, Some(3));
+
+        let next2 = pm.read_next_free(3).unwrap();
+        assert_eq!(next2, Some(1));
+
+        let next3 = pm.read_next_free(1).unwrap();
+        assert_eq!(next3, None);
+
+        cleanup("test_chain");
+    }
+
+    #[test]
+    fn test_allocate_all_freed_pages() {
+        cleanup("test_allocate_all");
+        let mut pm = PageManager::new("test_allocate_all.hdb").unwrap();
+
+        // Allocate 10 pages
+        for _ in 0..10 {
+            pm.allocate_page().unwrap();
+        }
+
+        // Free all (except page 0)
+        for i in 1..=10 {
+            pm.free_page(i).unwrap();
+        }
+
+        // Allocate all back
+        for _ in 0..10 {
+            pm.allocate_page().unwrap();
+        }
+
+        // Free list should be empty
+        assert_eq!(pm.first_free_page, None);
+
+        // Next allocation should extend
+        let new_page = pm.allocate_page().unwrap();
+        assert_eq!(new_page, 11);
+
+        cleanup("test_allocate_all");
     }
 }

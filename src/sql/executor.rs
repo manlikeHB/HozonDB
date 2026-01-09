@@ -47,9 +47,10 @@ impl Executor {
 
     // Read all rows from a table
     // which possible spans across multiple pages
-    fn read_all_table_rows(&self, first_page: u32) -> io::Result<Vec<Row>> {
+    fn read_all_table_rows(&self, first_page: u32) -> io::Result<(Vec<Row>, Vec<PageId>)> {
         let mut rows = Vec::new();
         let mut cur_page = first_page;
+        let mut old_chain = Vec::new();
 
         loop {
             // Read page data
@@ -60,6 +61,9 @@ impl Executor {
             let mut new_rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
             rows.append(&mut new_rows);
 
+            // collect old chain pages
+            old_chain.push(cur_page);
+
             if let Some(next_page) = page_meta.next_page {
                 cur_page = next_page;
             } else {
@@ -67,7 +71,7 @@ impl Executor {
             }
         }
 
-        Ok(rows)
+        Ok((rows, old_chain))
     }
 
     /// Write rows to a single page buffer
@@ -99,11 +103,30 @@ impl Executor {
     }
 
     /// writes rows of a table to as many pages as is required
-    fn write_all_table_rows(&mut self, first_page: PageId, rows: &[Row]) -> io::Result<()> {
-        let mut current_page_id = first_page;
+    fn write_all_table_rows(
+        &mut self,
+        rows: &[Row],
+        old_chain: Option<&[u32]>,
+    ) -> io::Result<Vec<PageId>> {
         let mut remaining_rows = rows; // shrinks as we write
+        let mut new_chain = Vec::new();
+
+        let old_page_ids = if let Some(page_ids) = old_chain {
+            page_ids
+        } else {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "list of old chain can't be empty",
+            ));
+        };
+
+        let mut cur_index = 0;
+        let mut current_page_id = old_page_ids[cur_index];
 
         loop {
+            // collect page chain
+            new_chain.push(current_page_id);
+
             let mut page_data = [0u8; PAGE_SIZE];
 
             // Write as many rows as fit
@@ -112,10 +135,18 @@ impl Executor {
 
             // Update page metadata
             let has_more_rows = rows_written < remaining_rows.len();
+
             let next_page = if has_more_rows {
-                // Need another page - allocate it
-                let new_page = self.catalog.allocate_page()?;
-                Some(new_page)
+                // check if there are more pages in old chain
+                if cur_index < old_page_ids.len() - 1 {
+                    cur_index += 1;
+                    Some(old_page_ids[cur_index])
+                } else {
+                    // else allocate new page
+                    // Need another page - allocate it
+                    let new_page = self.catalog.allocate_page()?;
+                    Some(new_page)
+                }
             } else {
                 None // Last page
             };
@@ -131,6 +162,8 @@ impl Executor {
             // Write page to disk
             self.catalog.write_page(current_page_id, &page_data)?;
 
+            let _ = self.catalog.read_page_metadata(current_page_id)?;
+
             // Move to remaining rows
             remaining_rows = &remaining_rows[rows_written..];
 
@@ -142,7 +175,7 @@ impl Executor {
             }
         }
 
-        Ok(())
+        Ok(new_chain)
     }
 
     pub fn execute(&mut self, statement: Statement) -> io::Result<ExecutionResult> {
@@ -167,6 +200,20 @@ impl Executor {
         }
     }
 
+    fn get_table_first_page_and_cols(&self, table_name: &str) -> io::Result<(u32, &Vec<Column>)> {
+        let (first_page, columns) = match self.catalog.get_table(&table_name) {
+            Some(meta) => (meta.first_page(), meta.schema().columns()),
+            None => {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("Table '{}' does not exist", table_name),
+                ));
+            }
+        };
+
+        Ok((first_page, columns))
+    }
+
     fn execute_create(
         &mut self,
         table_name: String,
@@ -174,6 +221,7 @@ impl Executor {
     ) -> io::Result<ExecutionResult> {
         let schema = Schema::new(&table_name, columns);
         self.catalog.create_table(schema)?;
+
         Ok(ExecutionResult::Success {
             message: format!("Table '{}' created.", table_name),
         })
@@ -185,15 +233,17 @@ impl Executor {
         values: Vec<Value>,
     ) -> io::Result<ExecutionResult> {
         // Get table metadata
-        let (first_page, columns) = match self.catalog.get_table(&table_name) {
-            Some(meta) => (meta.first_page(), meta.schema().columns()),
-            None => {
-                return Err(Error::new(
-                    ErrorKind::NotFound,
-                    format!("Table '{}' does not exist", table_name),
-                ));
-            }
-        };
+        // let (first_page, columns) = match self.catalog.get_table(&table_name) {
+        //     Some(meta) => (meta.first_page(), meta.schema().columns()),
+        //     None => {
+        //         return Err(Error::new(
+        //             ErrorKind::NotFound,
+        //             format!("Table '{}' does not exist", table_name),
+        //         ));
+        //     }
+        // };
+
+        let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
         // Validate value count
         if values.len() != columns.len() {
@@ -219,13 +269,13 @@ impl Executor {
         }
 
         // Read all existing rows
-        let mut all_rows = self.read_all_table_rows(first_page)?;
+        let (mut all_rows, old_chain) = self.read_all_table_rows(first_page)?;
 
         // Add new row
         all_rows.push(Row::new(values));
 
         // Rewrite everything // TODO: append new row instead of rewriting everything
-        self.write_all_table_rows(first_page, &all_rows)?;
+        let _ = self.write_all_table_rows(&all_rows, Some(&old_chain))?;
 
         Ok(ExecutionResult::Success {
             message: "1 row inserted.".to_string(),
@@ -238,18 +288,9 @@ impl Executor {
         select_columns: SelectColumns,
         where_clause: Option<Expr>,
     ) -> io::Result<ExecutionResult> {
-        // Get table metadata
-        let (first_page, columns) = match self.catalog.get_table(&table_name) {
-            Some(meta) => (meta.first_page(), meta.schema().columns()),
-            None => {
-                return Err(Error::new(
-                    ErrorKind::NotFound,
-                    format!("Table '{}' does not exist", table_name),
-                ));
-            }
-        };
+        let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
-        let rows = self.read_all_table_rows(first_page)?;
+        let (rows, _) = self.read_all_table_rows(first_page)?;
 
         // Extract column names
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
@@ -331,7 +372,25 @@ impl Executor {
     }
 
     fn execute_drop_table(&mut self, table_name: String) -> io::Result<ExecutionResult> {
+        // let (first_page, _) = match self.catalog.get_table(&table_name) {
+        //     Some(meta) => (meta.first_page(), meta.schema().columns()),
+        //     None => {
+        //         return Err(Error::new(
+        //             ErrorKind::NotFound,
+        //             format!("Table '{}' does not exist", table_name),
+        //         ));
+        //     }
+        // };
+
+        let (first_page, _) = self.get_table_first_page_and_cols(&table_name)?;
+
+        let page_chain = self.collect_page_chain(first_page)?;
+
         self.catalog.drop_table(&table_name)?;
+
+        for page in page_chain {
+            self.catalog.free_page(page)?;
+        }
 
         Ok(ExecutionResult::Success {
             message: format!("{} table successfully dropped", table_name),
@@ -344,18 +403,20 @@ impl Executor {
         where_clause: Option<Expr>,
     ) -> io::Result<ExecutionResult> {
         // Get table metadata
-        let (first_page, columns) = match self.catalog.get_table(&table_name) {
-            Some(meta) => (meta.first_page(), meta.schema().columns()),
-            None => {
-                return Err(Error::new(
-                    ErrorKind::NotFound,
-                    format!("Table '{}' does not exist", table_name),
-                ));
-            }
-        };
+        // let (first_page, columns) = match self.catalog.get_table(&table_name) {
+        //     Some(meta) => (meta.first_page(), meta.schema().columns()),
+        //     None => {
+        //         return Err(Error::new(
+        //             ErrorKind::NotFound,
+        //             format!("Table '{}' does not exist", table_name),
+        //         ));
+        //     }
+        // };
+
+        let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
         // get all rows
-        let rows = self.read_all_table_rows(first_page)?;
+        let (rows, old_chain) = self.read_all_table_rows(first_page)?;
         let rows_len = rows.len();
 
         // Extract column names
@@ -387,7 +448,16 @@ impl Executor {
             })
             .collect();
 
-        self.write_all_table_rows(first_page, &filtered_rows)?;
+        let new_chain = self.write_all_table_rows(&filtered_rows, Some(&old_chain))?;
+
+        let pages_to_free: Vec<PageId> = old_chain
+            .into_iter()
+            .filter(|x| !new_chain.contains(x))
+            .collect();
+
+        for page_id in pages_to_free {
+            self.catalog.free_page(page_id)?;
+        }
 
         let num_rows = rows_len - filtered_rows.len();
         Ok(ExecutionResult::Success {
@@ -406,15 +476,17 @@ impl Executor {
         where_clause: Option<Expr>,
     ) -> io::Result<ExecutionResult> {
         // Get table metadata
-        let (first_page, columns) = match self.catalog.get_table(&table_name) {
-            Some(meta) => (meta.first_page(), meta.schema().columns()),
-            None => {
-                return Err(Error::new(
-                    ErrorKind::NotFound,
-                    format!("Table '{}' does not exist", table_name),
-                ));
-            }
-        };
+        // let (first_page, columns) = match self.catalog.get_table(&table_name) {
+        //     Some(meta) => (meta.first_page(), meta.schema().columns()),
+        //     None => {
+        //         return Err(Error::new(
+        //             ErrorKind::NotFound,
+        //             format!("Table '{}' does not exist", table_name),
+        //         ));
+        //     }
+        // };
+
+        let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
         // Extract column names
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
@@ -449,7 +521,7 @@ impl Executor {
             }
         }
 
-        let rows = self.read_all_table_rows(first_page)?;
+        let (rows, old_chain) = self.read_all_table_rows(first_page)?;
 
         // Check if table is empty
         if rows.len() == 0 {
@@ -495,7 +567,7 @@ impl Executor {
             .collect();
 
         // write updated rows to page
-        self.write_all_table_rows(first_page, &updated_rows)?;
+        let _ = self.write_all_table_rows(&updated_rows, Some(&old_chain))?;
 
         Ok(ExecutionResult::Success {
             message: format!(
@@ -504,6 +576,20 @@ impl Executor {
                 if updated_count == 1 { "row" } else { "rows" }
             ),
         })
+    }
+
+    // #[cfg(test)]
+    fn collect_page_chain(&self, first_page: PageId) -> io::Result<Vec<PageId>> {
+        let mut chain = Vec::new();
+        let mut current = Some(first_page);
+
+        while let Some(page_id) = current {
+            chain.push(page_id);
+            let metadata = self.catalog.read_page_metadata(page_id)?;
+            current = metadata.next_page;
+        }
+
+        Ok(chain)
     }
 }
 
@@ -1657,15 +1743,17 @@ mod tests {
             .unwrap();
 
         // Should be empty
-        let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
-            .unwrap();
+        let result = executor.execute(Statement::Select {
+            table_name: "users".to_string(),
+            columns: SelectColumns::All,
+            where_clause: None,
+        });
 
-        match result {
+        if result.is_err() {
+            eprintln!("result: {:?}", result);
+        }
+
+        match result.unwrap() {
             ExecutionResult::Rows { rows, columns } => {
                 assert_eq!(rows.len(), 0); // New table should be empty
                 assert_eq!(columns.len(), 2); // New schema has 2 columns
@@ -3406,5 +3494,65 @@ mod tests {
         }
 
         cleanup("test_delete_all_mp");
+    }
+
+    #[test]
+    fn test_delete_frees_specific_pages() {
+        cleanup("test_compact_specific");
+        let mut executor = create_test_executor("test_compact_specific");
+
+        executor
+            .execute(Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer),
+                    Column::new("data", DataType::Text),
+                ],
+            })
+            .unwrap();
+
+        // Insert 100 rows
+        for i in 0..100 {
+            executor
+                .execute(Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                })
+                .unwrap();
+        }
+
+        // Get old page chain before delete
+        let first_page = executor.catalog.get_table("users").unwrap().first_page();
+        let old_chain = executor.collect_page_chain(first_page).unwrap();
+
+        // Delete 90% of rows
+        executor
+            .execute(Statement::Delete {
+                table_name: "users".to_string(),
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::GreaterThan,
+                    right: Box::new(Expr::Literal(Value::Integer(9))),
+                }),
+            })
+            .unwrap();
+
+        // Get new page chain
+        let new_chain = executor.collect_page_chain(first_page).unwrap();
+        eprintln!("New chain after compact: {:?}", new_chain);
+
+        // Should use fewer pages
+        assert!(new_chain.len() < old_chain.len());
+
+        // Freed pages should be in free list
+        let freed_pages: Vec<_> = old_chain
+            .iter()
+            .filter(|p| !new_chain.contains(p))
+            .collect();
+
+        eprintln!("Freed pages: {:?}", freed_pages);
+        assert!(freed_pages.len() > 0);
+
+        cleanup("test_compact_specific");
     }
 }
