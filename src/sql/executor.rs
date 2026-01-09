@@ -103,11 +103,7 @@ impl Executor {
     }
 
     /// writes rows of a table to as many pages as is required
-    fn write_all_table_rows(
-        &mut self,
-        rows: &[Row],
-        old_chain: Option<&[u32]>,
-    ) -> io::Result<Vec<PageId>> {
+    fn write_all_table_rows(&mut self, rows: &[Row], old_chain: Option<&[u32]>) -> io::Result<()> {
         let mut remaining_rows = rows; // shrinks as we write
         let mut new_chain = Vec::new();
 
@@ -175,7 +171,16 @@ impl Executor {
             }
         }
 
-        Ok(new_chain)
+        // Free any leftover pages from old chain
+        if let Some(old_chain) = old_chain {
+            for old_page in old_chain {
+                if !new_chain.contains(old_page) {
+                    self.catalog.free_page(*old_page)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn execute(&mut self, statement: Statement) -> io::Result<ExecutionResult> {
@@ -232,17 +237,6 @@ impl Executor {
         table_name: String,
         values: Vec<Value>,
     ) -> io::Result<ExecutionResult> {
-        // Get table metadata
-        // let (first_page, columns) = match self.catalog.get_table(&table_name) {
-        //     Some(meta) => (meta.first_page(), meta.schema().columns()),
-        //     None => {
-        //         return Err(Error::new(
-        //             ErrorKind::NotFound,
-        //             format!("Table '{}' does not exist", table_name),
-        //         ));
-        //     }
-        // };
-
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
         // Validate value count
@@ -275,7 +269,7 @@ impl Executor {
         all_rows.push(Row::new(values));
 
         // Rewrite everything // TODO: append new row instead of rewriting everything
-        let _ = self.write_all_table_rows(&all_rows, Some(&old_chain))?;
+        self.write_all_table_rows(&all_rows, Some(&old_chain))?;
 
         Ok(ExecutionResult::Success {
             message: "1 row inserted.".to_string(),
@@ -372,16 +366,6 @@ impl Executor {
     }
 
     fn execute_drop_table(&mut self, table_name: String) -> io::Result<ExecutionResult> {
-        // let (first_page, _) = match self.catalog.get_table(&table_name) {
-        //     Some(meta) => (meta.first_page(), meta.schema().columns()),
-        //     None => {
-        //         return Err(Error::new(
-        //             ErrorKind::NotFound,
-        //             format!("Table '{}' does not exist", table_name),
-        //         ));
-        //     }
-        // };
-
         let (first_page, _) = self.get_table_first_page_and_cols(&table_name)?;
 
         let page_chain = self.collect_page_chain(first_page)?;
@@ -402,17 +386,6 @@ impl Executor {
         table_name: String,
         where_clause: Option<Expr>,
     ) -> io::Result<ExecutionResult> {
-        // Get table metadata
-        // let (first_page, columns) = match self.catalog.get_table(&table_name) {
-        //     Some(meta) => (meta.first_page(), meta.schema().columns()),
-        //     None => {
-        //         return Err(Error::new(
-        //             ErrorKind::NotFound,
-        //             format!("Table '{}' does not exist", table_name),
-        //         ));
-        //     }
-        // };
-
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
         // get all rows
@@ -448,16 +421,7 @@ impl Executor {
             })
             .collect();
 
-        let new_chain = self.write_all_table_rows(&filtered_rows, Some(&old_chain))?;
-
-        let pages_to_free: Vec<PageId> = old_chain
-            .into_iter()
-            .filter(|x| !new_chain.contains(x))
-            .collect();
-
-        for page_id in pages_to_free {
-            self.catalog.free_page(page_id)?;
-        }
+        self.write_all_table_rows(&filtered_rows, Some(&old_chain))?;
 
         let num_rows = rows_len - filtered_rows.len();
         Ok(ExecutionResult::Success {
@@ -475,17 +439,6 @@ impl Executor {
         assignments: Vec<(String, Value)>,
         where_clause: Option<Expr>,
     ) -> io::Result<ExecutionResult> {
-        // Get table metadata
-        // let (first_page, columns) = match self.catalog.get_table(&table_name) {
-        //     Some(meta) => (meta.first_page(), meta.schema().columns()),
-        //     None => {
-        //         return Err(Error::new(
-        //             ErrorKind::NotFound,
-        //             format!("Table '{}' does not exist", table_name),
-        //         ));
-        //     }
-        // };
-
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
         // Extract column names
@@ -567,7 +520,7 @@ impl Executor {
             .collect();
 
         // write updated rows to page
-        let _ = self.write_all_table_rows(&updated_rows, Some(&old_chain))?;
+        self.write_all_table_rows(&updated_rows, Some(&old_chain))?;
 
         Ok(ExecutionResult::Success {
             message: format!(
