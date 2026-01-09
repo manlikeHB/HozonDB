@@ -125,8 +125,8 @@ impl PageManager {
         Ok(())
     }
 
-    /// Read next_free pointer from a free page // TODO: make private
-    pub fn read_next_free(&self, page_id: PageId) -> io::Result<Option<PageId>> {
+    /// Read next_free pointer from a free page
+    fn read_next_free(&self, page_id: PageId) -> io::Result<Option<PageId>> {
         let page_data = self.read_page(page_id)?;
         let next_page =
             u32::from_le_bytes([page_data[0], page_data[1], page_data[2], page_data[3]]);

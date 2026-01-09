@@ -190,18 +190,6 @@ impl TableCatalog {
     pub fn get_first_free_page(&self) -> Option<PageId> {
         self.page_manager.first_free_page()
     }
-
-    pub fn count_free_pages(&self) -> io::Result<usize> {
-        let mut count = 0;
-        let mut current = self.page_manager.first_free_page();
-
-        while let Some(page_id) = current {
-            count += 1;
-            current = self.page_manager.read_next_free(page_id)?;
-        }
-
-        Ok(count)
-    }
 }
 
 #[cfg(test)]
