@@ -158,8 +158,6 @@ impl Executor {
             // Write page to disk
             self.catalog.write_page(current_page_id, &page_data)?;
 
-            let _ = self.catalog.read_page_metadata(current_page_id)?;
-
             // Move to remaining rows
             remaining_rows = &remaining_rows[rows_written..];
 
@@ -262,14 +260,52 @@ impl Executor {
             }
         }
 
-        // Read all existing rows
-        let (mut all_rows, old_chain) = self.read_all_table_rows(first_page)?;
+        // get last page
+        let mut last_page = first_page;
 
-        // Add new row
-        all_rows.push(Row::new(values));
+        loop {
+            let page_meta = self.catalog.read_page_metadata(last_page)?;
+            match page_meta.next_page {
+                Some(next_page) => last_page = next_page,
+                None => break,
+            }
+        }
 
-        // Rewrite everything // TODO: append new row instead of rewriting everything
-        self.write_all_table_rows(&all_rows, Some(&old_chain))?;
+        let mut last_page_data = self.catalog.read_page(last_page)?;
+        let mut last_page_meta = PageManager::read_metadata_from_buffer(&last_page_data);
+        let row_bytes = Row::new(values).to_bytes();
+
+        // try to append new row to last page
+        if last_page_meta.last_offset + row_bytes.len() < PAGE_SIZE {
+            let offset = last_page_meta.last_offset;
+
+            last_page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
+
+            last_page_meta.num_rows += 1;
+            last_page_meta.last_offset += row_bytes.len();
+
+            PageManager::update_metadata_in_buffer(&mut last_page_data, &last_page_meta);
+            self.catalog.write_page(last_page, &last_page_data)?;
+        } else {
+            // Create a new page
+            let new_page = self.catalog.allocate_page()?;
+            let mut new_page_data = [0u8; PAGE_SIZE];
+            let mut new_page_meta = self.catalog.read_page_metadata(new_page)?;
+
+            new_page_meta.num_rows += 1;
+            new_page_meta.last_offset += row_bytes.len();
+
+            new_page_data[PAGE_DATA_START..PAGE_DATA_START + row_bytes.len()]
+                .copy_from_slice(&row_bytes);
+
+            PageManager::update_metadata_in_buffer(&mut new_page_data, &new_page_meta);
+            self.catalog.write_page(new_page, &new_page_data)?;
+
+            // Update the previous page's metadata to point to the new page
+            last_page_meta.next_page = Some(new_page);
+            self.catalog
+                .update_page_metadata(last_page, &last_page_meta)?;
+        }
 
         Ok(ExecutionResult::Success {
             message: "1 row inserted.".to_string(),
@@ -3492,7 +3528,6 @@ mod tests {
 
         // Get new page chain
         let new_chain = executor.collect_page_chain(first_page).unwrap();
-        eprintln!("New chain after compact: {:?}", new_chain);
 
         // Should use fewer pages
         assert!(new_chain.len() < old_chain.len());
@@ -3503,7 +3538,6 @@ mod tests {
             .filter(|p| !new_chain.contains(p))
             .collect();
 
-        eprintln!("Freed pages: {:?}", freed_pages);
         assert!(freed_pages.len() > 0);
 
         cleanup("test_compact_specific");
