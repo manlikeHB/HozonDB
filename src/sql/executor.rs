@@ -1,4 +1,6 @@
-use crate::{sql::evaluator::evaluate_expr, storage::page::PageId};
+use crate::{
+    benchmark::metrics::QueryMetrics, sql::evaluator::evaluate_expr, storage::page::PageId,
+};
 use std::io::{self, Error, ErrorKind};
 
 use crate::{
@@ -47,7 +49,11 @@ impl Executor {
 
     // Read all rows from a table
     // which possible spans across multiple pages
-    fn read_all_table_rows(&self, first_page: u32) -> io::Result<(Vec<Row>, Vec<PageId>)> {
+    fn read_all_table_rows(
+        &self,
+        first_page: u32,
+        metrics: &mut Option<QueryMetrics>,
+    ) -> io::Result<(Vec<Row>, Vec<PageId>)> {
         let mut rows = Vec::new();
         let mut cur_page = first_page;
         let mut old_chain = Vec::new();
@@ -55,10 +61,21 @@ impl Executor {
         loop {
             // Read page data
             let page_data = self.catalog.read_page(cur_page)?;
+
+            // track page reads
+            if let Some(m) = metrics.as_mut() {
+                m.pages_read += 1;
+            }
+
             let page_meta = PageManager::read_metadata_from_buffer(&page_data);
 
             // Parse all rows from the page
             let mut new_rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
+
+            // track rows scanned
+            if let Some(m) = metrics.as_mut() {
+                m.rows_scanned += rows.len();
+            }
             rows.append(&mut new_rows);
 
             // collect old chain pages
@@ -103,7 +120,12 @@ impl Executor {
     }
 
     /// writes rows of a table to as many pages as is required
-    fn write_all_table_rows(&mut self, rows: &[Row], old_chain: Option<&[u32]>) -> io::Result<()> {
+    fn write_all_table_rows(
+        &mut self,
+        rows: &[Row],
+        old_chain: Option<&[u32]>,
+        metrics: &mut Option<QueryMetrics>,
+    ) -> io::Result<()> {
         let mut remaining_rows = rows; // shrinks as we write
         let mut new_chain = Vec::new();
 
@@ -158,6 +180,11 @@ impl Executor {
             // Write page to disk
             self.catalog.write_page(current_page_id, &page_data)?;
 
+            // track page write
+            if let Some(m) = metrics.as_mut() {
+                m.pages_written += 1;
+            }
+
             // Move to remaining rows
             remaining_rows = &remaining_rows[rows_written..];
 
@@ -181,26 +208,40 @@ impl Executor {
         Ok(())
     }
 
-    pub fn execute(&mut self, statement: Statement) -> io::Result<ExecutionResult> {
-        match statement {
+    pub fn execute(
+        &mut self,
+        statement: Statement,
+        metrics: &mut Option<QueryMetrics>,
+    ) -> io::Result<ExecutionResult> {
+        let start = std::time::Instant::now();
+
+        let result = match statement {
             Statement::CreateTable { name, columns } => self.execute_create(name, columns),
-            Statement::Insert { table_name, values } => self.execute_insert(table_name, values),
+            Statement::Insert { table_name, values } => {
+                self.execute_insert(table_name, values, metrics)
+            }
             Statement::Select {
                 table_name,
                 columns,
                 where_clause,
-            } => self.execute_select(table_name, columns, where_clause),
+            } => self.execute_select(table_name, columns, where_clause, metrics),
             Statement::DropTable { name } => self.execute_drop_table(name),
             Statement::Delete {
                 table_name,
                 where_clause,
-            } => self.execute_delete(table_name, where_clause),
+            } => self.execute_delete(table_name, where_clause, metrics),
             Statement::Update {
                 table_name,
                 assignments,
                 where_clause,
-            } => self.execute_update(table_name, assignments, where_clause),
+            } => self.execute_update(table_name, assignments, where_clause, metrics),
+        };
+
+        if let Some(m) = metrics {
+            m.duration_ms = start.elapsed().as_secs_f64() * 1000.0;
         }
+
+        result
     }
 
     fn get_table_first_page_and_cols(&self, table_name: &str) -> io::Result<(u32, &Vec<Column>)> {
@@ -234,6 +275,7 @@ impl Executor {
         &mut self,
         table_name: String,
         values: Vec<Value>,
+        metrics: &mut Option<QueryMetrics>,
     ) -> io::Result<ExecutionResult> {
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
@@ -272,6 +314,12 @@ impl Executor {
         }
 
         let mut last_page_data = self.catalog.read_page(last_page)?;
+
+        // Track page read
+        if let Some(m) = metrics.as_mut() {
+            m.pages_read += 1;
+        }
+
         let mut last_page_meta = PageManager::read_metadata_from_buffer(&last_page_data);
         let row_bytes = Row::new(values).to_bytes();
 
@@ -286,6 +334,11 @@ impl Executor {
 
             PageManager::update_metadata_in_buffer(&mut last_page_data, &last_page_meta);
             self.catalog.write_page(last_page, &last_page_data)?;
+
+            // Track page write
+            if let Some(m) = metrics.as_mut() {
+                m.pages_written += 1;
+            }
         } else {
             // Create a new page
             let new_page = self.catalog.allocate_page()?;
@@ -301,10 +354,23 @@ impl Executor {
             PageManager::update_metadata_in_buffer(&mut new_page_data, &new_page_meta);
             self.catalog.write_page(new_page, &new_page_data)?;
 
+            // Track new page write
+            if let Some(m) = metrics.as_mut() {
+                m.pages_written += 1;
+            }
+
             // Update the previous page's metadata to point to the new page
             last_page_meta.next_page = Some(new_page);
             self.catalog
                 .update_page_metadata(last_page, &last_page_meta)?;
+
+            if let Some(m) = metrics.as_mut() {
+                m.pages_written += 1;
+            }
+        }
+
+        if let Some(m) = metrics.as_mut() {
+            m.rows_modified += 1;
         }
 
         Ok(ExecutionResult::Success {
@@ -317,10 +383,11 @@ impl Executor {
         table_name: String,
         select_columns: SelectColumns,
         where_clause: Option<Expr>,
+        metrics: &mut Option<QueryMetrics>,
     ) -> io::Result<ExecutionResult> {
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
-        let (rows, _) = self.read_all_table_rows(first_page)?;
+        let (rows, _) = self.read_all_table_rows(first_page, metrics)?;
 
         // Extract column names
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
@@ -421,11 +488,12 @@ impl Executor {
         &mut self,
         table_name: String,
         where_clause: Option<Expr>,
+        metrics: &mut Option<QueryMetrics>,
     ) -> io::Result<ExecutionResult> {
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
         // get all rows
-        let (rows, old_chain) = self.read_all_table_rows(first_page)?;
+        let (rows, old_chain) = self.read_all_table_rows(first_page, metrics)?;
         let rows_len = rows.len();
 
         // Extract column names
@@ -457,9 +525,13 @@ impl Executor {
             })
             .collect();
 
-        self.write_all_table_rows(&filtered_rows, Some(&old_chain))?;
+        self.write_all_table_rows(&filtered_rows, Some(&old_chain), metrics)?;
 
         let num_rows = rows_len - filtered_rows.len();
+
+        if let Some(m) = metrics {
+            m.rows_modified = num_rows;
+        }
         Ok(ExecutionResult::Success {
             message: format!(
                 "{} {} deleted.",
@@ -474,6 +546,7 @@ impl Executor {
         table_name: String,
         assignments: Vec<(String, Value)>,
         where_clause: Option<Expr>,
+        metrics: &mut Option<QueryMetrics>,
     ) -> io::Result<ExecutionResult> {
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
@@ -510,7 +583,7 @@ impl Executor {
             }
         }
 
-        let (rows, old_chain) = self.read_all_table_rows(first_page)?;
+        let (rows, old_chain) = self.read_all_table_rows(first_page, metrics)?;
 
         // Check if table is empty
         if rows.len() == 0 {
@@ -556,7 +629,11 @@ impl Executor {
             .collect();
 
         // write updated rows to page
-        self.write_all_table_rows(&updated_rows, Some(&old_chain))?;
+        self.write_all_table_rows(&updated_rows, Some(&old_chain), metrics)?;
+
+        if let Some(m) = metrics {
+            m.rows_modified = updated_count;
+        }
 
         Ok(ExecutionResult::Success {
             message: format!(
@@ -628,7 +705,7 @@ mod tests {
             columns,
         };
 
-        let result = executor.execute(statement).unwrap();
+        let result = executor.execute(statement, &mut None).unwrap();
 
         match result {
             ExecutionResult::Success { message } => {
@@ -653,19 +730,25 @@ mod tests {
             Column::new("name", DataType::Text),
         ];
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns,
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns,
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert row
         let values = vec![Value::Integer(1), Value::Text("Alice".to_string())];
         let result = executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values,
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -686,33 +769,42 @@ mod tests {
 
         // Create table
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert multiple rows
         for i in 1..=5 {
             let values = vec![Value::Integer(i), Value::Text(format!("User{}", i))];
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values,
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values,
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Verify with SELECT
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -734,13 +826,16 @@ mod tests {
 
         // Create table with 2 columns
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Try to insert 3 values
@@ -749,10 +844,13 @@ mod tests {
             Value::Text("Alice".to_string()),
             Value::Boolean(true),
         ];
-        let result = executor.execute(Statement::Insert {
-            table_name: "users".to_string(),
-            values,
-        });
+        let result = executor.execute(
+            Statement::Insert {
+                table_name: "users".to_string(),
+                values,
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -766,13 +864,16 @@ mod tests {
         let mut executor = create_test_executor("test_exec_wrong_type");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Try to insert text where integer expected
@@ -780,10 +881,13 @@ mod tests {
             Value::Text("not a number".to_string()),
             Value::Text("Alice".to_string()),
         ];
-        let result = executor.execute(Statement::Insert {
-            table_name: "users".to_string(),
-            values,
-        });
+        let result = executor.execute(
+            Statement::Insert {
+                table_name: "users".to_string(),
+                values,
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -797,10 +901,13 @@ mod tests {
         let mut executor = create_test_executor("test_exec_no_table");
 
         let values = vec![Value::Integer(1)];
-        let result = executor.execute(Statement::Insert {
-            table_name: "nonexistent".to_string(),
-            values,
-        });
+        let result = executor.execute(
+            Statement::Insert {
+                table_name: "nonexistent".to_string(),
+                values,
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -815,34 +922,43 @@ mod tests {
 
         // Setup
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                    Column::new("active", DataType::Boolean),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                        Column::new("active", DataType::Boolean),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![
-                    Value::Integer(1),
-                    Value::Text("Alice".to_string()),
-                    Value::Boolean(true),
-                ],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Integer(1),
+                        Value::Text("Alice".to_string()),
+                        Value::Boolean(true),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Test SELECT *
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -867,34 +983,43 @@ mod tests {
 
         // Setup
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                    Column::new("email", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                        Column::new("email", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![
-                    Value::Integer(1),
-                    Value::Text("Alice".to_string()),
-                    Value::Text("alice@example.com".to_string()),
-                ],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Integer(1),
+                        Value::Text("Alice".to_string()),
+                        Value::Text("alice@example.com".to_string()),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Test SELECT specific columns
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::Specific(vec!["name".to_string(), "id".to_string()]),
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::Specific(vec!["name".to_string(), "id".to_string()]),
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -927,24 +1052,33 @@ mod tests {
         let mut executor = create_test_executor("test_exec_select_bad_col");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1)],
+                },
+                &mut None,
+            )
             .unwrap();
 
-        let result = executor.execute(Statement::Select {
-            table_name: "users".to_string(),
-            columns: SelectColumns::Specific(vec!["nonexistent".to_string()]),
-            where_clause: None,
-        });
+        let result = executor.execute(
+            Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::Specific(vec!["nonexistent".to_string()]),
+                where_clause: None,
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -958,18 +1092,24 @@ mod tests {
         let mut executor = create_test_executor("test_exec_select_empty");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -991,37 +1131,46 @@ mod tests {
 
         // Create table with all types
         executor
-            .execute(Statement::CreateTable {
-                name: "test".to_string(),
-                columns: vec![
-                    Column::new("int_col", DataType::Integer),
-                    Column::new("text_col", DataType::Text),
-                    Column::new("bool_col", DataType::Boolean),
-                    Column::new("null_col", DataType::Null),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "test".to_string(),
+                    columns: vec![
+                        Column::new("int_col", DataType::Integer),
+                        Column::new("text_col", DataType::Text),
+                        Column::new("bool_col", DataType::Boolean),
+                        Column::new("null_col", DataType::Null),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert row with all types
         executor
-            .execute(Statement::Insert {
-                table_name: "test".to_string(),
-                values: vec![
-                    Value::Integer(42),
-                    Value::Text("hello".to_string()),
-                    Value::Boolean(true),
-                    Value::Null,
-                ],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "test".to_string(),
+                    values: vec![
+                        Value::Integer(42),
+                        Value::Text("hello".to_string()),
+                        Value::Boolean(true),
+                        Value::Null,
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Select and verify
         let result = executor
-            .execute(Statement::Select {
-                table_name: "test".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "test".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1053,10 +1202,13 @@ mod tests {
 
         // Create table
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Get table's first page
@@ -1069,10 +1221,13 @@ mod tests {
 
         // Insert row
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Check metadata updated
@@ -1090,29 +1245,38 @@ mod tests {
         let mut executor = create_test_executor("test_exec_nulls");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // NULL can go in any column type
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Null, Value::Null],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Null, Value::Null],
+                },
+                &mut None,
+            )
             .unwrap();
 
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1134,40 +1298,52 @@ mod tests {
 
         // Setup
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(2), Value::Text("Bob".to_string())],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(2), Value::Text("Bob".to_string())],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Test WHERE id = 2
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(2))),
-                }),
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(2))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1190,40 +1366,52 @@ mod tests {
         let mut executor = create_test_executor("test_where_eq_text");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(2), Value::Text("Bob".to_string())],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(2), Value::Text("Bob".to_string())],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Test WHERE name = 'Alice'
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("name".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Text("Alice".to_string()))),
-                }),
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("name".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Text("Alice".to_string()))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1246,35 +1434,44 @@ mod tests {
         let mut executor = create_test_executor("test_where_gt");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("age", DataType::Integer),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("age", DataType::Integer),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         for i in 1..=5 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i), Value::Integer(20 + i)],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Integer(20 + i)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Test WHERE age > 23
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("age".to_string())),
-                    op: BinaryOperator::GreaterThan,
-                    right: Box::new(Expr::Literal(Value::Integer(23))),
-                }),
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("age".to_string())),
+                        op: BinaryOperator::GreaterThan,
+                        right: Box::new(Expr::Literal(Value::Integer(23))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1293,32 +1490,41 @@ mod tests {
         let mut executor = create_test_executor("test_where_lt");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         for i in 1..=5 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i * 10)],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i * 10)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Test WHERE id < 30
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::LessThan,
-                    right: Box::new(Expr::Literal(Value::Integer(30))),
-                }),
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::LessThan,
+                        right: Box::new(Expr::Literal(Value::Integer(30))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1337,55 +1543,70 @@ mod tests {
         let mut executor = create_test_executor("test_where_and");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("age", DataType::Integer),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("age", DataType::Integer),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1), Value::Integer(25)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Integer(25)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(2), Value::Integer(30)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(2), Value::Integer(30)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(3), Value::Integer(35)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(3), Value::Integer(35)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Test WHERE id > 1 AND age < 35
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::GreaterThan,
-                        right: Box::new(Expr::Literal(Value::Integer(1))),
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::GreaterThan,
+                            right: Box::new(Expr::Literal(Value::Integer(1))),
+                        }),
+                        op: BinaryOperator::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("age".to_string())),
+                            op: BinaryOperator::LessThan,
+                            right: Box::new(Expr::Literal(Value::Integer(35))),
+                        }),
                     }),
-                    op: BinaryOperator::And,
-                    right: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("age".to_string())),
-                        op: BinaryOperator::LessThan,
-                        right: Box::new(Expr::Literal(Value::Integer(35))),
-                    }),
-                }),
-            })
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1408,40 +1629,49 @@ mod tests {
         let mut executor = create_test_executor("test_where_or");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         for i in 1..=5 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i)],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Test WHERE id = 1 OR id = 5
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::Equals,
-                        right: Box::new(Expr::Literal(Value::Integer(1))),
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Integer(1))),
+                        }),
+                        op: BinaryOperator::Or,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Integer(5))),
+                        }),
                     }),
-                    op: BinaryOperator::Or,
-                    right: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::Equals,
-                        right: Box::new(Expr::Literal(Value::Integer(5))),
-                    }),
-                }),
-            })
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1460,30 +1690,39 @@ mod tests {
         let mut executor = create_test_executor("test_where_none");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Test WHERE id = 999 (doesn't exist)
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(999))),
-                }),
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(999))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1502,38 +1741,47 @@ mod tests {
         let mut executor = create_test_executor("test_where_cols");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                    Column::new("age", DataType::Integer),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                        Column::new("age", DataType::Integer),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![
-                    Value::Integer(1),
-                    Value::Text("Alice".to_string()),
-                    Value::Integer(25),
-                ],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Integer(1),
+                        Value::Text("Alice".to_string()),
+                        Value::Integer(25),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Test SELECT name FROM users WHERE id = 1
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::Specific(vec!["name".to_string()]),
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(1))),
-                }),
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::Specific(vec!["name".to_string()]),
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1558,40 +1806,52 @@ mod tests {
         let mut executor = create_test_executor("test_where_bool");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("name", DataType::Text),
-                    Column::new("active", DataType::Boolean),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("name", DataType::Text),
+                        Column::new("active", DataType::Boolean),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Text("Alice".to_string()), Value::Boolean(true)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Text("Alice".to_string()), Value::Boolean(true)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Text("Bob".to_string()), Value::Boolean(false)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Text("Bob".to_string()), Value::Boolean(false)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Test WHERE active = true
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("active".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Boolean(true))),
-                }),
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("active".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Boolean(true))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1615,24 +1875,33 @@ mod tests {
 
         // Create table
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Verify table exists
-        let result = executor.execute(Statement::Select {
-            table_name: "users".to_string(),
-            columns: SelectColumns::All,
-            where_clause: None,
-        });
+        let result = executor.execute(
+            Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            },
+            &mut None,
+        );
         assert!(result.is_ok());
 
         // Drop table
-        let result = executor.execute(Statement::DropTable {
-            name: "users".to_string(),
-        });
+        let result = executor.execute(
+            Statement::DropTable {
+                name: "users".to_string(),
+            },
+            &mut None,
+        );
 
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1652,9 +1921,12 @@ mod tests {
         let mut executor = create_test_executor("test_drop_nonexist");
 
         // Try to drop table that doesn't exist
-        let result = executor.execute(Statement::DropTable {
-            name: "nonexistent".to_string(),
-        });
+        let result = executor.execute(
+            Statement::DropTable {
+                name: "nonexistent".to_string(),
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -1668,24 +1940,33 @@ mod tests {
 
         // Create and drop table
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::DropTable {
-                name: "users".to_string(),
-            })
+            .execute(
+                Statement::DropTable {
+                    name: "users".to_string(),
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Try to select from dropped table
-        let result = executor.execute(Statement::Select {
-            table_name: "users".to_string(),
-            columns: SelectColumns::All,
-            where_clause: None,
-        });
+        let result = executor.execute(
+            Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -1699,44 +1980,59 @@ mod tests {
 
         // Create table
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert data
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Drop table
         executor
-            .execute(Statement::DropTable {
-                name: "users".to_string(),
-            })
+            .execute(
+                Statement::DropTable {
+                    name: "users".to_string(),
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Recreate with different schema
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Should be empty
-        let result = executor.execute(Statement::Select {
-            table_name: "users".to_string(),
-            columns: SelectColumns::All,
-            where_clause: None,
-        });
+        let result = executor.execute(
+            Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            },
+            &mut None,
+        );
 
         if result.is_err() {
             eprintln!("result: {:?}", result);
@@ -1762,23 +2058,32 @@ mod tests {
             let mut executor = create_test_executor("test_drop_persist");
 
             executor
-                .execute(Statement::CreateTable {
-                    name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
-                })
+                .execute(
+                    Statement::CreateTable {
+                        name: "users".to_string(),
+                        columns: vec![Column::new("id", DataType::Integer)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
 
             executor
-                .execute(Statement::CreateTable {
-                    name: "orders".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
-                })
+                .execute(
+                    Statement::CreateTable {
+                        name: "orders".to_string(),
+                        columns: vec![Column::new("id", DataType::Integer)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
 
             executor
-                .execute(Statement::DropTable {
-                    name: "users".to_string(),
-                })
+                .execute(
+                    Statement::DropTable {
+                        name: "users".to_string(),
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
@@ -1787,19 +2092,25 @@ mod tests {
             let mut executor = create_test_executor("test_drop_persist");
 
             // users should not exist
-            let result = executor.execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            });
+            let result = executor.execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            );
             assert!(result.is_err());
 
             // orders should still exist
-            let result = executor.execute(Statement::Select {
-                table_name: "orders".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            });
+            let result = executor.execute(
+                Statement::Select {
+                    table_name: "orders".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            );
             assert!(result.is_ok());
         }
 
@@ -1813,46 +2124,61 @@ mod tests {
 
         // Setup
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(2), Value::Text("Bob".to_string())],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(2), Value::Text("Bob".to_string())],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(3), Value::Text("Charlie".to_string())],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(3), Value::Text("Charlie".to_string())],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Delete WHERE id = 2
         let result = executor
-            .execute(Statement::Delete {
-                table_name: "users".to_string(),
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(2))),
-                }),
-            })
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(2))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1864,11 +2190,14 @@ mod tests {
 
         // Verify only 2 rows remain
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1894,34 +2223,43 @@ mod tests {
         let mut executor = create_test_executor("test_delete_multiple");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("age", DataType::Integer),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("age", DataType::Integer),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         for i in 1..=5 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i), Value::Integer(20 + i)],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Integer(20 + i)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Delete WHERE age > 23
         let result = executor
-            .execute(Statement::Delete {
-                table_name: "users".to_string(),
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("age".to_string())),
-                    op: BinaryOperator::GreaterThan,
-                    right: Box::new(Expr::Literal(Value::Integer(23))),
-                }),
-            })
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("age".to_string())),
+                        op: BinaryOperator::GreaterThan,
+                        right: Box::new(Expr::Literal(Value::Integer(23))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1933,11 +2271,14 @@ mod tests {
 
         // Verify 3 rows remain
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1956,27 +2297,36 @@ mod tests {
         let mut executor = create_test_executor("test_delete_all");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         for i in 1..=3 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i)],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // DELETE without WHERE clause
         let result = executor
-            .execute(Statement::Delete {
-                table_name: "users".to_string(),
-                where_clause: None,
-            })
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -1988,11 +2338,14 @@ mod tests {
 
         // Verify table is empty
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2011,29 +2364,38 @@ mod tests {
         let mut executor = create_test_executor("test_delete_none");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Delete WHERE id = 999 (doesn't exist)
         let result = executor
-            .execute(Statement::Delete {
-                table_name: "users".to_string(),
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(999))),
-                }),
-            })
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(999))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2045,11 +2407,14 @@ mod tests {
 
         // Verify row still exists
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2068,49 +2433,58 @@ mod tests {
         let mut executor = create_test_executor("test_delete_and");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("age", DataType::Integer),
-                    Column::new("active", DataType::Boolean),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("age", DataType::Integer),
+                        Column::new("active", DataType::Boolean),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         let test_data = vec![(1, 25, true), (2, 30, true), (3, 35, false), (4, 28, true)];
 
         for (id, age, active) in test_data {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![
-                        Value::Integer(id),
-                        Value::Integer(age),
-                        Value::Boolean(active),
-                    ],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![
+                            Value::Integer(id),
+                            Value::Integer(age),
+                            Value::Boolean(active),
+                        ],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Delete WHERE age > 27 AND active = true
         let result = executor
-            .execute(Statement::Delete {
-                table_name: "users".to_string(),
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("age".to_string())),
-                        op: BinaryOperator::GreaterThan,
-                        right: Box::new(Expr::Literal(Value::Integer(27))),
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("age".to_string())),
+                            op: BinaryOperator::GreaterThan,
+                            right: Box::new(Expr::Literal(Value::Integer(27))),
+                        }),
+                        op: BinaryOperator::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("active".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Boolean(true))),
+                        }),
                     }),
-                    op: BinaryOperator::And,
-                    right: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("active".to_string())),
-                        op: BinaryOperator::Equals,
-                        right: Box::new(Expr::Literal(Value::Boolean(true))),
-                    }),
-                }),
-            })
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2122,11 +2496,14 @@ mod tests {
 
         // Verify correct rows remain
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2144,14 +2521,17 @@ mod tests {
         cleanup("test_delete_no_table");
         let mut executor = create_test_executor("test_delete_no_table");
 
-        let result = executor.execute(Statement::Delete {
-            table_name: "nonexistent".to_string(),
-            where_clause: Some(Expr::BinaryOp {
-                left: Box::new(Expr::Column("id".to_string())),
-                op: BinaryOperator::Equals,
-                right: Box::new(Expr::Literal(Value::Integer(1))),
-            }),
-        });
+        let result = executor.execute(
+            Statement::Delete {
+                table_name: "nonexistent".to_string(),
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(1))),
+                }),
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -2167,31 +2547,40 @@ mod tests {
             let mut executor = create_test_executor("test_delete_persist");
 
             executor
-                .execute(Statement::CreateTable {
-                    name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
-                })
+                .execute(
+                    Statement::CreateTable {
+                        name: "users".to_string(),
+                        columns: vec![Column::new("id", DataType::Integer)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
 
             for i in 1..=5 {
                 executor
-                    .execute(Statement::Insert {
-                        table_name: "users".to_string(),
-                        values: vec![Value::Integer(i)],
-                    })
+                    .execute(
+                        Statement::Insert {
+                            table_name: "users".to_string(),
+                            values: vec![Value::Integer(i)],
+                        },
+                        &mut None,
+                    )
                     .unwrap();
             }
 
             // Delete id > 3
             executor
-                .execute(Statement::Delete {
-                    table_name: "users".to_string(),
-                    where_clause: Some(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::GreaterThan,
-                        right: Box::new(Expr::Literal(Value::Integer(3))),
-                    }),
-                })
+                .execute(
+                    Statement::Delete {
+                        table_name: "users".to_string(),
+                        where_clause: Some(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::GreaterThan,
+                            right: Box::new(Expr::Literal(Value::Integer(3))),
+                        }),
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
@@ -2200,11 +2589,14 @@ mod tests {
             let mut executor = create_test_executor("test_delete_persist");
 
             let result = executor
-                .execute(Statement::Select {
-                    table_name: "users".to_string(),
-                    columns: SelectColumns::All,
-                    where_clause: None,
-                })
+                .execute(
+                    Statement::Select {
+                        table_name: "users".to_string(),
+                        columns: SelectColumns::All,
+                        where_clause: None,
+                    },
+                    &mut None,
+                )
                 .unwrap();
 
             match result {
@@ -2230,47 +2622,62 @@ mod tests {
         let mut executor = create_test_executor("test_delete_insert");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert rows
         for i in 1..=3 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i)],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Delete all
         executor
-            .execute(Statement::Delete {
-                table_name: "users".to_string(),
-                where_clause: None,
-            })
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert new rows
         for i in 10..=12 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i)],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Verify only new rows exist
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2296,49 +2703,61 @@ mod tests {
 
         // Setup
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                    Column::new("age", DataType::Integer),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                        Column::new("age", DataType::Integer),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![
-                    Value::Integer(1),
-                    Value::Text("Alice".to_string()),
-                    Value::Integer(25),
-                ],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Integer(1),
+                        Value::Text("Alice".to_string()),
+                        Value::Integer(25),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![
-                    Value::Integer(2),
-                    Value::Text("Bob".to_string()),
-                    Value::Integer(30),
-                ],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Integer(2),
+                        Value::Text("Bob".to_string()),
+                        Value::Integer(30),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Update WHERE id = 1
         let result = executor
-            .execute(Statement::Update {
-                table_name: "users".to_string(),
-                assignments: vec![("age".to_string(), Value::Integer(26))],
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(1))),
-                }),
-            })
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("age".to_string(), Value::Integer(26))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2350,15 +2769,18 @@ mod tests {
 
         // Verify update
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(1))),
-                }),
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2381,41 +2803,50 @@ mod tests {
         let mut executor = create_test_executor("test_update_multi");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                    Column::new("age", DataType::Integer),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                        Column::new("age", DataType::Integer),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![
-                    Value::Integer(1),
-                    Value::Text("Alice".to_string()),
-                    Value::Integer(25),
-                ],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Integer(1),
+                        Value::Text("Alice".to_string()),
+                        Value::Integer(25),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Update multiple columns
         let result = executor
-            .execute(Statement::Update {
-                table_name: "users".to_string(),
-                assignments: vec![
-                    ("name".to_string(), Value::Text("Alicia".to_string())),
-                    ("age".to_string(), Value::Integer(26)),
-                ],
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(1))),
-                }),
-            })
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![
+                        ("name".to_string(), Value::Text("Alicia".to_string())),
+                        ("age".to_string(), Value::Integer(26)),
+                    ],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2427,11 +2858,14 @@ mod tests {
 
         // Verify both columns updated
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2457,40 +2891,49 @@ mod tests {
         let mut executor = create_test_executor("test_update_multi_rows");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("age", DataType::Integer),
-                    Column::new("active", DataType::Boolean),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("age", DataType::Integer),
+                        Column::new("active", DataType::Boolean),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         for i in 1..=5 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![
-                        Value::Integer(i),
-                        Value::Integer(20 + i),
-                        Value::Boolean(true),
-                    ],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![
+                            Value::Integer(i),
+                            Value::Integer(20 + i),
+                            Value::Boolean(true),
+                        ],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Update WHERE age > 23
         let result = executor
-            .execute(Statement::Update {
-                table_name: "users".to_string(),
-                assignments: vec![("active".to_string(), Value::Boolean(false))],
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("age".to_string())),
-                    op: BinaryOperator::GreaterThan,
-                    right: Box::new(Expr::Literal(Value::Integer(23))),
-                }),
-            })
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("active".to_string(), Value::Boolean(false))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("age".to_string())),
+                        op: BinaryOperator::GreaterThan,
+                        right: Box::new(Expr::Literal(Value::Integer(23))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2502,15 +2945,18 @@ mod tests {
 
         // Verify correct rows updated
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("active".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Boolean(false))),
-                }),
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("active".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Boolean(false))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2529,31 +2975,40 @@ mod tests {
         let mut executor = create_test_executor("test_update_all");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("active", DataType::Boolean),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("active", DataType::Boolean),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         for i in 1..=3 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i), Value::Boolean(true)],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Boolean(true)],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // UPDATE without WHERE clause
         let result = executor
-            .execute(Statement::Update {
-                table_name: "users".to_string(),
-                assignments: vec![("active".to_string(), Value::Boolean(false))],
-                where_clause: None,
-            })
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("active".to_string(), Value::Boolean(false))],
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2565,11 +3020,14 @@ mod tests {
 
         // Verify all rows updated
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2594,33 +3052,42 @@ mod tests {
         let mut executor = create_test_executor("test_update_none");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("age", DataType::Integer),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("age", DataType::Integer),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1), Value::Integer(25)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Integer(25)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Update WHERE id = 999 (doesn't exist)
         let result = executor
-            .execute(Statement::Update {
-                table_name: "users".to_string(),
-                assignments: vec![("age".to_string(), Value::Integer(30))],
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(999))),
-                }),
-            })
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("age".to_string(), Value::Integer(30))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(999))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2632,11 +3099,14 @@ mod tests {
 
         // Verify row unchanged
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2658,11 +3128,14 @@ mod tests {
         cleanup("test_update_no_table");
         let mut executor = create_test_executor("test_update_no_table");
 
-        let result = executor.execute(Statement::Update {
-            table_name: "nonexistent".to_string(),
-            assignments: vec![("age".to_string(), Value::Integer(30))],
-            where_clause: None,
-        });
+        let result = executor.execute(
+            Statement::Update {
+                table_name: "nonexistent".to_string(),
+                assignments: vec![("age".to_string(), Value::Integer(30))],
+                where_clause: None,
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -2675,25 +3148,34 @@ mod tests {
         let mut executor = create_test_executor("test_update_bad_col");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![Column::new("id", DataType::Integer)],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Try to update non-existent column
-        let result = executor.execute(Statement::Update {
-            table_name: "users".to_string(),
-            assignments: vec![("nonexistent".to_string(), Value::Integer(30))],
-            where_clause: None,
-        });
+        let result = executor.execute(
+            Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("nonexistent".to_string(), Value::Integer(30))],
+                where_clause: None,
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -2706,28 +3188,37 @@ mod tests {
         let mut executor = create_test_executor("test_update_type_err");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("age", DataType::Integer),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("age", DataType::Integer),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1), Value::Integer(25)],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Integer(25)],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Try to set integer column to text
-        let result = executor.execute(Statement::Update {
-            table_name: "users".to_string(),
-            assignments: vec![("age".to_string(), Value::Text("not a number".to_string()))],
-            where_clause: None,
-        });
+        let result = executor.execute(
+            Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("age".to_string(), Value::Text("not a number".to_string()))],
+                where_clause: None,
+            },
+            &mut None,
+        );
 
         assert!(result.is_err());
 
@@ -2740,50 +3231,59 @@ mod tests {
         let mut executor = create_test_executor("test_update_complex");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("age", DataType::Integer),
-                    Column::new("active", DataType::Boolean),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("age", DataType::Integer),
+                        Column::new("active", DataType::Boolean),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         let test_data = vec![(1, 25, true), (2, 30, true), (3, 35, false), (4, 28, true)];
 
         for (id, age, active) in test_data {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![
-                        Value::Integer(id),
-                        Value::Integer(age),
-                        Value::Boolean(active),
-                    ],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![
+                            Value::Integer(id),
+                            Value::Integer(age),
+                            Value::Boolean(active),
+                        ],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Update WHERE age > 27 AND active = true
         let result = executor
-            .execute(Statement::Update {
-                table_name: "users".to_string(),
-                assignments: vec![("active".to_string(), Value::Boolean(false))],
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("age".to_string())),
-                        op: BinaryOperator::GreaterThan,
-                        right: Box::new(Expr::Literal(Value::Integer(27))),
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("active".to_string(), Value::Boolean(false))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("age".to_string())),
+                            op: BinaryOperator::GreaterThan,
+                            right: Box::new(Expr::Literal(Value::Integer(27))),
+                        }),
+                        op: BinaryOperator::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("active".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Boolean(true))),
+                        }),
                     }),
-                    op: BinaryOperator::And,
-                    right: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("active".to_string())),
-                        op: BinaryOperator::Equals,
-                        right: Box::new(Expr::Literal(Value::Boolean(true))),
-                    }),
-                }),
-            })
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2805,35 +3305,44 @@ mod tests {
             let mut executor = create_test_executor("test_update_persist");
 
             executor
-                .execute(Statement::CreateTable {
-                    name: "users".to_string(),
-                    columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("age", DataType::Integer),
-                    ],
-                })
+                .execute(
+                    Statement::CreateTable {
+                        name: "users".to_string(),
+                        columns: vec![
+                            Column::new("id", DataType::Integer),
+                            Column::new("age", DataType::Integer),
+                        ],
+                    },
+                    &mut None,
+                )
                 .unwrap();
 
             for i in 1..=3 {
                 executor
-                    .execute(Statement::Insert {
-                        table_name: "users".to_string(),
-                        values: vec![Value::Integer(i), Value::Integer(20 + i)],
-                    })
+                    .execute(
+                        Statement::Insert {
+                            table_name: "users".to_string(),
+                            values: vec![Value::Integer(i), Value::Integer(20 + i)],
+                        },
+                        &mut None,
+                    )
                     .unwrap();
             }
 
             // Update id = 2
             executor
-                .execute(Statement::Update {
-                    table_name: "users".to_string(),
-                    assignments: vec![("age".to_string(), Value::Integer(99))],
-                    where_clause: Some(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::Equals,
-                        right: Box::new(Expr::Literal(Value::Integer(2))),
-                    }),
-                })
+                .execute(
+                    Statement::Update {
+                        table_name: "users".to_string(),
+                        assignments: vec![("age".to_string(), Value::Integer(99))],
+                        where_clause: Some(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Integer(2))),
+                        }),
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
@@ -2842,15 +3351,18 @@ mod tests {
             let mut executor = create_test_executor("test_update_persist");
 
             let result = executor
-                .execute(Statement::Select {
-                    table_name: "users".to_string(),
-                    columns: SelectColumns::All,
-                    where_clause: Some(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::Equals,
-                        right: Box::new(Expr::Literal(Value::Integer(2))),
-                    }),
-                })
+                .execute(
+                    Statement::Select {
+                        table_name: "users".to_string(),
+                        columns: SelectColumns::All,
+                        where_clause: Some(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Integer(2))),
+                        }),
+                    },
+                    &mut None,
+                )
                 .unwrap();
 
             match result {
@@ -2874,33 +3386,42 @@ mod tests {
         let mut executor = create_test_executor("test_update_text");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("name", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         executor
-            .execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
-            })
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Update text column
         let result = executor
-            .execute(Statement::Update {
-                table_name: "users".to_string(),
-                assignments: vec![("name".to_string(), Value::Text("Alicia".to_string()))],
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(Expr::Literal(Value::Integer(1))),
-                }),
-            })
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("name".to_string(), Value::Text("Alicia".to_string()))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2912,11 +3433,14 @@ mod tests {
 
         // Verify text updated
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -2939,36 +3463,45 @@ mod tests {
         let mut executor = create_test_executor("test_multi_insert");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("data", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("data", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert 100 rows with large text (~90 bytes per row)
         // This should span multiple pages (4KB page / 90 bytes ≈ 45 rows per page)
         for i in 0..100 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![
-                        Value::Integer(i),
-                        Value::Text("x".repeat(80)), // 80 character string
-                    ],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![
+                            Value::Integer(i),
+                            Value::Text("x".repeat(80)), // 80 character string
+                        ],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Verify all rows are readable
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -3005,22 +3538,28 @@ mod tests {
         let mut executor = create_test_executor("test_page_chain");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("data", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("data", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert enough data for multiple pages
         for i in 0..100 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
@@ -3070,32 +3609,41 @@ mod tests {
         let mut executor = create_test_executor("test_select_multi");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("data", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("data", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert 150 rows
         for i in 0..150 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i), Value::Text("test".to_string())],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text("test".to_string())],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Test: SELECT * returns all rows
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -3107,23 +3655,26 @@ mod tests {
 
         // Test: SELECT with WHERE spanning pages
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::GreaterThan,
-                        right: Box::new(Expr::Literal(Value::Integer(50))),
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::GreaterThan,
+                            right: Box::new(Expr::Literal(Value::Integer(50))),
+                        }),
+                        op: BinaryOperator::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::LessThan,
+                            right: Box::new(Expr::Literal(Value::Integer(100))),
+                        }),
                     }),
-                    op: BinaryOperator::And,
-                    right: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::LessThan,
-                        right: Box::new(Expr::Literal(Value::Integer(100))),
-                    }),
-                }),
-            })
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -3152,52 +3703,64 @@ mod tests {
         let mut executor = create_test_executor("test_delete_multi");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("data", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("data", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert 150 rows
         for i in 0..150 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Delete rows from middle: WHERE id >= 50 AND id < 100
         executor
-            .execute(Statement::Delete {
-                table_name: "users".to_string(),
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::GreaterOrEqual,
-                        right: Box::new(Expr::Literal(Value::Integer(50))),
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::GreaterOrEqual,
+                            right: Box::new(Expr::Literal(Value::Integer(50))),
+                        }),
+                        op: BinaryOperator::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::LessThan,
+                            right: Box::new(Expr::Literal(Value::Integer(100))),
+                        }),
                     }),
-                    op: BinaryOperator::And,
-                    right: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::LessThan,
-                        right: Box::new(Expr::Literal(Value::Integer(100))),
-                    }),
-                }),
-            })
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Verify correct rows remain: 0-49 and 100-149 = 100 rows
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -3226,45 +3789,57 @@ mod tests {
         let mut executor = create_test_executor("test_update_multi");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("data", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("data", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert 100 rows
         for i in 0..100 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i), Value::Text("original".to_string())],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text("original".to_string())],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Update subset: SET data = 'UPDATED' WHERE id < 30
         executor
-            .execute(Statement::Update {
-                table_name: "users".to_string(),
-                assignments: vec![("data".to_string(), Value::Text("UPDATED".to_string()))],
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::LessThan,
-                    right: Box::new(Expr::Literal(Value::Integer(30))),
-                }),
-            })
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("data".to_string(), Value::Text("UPDATED".to_string()))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::LessThan,
+                        right: Box::new(Expr::Literal(Value::Integer(30))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Verify only first 30 rows are updated
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -3299,21 +3874,27 @@ mod tests {
             let mut executor = create_test_executor("test_multi_persist");
 
             executor
-                .execute(Statement::CreateTable {
-                    name: "users".to_string(),
-                    columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("data", DataType::Text),
-                    ],
-                })
+                .execute(
+                    Statement::CreateTable {
+                        name: "users".to_string(),
+                        columns: vec![
+                            Column::new("id", DataType::Integer),
+                            Column::new("data", DataType::Text),
+                        ],
+                    },
+                    &mut None,
+                )
                 .unwrap();
 
             for i in 0..100 {
                 executor
-                    .execute(Statement::Insert {
-                        table_name: "users".to_string(),
-                        values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
-                    })
+                    .execute(
+                        Statement::Insert {
+                            table_name: "users".to_string(),
+                            values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                        },
+                        &mut None,
+                    )
                     .unwrap();
             }
         } // Drop executor, close database
@@ -3323,11 +3904,14 @@ mod tests {
             let mut executor = create_test_executor("test_multi_persist");
 
             let result = executor
-                .execute(Statement::Select {
-                    table_name: "users".to_string(),
-                    columns: SelectColumns::All,
-                    where_clause: None,
-                })
+                .execute(
+                    Statement::Select {
+                        table_name: "users".to_string(),
+                        columns: SelectColumns::All,
+                        where_clause: None,
+                    },
+                    &mut None,
+                )
                 .unwrap();
 
             match result {
@@ -3358,53 +3942,68 @@ mod tests {
 
         // Create table1
         executor
-            .execute(Statement::CreateTable {
-                name: "table1".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("data", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "table1".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("data", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Create table2
         executor
-            .execute(Statement::CreateTable {
-                name: "table2".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("info", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "table2".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("info", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert 80 rows into table1
         for i in 0..80 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "table1".to_string(),
-                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "table1".to_string(),
+                        values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Insert 120 rows into table2
         for i in 0..120 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "table2".to_string(),
-                    values: vec![Value::Integer(i), Value::Text("y".repeat(80))],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "table2".to_string(),
+                        values: vec![Value::Integer(i), Value::Text("y".repeat(80))],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Verify table1
         let result = executor
-            .execute(Statement::Select {
-                table_name: "table1".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "table1".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -3416,11 +4015,14 @@ mod tests {
 
         // Verify table2
         let result = executor
-            .execute(Statement::Select {
-                table_name: "table2".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "table2".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -3439,40 +4041,52 @@ mod tests {
         let mut executor = create_test_executor("test_delete_all_mp");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("data", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("data", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert 100 rows (multi-page)
         for i in 0..100 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
         // Delete all (no WHERE clause)
         executor
-            .execute(Statement::Delete {
-                table_name: "users".to_string(),
-                where_clause: None,
-            })
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Verify table is empty
         let result = executor
-            .execute(Statement::Select {
-                table_name: "users".to_string(),
-                columns: SelectColumns::All,
-                where_clause: None,
-            })
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
             .unwrap();
 
         match result {
@@ -3491,22 +4105,28 @@ mod tests {
         let mut executor = create_test_executor("test_compact_specific");
 
         executor
-            .execute(Statement::CreateTable {
-                name: "users".to_string(),
-                columns: vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("data", DataType::Text),
-                ],
-            })
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer),
+                        Column::new("data", DataType::Text),
+                    ],
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Insert 100 rows
         for i in 0..100 {
             executor
-                .execute(Statement::Insert {
-                    table_name: "users".to_string(),
-                    values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
-                })
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
+                    },
+                    &mut None,
+                )
                 .unwrap();
         }
 
@@ -3516,14 +4136,17 @@ mod tests {
 
         // Delete 90% of rows
         executor
-            .execute(Statement::Delete {
-                table_name: "users".to_string(),
-                where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column("id".to_string())),
-                    op: BinaryOperator::GreaterThan,
-                    right: Box::new(Expr::Literal(Value::Integer(9))),
-                }),
-            })
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::GreaterThan,
+                        right: Box::new(Expr::Literal(Value::Integer(9))),
+                    }),
+                },
+                &mut None,
+            )
             .unwrap();
 
         // Get new page chain

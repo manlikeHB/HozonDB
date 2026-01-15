@@ -1,3 +1,4 @@
+use crate::benchmark::BenchmarkRunner;
 use crate::catalog::{row::Value, table::TableCatalog};
 use crate::sql::{
     executor::{ExecutionResult, Executor},
@@ -68,6 +69,7 @@ impl Repl {
         match command {
             ".help" => self.cmd_help(),
             ".open" => self.cmd_open(&parts),
+            ".benchmark" => self.cmd_benchmark(&parts),
             _ => {
                 eprintln!("Unknown command: '{}'. Type '.help' for usage.", command);
                 Ok(())
@@ -87,7 +89,7 @@ impl Repl {
 
         let tokens = tokenizer::tokenize(sql)?;
         let statement = Parser::new(tokens).parse()?;
-        let res = executor.execute(statement)?;
+        let res = executor.execute(statement, &mut None)?;
 
         match res {
             ExecutionResult::Success { message } => {
@@ -119,6 +121,7 @@ impl Repl {
         println!("Available commands:");
         println!("  .help              - Show this help message");
         println!("  .open <file>       - Open or create a database file");
+        println!("  .benchmark [rows]  - Run performance benchmarks (default: 10000 rows)");
         println!("  .exit              - Exit the program");
         Ok(())
     }
@@ -140,6 +143,147 @@ impl Repl {
         println!("Opened database file: {}", filename);
         Ok(())
     }
+
+    fn cmd_benchmark(&mut self, parts: &[&str]) -> io::Result<()> {
+        // Check if database is open
+        let executor = match self.executor.as_mut() {
+            Some(exec) => exec,
+            None => {
+                eprintln!("No database is open. Use '.open <file>' first.");
+                return Ok(());
+            }
+        };
+
+        // Parse number of rows (default 10,000)
+        let num_rows = if parts.len() > 1 {
+            match parts[1].parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    eprintln!("Invalid row count. Usage: .benchmark [rows]");
+                    return Ok(());
+                }
+            }
+        } else {
+            10_000
+        };
+
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║              HozonDB Benchmark Starting...                   ║");
+        println!("╚══════════════════════════════════════════════════════════════╝\n");
+        println!("Configuration:");
+        println!("  Rows: {}", num_rows);
+        println!();
+
+        // Create benchmark runner
+        let mut runner = BenchmarkRunner::new(executor, num_rows);
+
+        // Setup test data
+        println!("Setting up test data...");
+        if let Err(e) = runner.setup() {
+            eprintln!("Benchmark setup failed: {}", e);
+            return Ok(());
+        }
+
+        // Run benchmarks
+        println!("Running benchmarks...");
+        let results = match runner.run_all_benchmarks() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Benchmark failed: {}", e);
+                runner.cleanup().ok(); // Try to cleanup
+                return Ok(());
+            }
+        };
+
+        // Cleanup
+        println!("Cleaning up...\n");
+        runner.cleanup()?;
+
+        println!("BENCHMARK RESULTS\n");
+
+        // Split results into read and write operations
+        let (read_ops, write_ops): (Vec<_>, Vec<_>) = results
+            .iter()
+            .partition(|r| r.operation.starts_with("SELECT"));
+
+        // Display READ operations table
+        if !read_ops.is_empty() {
+            print_read_table(&read_ops);
+        }
+
+        // Display WRITE operations table
+        if !write_ops.is_empty() {
+            print_write_table(&write_ops);
+        }
+
+        println!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        );
+
+        Ok(())
+    }
+}
+
+fn print_read_table(results: &[&crate::benchmark::BenchmarkResult]) {
+    println!("\n━━━ READ OPERATIONS ━━━");
+
+    // Header
+    println!(
+        "┌───────────────────────────┬────────────┬────────────┬──────────────┬──────────────┐"
+    );
+    println!(
+        "│ Query                     │ Duration   │ Pages      │ Rows         │ Rows         │"
+    );
+    println!(
+        "│                           │ (ms)       │ Read       │ Scanned      │ Returned     │"
+    );
+    println!(
+        "├───────────────────────────┼────────────┼────────────┼──────────────┼──────────────┤"
+    );
+
+    // Data rows
+    for result in results {
+        println!(
+            "│ {:<25} │ {:>10.2} │ {:>10} │ {:>12} │ {:>12} │",
+            result.operation,
+            result.metrics.duration_ms,
+            result.metrics.pages_read,
+            result.metrics.rows_scanned,
+            result.rows_affected
+        );
+    }
+
+    // Footer
+    println!(
+        "└───────────────────────────┴────────────┴────────────┴──────────────┴──────────────┘\n"
+    );
+}
+
+fn print_write_table(results: &[&crate::benchmark::BenchmarkResult]) {
+    println!("\n━━━ WRITE OPERATIONS ━━━");
+
+    // Header
+    println!("┌───────────────────────────┬────────────┬────────────┬────────────┬──────────────┐");
+    println!("│ Operation                 │ Duration   │ Pages      │ Pages      │ Rows         │");
+    println!("│                           │ (ms)       │ Read       │ Written    │ Modified     │");
+    println!("├───────────────────────────┼────────────┼────────────┼────────────┼──────────────┤");
+
+    // Data rows
+    for result in results {
+        println!(
+            "│ {:<25} │ {:>10.2} │ {:>10} │ {:>10} │ {:>12} │",
+            result.operation,
+            result.metrics.duration_ms,
+            result.metrics.pages_read,
+            result.metrics.pages_written,
+            result.rows_affected
+        );
+    }
+
+    // Footer
+    println!(
+        "└───────────────────────────┴────────────┴────────────┴────────────┴──────────────┘\n"
+    );
 }
 
 #[cfg(test)]
