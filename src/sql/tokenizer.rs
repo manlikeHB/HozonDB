@@ -15,6 +15,8 @@ pub enum Token {
     Delete,
     Update,
     Set,
+    Primary,
+    Key,
 
     // Data types
     Integer,
@@ -191,6 +193,8 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                     "DELETE" => Token::Delete,
                     "UPDATE" => Token::Update,
                     "SET" => Token::Set,
+                    "PRIMARY" => Token::Primary,
+                    "KEY" => Token::Key,
                     _ => Token::Identifier(word),
                 };
 
@@ -350,5 +354,23 @@ mod tests {
         assert_eq!(tokens[7], Token::Identifier("id".to_string()));
         assert_eq!(tokens[8], Token::Equals);
         assert_eq!(tokens[9], Token::NumberLiteral(1));
+    }
+
+    #[test]
+    fn test_tokenize_create_table_with_primary_key() {
+        let sql = "CREATE TABLE users (id INTEGER PRIMARY KEY);";
+        let tokens = tokenize(sql).unwrap();
+
+        assert_eq!(tokens[0], Token::Create);
+        assert_eq!(tokens[1], Token::Table);
+        assert_eq!(tokens[2], Token::Identifier("users".to_string()));
+        assert_eq!(tokens[3], Token::LeftParen);
+        assert_eq!(tokens[4], Token::Identifier("id".to_string()));
+        assert_eq!(tokens[5], Token::Integer);
+        assert_eq!(tokens[6], Token::Primary);
+        assert_eq!(tokens[7], Token::Key);
+        assert_eq!(tokens[8], Token::RightParen);
+        assert_eq!(tokens[9], Token::Semicolon);
+        assert_eq!(tokens[10], Token::Eof);
     }
 }
