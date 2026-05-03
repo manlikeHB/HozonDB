@@ -39,9 +39,9 @@ impl<'a> BenchmarkRunner<'a> {
     pub fn setup(&mut self) -> io::Result<()> {
         // Create table with schema: (id INTEGER, name TEXT, age INTEGER)
         let columns = vec![
-            Column::new("id", DataType::Integer),
-            Column::new("name", DataType::Text),
-            Column::new("age", DataType::Integer),
+            Column::new("id", DataType::Integer, true),
+            Column::new("name", DataType::Text, false),
+            Column::new("age", DataType::Integer, false),
         ];
         let create_stm = Statement::CreateTable {
             name: self.temp_table_name.clone(),

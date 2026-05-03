@@ -225,10 +225,11 @@ mod tests {
         let schema = Schema::new(
             "users",
             vec![
-                Column::new("id", DataType::Integer),
-                Column::new("name", DataType::Text),
+                Column::new("id", DataType::Integer, true),
+                Column::new("name", DataType::Text, false),
             ],
-        );
+        )
+        .unwrap();
 
         catalog.create_table(schema).unwrap();
 
@@ -246,17 +247,19 @@ mod tests {
         let mut catalog = TableCatalog::new(pm).unwrap();
 
         // Create first table
-        let users_schema = Schema::new("users", vec![Column::new("id", DataType::Integer)]);
+        let users_schema =
+            Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap();
         catalog.create_table(users_schema).unwrap();
 
         // Create second table
         let orders_schema = Schema::new(
             "orders",
             vec![
-                Column::new("id", DataType::Integer),
-                Column::new("total", DataType::Integer),
+                Column::new("id", DataType::Integer, true),
+                Column::new("total", DataType::Integer, false),
             ],
-        );
+        )
+        .unwrap();
         catalog.create_table(orders_schema).unwrap();
 
         assert_eq!(catalog.tables.len(), 2);
@@ -278,10 +281,11 @@ mod tests {
             let schema = Schema::new(
                 "users",
                 vec![
-                    Column::new("id", DataType::Integer),
-                    Column::new("name", DataType::Text),
+                    Column::new("id", DataType::Integer, true),
+                    Column::new("name", DataType::Text, false),
                 ],
-            );
+            )
+            .unwrap();
 
             catalog.create_table(schema).unwrap();
             assert_eq!(catalog.tables.len(), 1);
@@ -313,30 +317,35 @@ mod tests {
             let mut catalog = TableCatalog::new(pm).unwrap();
 
             catalog
-                .create_table(Schema::new(
-                    "users",
-                    vec![Column::new("id", DataType::Integer)],
-                ))
+                .create_table(
+                    Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
+                )
                 .unwrap();
 
             catalog
-                .create_table(Schema::new(
-                    "orders",
-                    vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("user_id", DataType::Integer),
-                    ],
-                ))
+                .create_table(
+                    Schema::new(
+                        "orders",
+                        vec![
+                            Column::new("id", DataType::Integer, true),
+                            Column::new("user_id", DataType::Integer, false),
+                        ],
+                    )
+                    .unwrap(),
+                )
                 .unwrap();
 
             catalog
-                .create_table(Schema::new(
-                    "products",
-                    vec![
-                        Column::new("name", DataType::Text),
-                        Column::new("price", DataType::Integer),
-                    ],
-                ))
+                .create_table(
+                    Schema::new(
+                        "products",
+                        vec![
+                            Column::new("name", DataType::Text, false),
+                            Column::new("price", DataType::Integer, false),
+                        ],
+                    )
+                    .unwrap(),
+                )
                 .unwrap();
         }
 
@@ -375,10 +384,9 @@ mod tests {
 
         // Create first table
         catalog
-            .create_table(Schema::new(
-                "users",
-                vec![Column::new("id", DataType::Integer)],
-            ))
+            .create_table(
+                Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
+            )
             .unwrap();
 
         let users_page = catalog.get_table("users").unwrap().first_page;
@@ -386,10 +394,9 @@ mod tests {
 
         // Create second table
         catalog
-            .create_table(Schema::new(
-                "orders",
-                vec![Column::new("id", DataType::Integer)],
-            ))
+            .create_table(
+                Schema::new("orders", vec![Column::new("id", DataType::Integer, false)]).unwrap(),
+            )
             .unwrap();
 
         let orders_page = catalog.get_table("orders").unwrap().first_page;
@@ -408,12 +415,13 @@ mod tests {
         let schema = Schema::new(
             "test_table",
             vec![
-                Column::new("int_col", DataType::Integer),
-                Column::new("text_col", DataType::Text),
-                Column::new("bool_col", DataType::Boolean),
-                Column::new("null_col", DataType::Null),
+                Column::new("int_col", DataType::Integer, false),
+                Column::new("text_col", DataType::Text, false),
+                Column::new("bool_col", DataType::Boolean, false),
+                Column::new("null_col", DataType::Null, false),
             ],
-        );
+        )
+        .unwrap();
 
         catalog.create_table(schema).unwrap();
 
@@ -435,7 +443,7 @@ mod tests {
         let pm = PageManager::new("test_empty_name.hdb").unwrap();
         let mut catalog = TableCatalog::new(pm).unwrap();
 
-        let schema = Schema::new("", vec![Column::new("id", DataType::Integer)]);
+        let schema = Schema::new("", vec![Column::new("id", DataType::Integer, true)]).unwrap();
 
         // Should still work (validation not implemented yet)
         catalog.create_table(schema).unwrap();
@@ -452,7 +460,11 @@ mod tests {
         let mut catalog = TableCatalog::new(pm).unwrap();
 
         let long_name = "a".repeat(1000);
-        let schema = Schema::new(&long_name, vec![Column::new("id", DataType::Integer)]);
+        let schema = Schema::new(
+            &long_name,
+            vec![Column::new("id", DataType::Integer, false)],
+        )
+        .unwrap();
 
         catalog.create_table(schema).unwrap();
 
@@ -473,7 +485,8 @@ mod tests {
         let pm = PageManager::new("test_get.hdb").unwrap();
         let mut catalog = TableCatalog::new(pm).unwrap();
 
-        let schema = Schema::new("users", vec![Column::new("id", DataType::Integer)]);
+        let schema =
+            Schema::new("users", vec![Column::new("id", DataType::Integer, false)]).unwrap();
         catalog.create_table(schema).unwrap();
 
         let result = catalog.get_table("users");
@@ -502,10 +515,14 @@ mod tests {
         let pm = PageManager::new("test_list.hdb").unwrap();
         let mut catalog = TableCatalog::new(pm).unwrap();
 
-        catalog.create_table(Schema::new("users", vec![])).unwrap();
-        catalog.create_table(Schema::new("orders", vec![])).unwrap();
         catalog
-            .create_table(Schema::new("products", vec![]))
+            .create_table(Schema::new("users", vec![]).unwrap())
+            .unwrap();
+        catalog
+            .create_table(Schema::new("orders", vec![]).unwrap())
+            .unwrap();
+        catalog
+            .create_table(Schema::new("products", vec![]).unwrap())
             .unwrap();
 
         let tables = catalog.list_tables();
@@ -524,8 +541,12 @@ mod tests {
         let pm = PageManager::new("test_drop.hdb").unwrap();
         let mut catalog = TableCatalog::new(pm).unwrap();
 
-        catalog.create_table(Schema::new("users", vec![])).unwrap();
-        catalog.create_table(Schema::new("orders", vec![])).unwrap();
+        catalog
+            .create_table(Schema::new("users", vec![]).unwrap())
+            .unwrap();
+        catalog
+            .create_table(Schema::new("orders", vec![]).unwrap())
+            .unwrap();
 
         assert_eq!(catalog.tables.len(), 2);
 
@@ -546,8 +567,12 @@ mod tests {
             let pm = PageManager::new("test_drop_persist.hdb").unwrap();
             let mut catalog = TableCatalog::new(pm).unwrap();
 
-            catalog.create_table(Schema::new("users", vec![])).unwrap();
-            catalog.create_table(Schema::new("orders", vec![])).unwrap();
+            catalog
+                .create_table(Schema::new("users", vec![]).unwrap())
+                .unwrap();
+            catalog
+                .create_table(Schema::new("orders", vec![]).unwrap())
+                .unwrap();
             catalog.drop_table("users").unwrap();
         }
 

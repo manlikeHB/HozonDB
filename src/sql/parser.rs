@@ -184,7 +184,18 @@ impl Parser {
                 }
             };
 
-            columns.push(Column::new(&col_name, data_type));
+            // extract is_primary_key
+            let is_primary_key = match self.peek() {
+                Some(Token::Primary) => {
+                    self.advance();
+                    self.expect(Token::Key)?;
+                    // TODO: create index
+                    true
+                }
+                _ => false,
+            };
+
+            columns.push(Column::new(&col_name, data_type, is_primary_key));
 
             match self.peek() {
                 Some(&Token::Comma) => {
@@ -1135,6 +1146,26 @@ mod tests {
                 }
             }
             _ => panic!("Expected Delete statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_table_with_primary_key() {
+        let sql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::CreateTable { name, columns } => {
+                assert_eq!(name, "users");
+                assert_eq!(columns.len(), 2);
+                assert_eq!(columns[0].name(), "id");
+                assert_eq!(columns[0].is_primary_key(), true);
+                assert_eq!(columns[1].name(), "name");
+                assert_eq!(columns[1].is_primary_key(), false);
+            }
+            _ => panic!("Expected CreateTable statement"),
         }
     }
 }

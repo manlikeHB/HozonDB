@@ -263,7 +263,7 @@ impl Executor {
         table_name: String,
         columns: Vec<Column>,
     ) -> io::Result<ExecutionResult> {
-        let schema = Schema::new(&table_name, columns);
+        let schema = Schema::new(&table_name, columns)?;
         self.catalog.create_table(schema)?;
 
         Ok(ExecutionResult::Success {
@@ -696,8 +696,8 @@ mod tests {
         let mut executor = create_test_executor("test_exec_create");
 
         let columns = vec![
-            Column::new("id", DataType::Integer),
-            Column::new("name", DataType::Text),
+            Column::new("id", DataType::Integer, true),
+            Column::new("name", DataType::Text, false),
         ];
 
         let statement = Statement::CreateTable {
@@ -726,8 +726,8 @@ mod tests {
 
         // Create table
         let columns = vec![
-            Column::new("id", DataType::Integer),
-            Column::new("name", DataType::Text),
+            Column::new("id", DataType::Integer, true),
+            Column::new("name", DataType::Text, false),
         ];
         executor
             .execute(
@@ -773,8 +773,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -830,8 +830,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -868,8 +868,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -926,9 +926,9 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
-                        Column::new("active", DataType::Boolean),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                        Column::new("active", DataType::Boolean, false),
                     ],
                 },
                 &mut None,
@@ -987,9 +987,9 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
-                        Column::new("email", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                        Column::new("email", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -1055,7 +1055,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -1095,7 +1095,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -1135,10 +1135,10 @@ mod tests {
                 Statement::CreateTable {
                     name: "test".to_string(),
                     columns: vec![
-                        Column::new("int_col", DataType::Integer),
-                        Column::new("text_col", DataType::Text),
-                        Column::new("bool_col", DataType::Boolean),
-                        Column::new("null_col", DataType::Null),
+                        Column::new("int_col", DataType::Integer, true),
+                        Column::new("text_col", DataType::Text, false),
+                        Column::new("bool_col", DataType::Boolean, false),
+                        Column::new("null_col", DataType::Null, false),
                     ],
                 },
                 &mut None,
@@ -1205,7 +1205,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -1249,8 +1249,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -1302,8 +1302,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -1370,8 +1370,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -1438,8 +1438,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("age", DataType::Integer),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("age", DataType::Integer, false),
                     ],
                 },
                 &mut None,
@@ -1493,7 +1493,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, false)],
                 },
                 &mut None,
             )
@@ -1547,8 +1547,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("age", DataType::Integer),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("age", DataType::Integer, false),
                     ],
                 },
                 &mut None,
@@ -1632,7 +1632,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -1693,7 +1693,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -1745,9 +1745,9 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
-                        Column::new("age", DataType::Integer),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                        Column::new("age", DataType::Integer, false),
                     ],
                 },
                 &mut None,
@@ -1810,8 +1810,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("name", DataType::Text),
-                        Column::new("active", DataType::Boolean),
+                        Column::new("name", DataType::Text, true),
+                        Column::new("active", DataType::Boolean, false),
                     ],
                 },
                 &mut None,
@@ -1878,7 +1878,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -1943,7 +1943,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -1983,7 +1983,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -2016,8 +2016,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -2061,7 +2061,7 @@ mod tests {
                 .execute(
                     Statement::CreateTable {
                         name: "users".to_string(),
-                        columns: vec![Column::new("id", DataType::Integer)],
+                        columns: vec![Column::new("id", DataType::Integer, true)],
                     },
                     &mut None,
                 )
@@ -2071,7 +2071,7 @@ mod tests {
                 .execute(
                     Statement::CreateTable {
                         name: "orders".to_string(),
-                        columns: vec![Column::new("id", DataType::Integer)],
+                        columns: vec![Column::new("id", DataType::Integer, false)],
                     },
                     &mut None,
                 )
@@ -2128,8 +2128,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -2227,8 +2227,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("age", DataType::Integer),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("age", DataType::Integer, false),
                     ],
                 },
                 &mut None,
@@ -2300,7 +2300,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -2367,7 +2367,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -2437,9 +2437,9 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("age", DataType::Integer),
-                        Column::new("active", DataType::Boolean),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("age", DataType::Integer, false),
+                        Column::new("active", DataType::Boolean, false),
                     ],
                 },
                 &mut None,
@@ -2550,7 +2550,7 @@ mod tests {
                 .execute(
                     Statement::CreateTable {
                         name: "users".to_string(),
-                        columns: vec![Column::new("id", DataType::Integer)],
+                        columns: vec![Column::new("id", DataType::Integer, true)],
                     },
                     &mut None,
                 )
@@ -2625,7 +2625,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, true)],
                 },
                 &mut None,
             )
@@ -2707,9 +2707,9 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
-                        Column::new("age", DataType::Integer),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                        Column::new("age", DataType::Integer, false),
                     ],
                 },
                 &mut None,
@@ -2807,9 +2807,9 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
-                        Column::new("age", DataType::Integer),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                        Column::new("age", DataType::Integer, false),
                     ],
                 },
                 &mut None,
@@ -2895,9 +2895,9 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("age", DataType::Integer),
-                        Column::new("active", DataType::Boolean),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("age", DataType::Integer, false),
+                        Column::new("active", DataType::Boolean, false),
                     ],
                 },
                 &mut None,
@@ -2979,8 +2979,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("active", DataType::Boolean),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("active", DataType::Boolean, false),
                     ],
                 },
                 &mut None,
@@ -3056,8 +3056,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("age", DataType::Integer),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("age", DataType::Integer, false),
                     ],
                 },
                 &mut None,
@@ -3151,7 +3151,7 @@ mod tests {
             .execute(
                 Statement::CreateTable {
                     name: "users".to_string(),
-                    columns: vec![Column::new("id", DataType::Integer)],
+                    columns: vec![Column::new("id", DataType::Integer, false)],
                 },
                 &mut None,
             )
@@ -3192,8 +3192,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("age", DataType::Integer),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("age", DataType::Integer, false),
                     ],
                 },
                 &mut None,
@@ -3235,9 +3235,9 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("age", DataType::Integer),
-                        Column::new("active", DataType::Boolean),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("age", DataType::Integer, false),
+                        Column::new("active", DataType::Boolean, false),
                     ],
                 },
                 &mut None,
@@ -3309,8 +3309,8 @@ mod tests {
                     Statement::CreateTable {
                         name: "users".to_string(),
                         columns: vec![
-                            Column::new("id", DataType::Integer),
-                            Column::new("age", DataType::Integer),
+                            Column::new("id", DataType::Integer, true),
+                            Column::new("age", DataType::Integer, false),
                         ],
                     },
                     &mut None,
@@ -3390,8 +3390,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("name", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -3467,8 +3467,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("data", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -3542,8 +3542,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("data", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -3613,8 +3613,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("data", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -3707,8 +3707,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("data", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -3793,8 +3793,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("data", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -3878,8 +3878,8 @@ mod tests {
                     Statement::CreateTable {
                         name: "users".to_string(),
                         columns: vec![
-                            Column::new("id", DataType::Integer),
-                            Column::new("data", DataType::Text),
+                            Column::new("id", DataType::Integer, true),
+                            Column::new("data", DataType::Text, false),
                         ],
                     },
                     &mut None,
@@ -3946,8 +3946,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "table1".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("data", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -3960,8 +3960,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "table2".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("info", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("info", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -4045,8 +4045,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("data", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
                     ],
                 },
                 &mut None,
@@ -4109,8 +4109,8 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer),
-                        Column::new("data", DataType::Text),
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
                     ],
                 },
                 &mut None,
