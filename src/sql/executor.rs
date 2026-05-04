@@ -1,5 +1,7 @@
 use crate::{
-    benchmark::metrics::QueryMetrics, sql::evaluator::evaluate_expr, storage::page::PageId,
+    benchmark::metrics::QueryMetrics,
+    sql::{database::Database, evaluator::evaluate_expr},
+    storage::page::PageId,
 };
 use std::io::{self, Error, ErrorKind};
 
@@ -7,14 +9,13 @@ use crate::{
     catalog::{
         row::{Row, Value},
         schema::{Column, DataType, Schema},
-        table::TableCatalog,
     },
     sql::parser::{Expr, SelectColumns, Statement},
     storage::page::{PAGE_DATA_START, PAGE_SIZE, PageManager, PageMetadata},
 };
 
 pub struct Executor {
-    catalog: TableCatalog,
+    database: Database,
 }
 
 #[derive(Debug)]
@@ -29,8 +30,8 @@ pub enum ExecutionResult {
 }
 
 impl Executor {
-    pub fn new(catalog: TableCatalog) -> Self {
-        Executor { catalog }
+    pub fn new(database: Database) -> Self {
+        Executor { database }
     }
 
     /// Read all rows from a page
@@ -60,7 +61,7 @@ impl Executor {
 
         loop {
             // Read page data
-            let page_data = self.catalog.read_page(cur_page)?;
+            let page_data = self.database.read_page(cur_page)?;
 
             // track page reads
             if let Some(m) = metrics.as_mut() {
@@ -162,7 +163,7 @@ impl Executor {
                 } else {
                     // else allocate new page
                     // Need another page - allocate it
-                    let new_page = self.catalog.allocate_page()?;
+                    let new_page = self.database.allocate_page()?;
                     Some(new_page)
                 }
             } else {
@@ -178,7 +179,7 @@ impl Executor {
             PageManager::update_metadata_in_buffer(&mut page_data, &metadata);
 
             // Write page to disk
-            self.catalog.write_page(current_page_id, &page_data)?;
+            self.database.write_page(current_page_id, &page_data)?;
 
             // track page write
             if let Some(m) = metrics.as_mut() {
@@ -200,7 +201,7 @@ impl Executor {
         if let Some(old_chain) = old_chain {
             for old_page in old_chain {
                 if !new_chain.contains(old_page) {
-                    self.catalog.free_page(*old_page)?;
+                    self.database.free_page(*old_page)?;
                 }
             }
         }
@@ -245,7 +246,7 @@ impl Executor {
     }
 
     fn get_table_first_page_and_cols(&self, table_name: &str) -> io::Result<(u32, &Vec<Column>)> {
-        let (first_page, columns) = match self.catalog.get_table(&table_name) {
+        let (first_page, columns) = match self.database.get_table(&table_name) {
             Some(meta) => (meta.first_page(), meta.schema().columns()),
             None => {
                 return Err(Error::new(
@@ -264,7 +265,7 @@ impl Executor {
         columns: Vec<Column>,
     ) -> io::Result<ExecutionResult> {
         let schema = Schema::new(&table_name, columns)?;
-        self.catalog.create_table(schema)?;
+        self.database.create_table(schema)?;
 
         Ok(ExecutionResult::Success {
             message: format!("Table '{}' created.", table_name),
@@ -306,14 +307,14 @@ impl Executor {
         let mut last_page = first_page;
 
         loop {
-            let page_meta = self.catalog.read_page_metadata(last_page)?;
+            let page_meta = self.database.read_page_metadata(last_page)?;
             match page_meta.next_page {
                 Some(next_page) => last_page = next_page,
                 None => break,
             }
         }
 
-        let mut last_page_data = self.catalog.read_page(last_page)?;
+        let mut last_page_data = self.database.read_page(last_page)?;
 
         // Track page read
         if let Some(m) = metrics.as_mut() {
@@ -333,7 +334,7 @@ impl Executor {
             last_page_meta.last_offset += row_bytes.len();
 
             PageManager::update_metadata_in_buffer(&mut last_page_data, &last_page_meta);
-            self.catalog.write_page(last_page, &last_page_data)?;
+            self.database.write_page(last_page, &last_page_data)?;
 
             // Track page write
             if let Some(m) = metrics.as_mut() {
@@ -341,9 +342,9 @@ impl Executor {
             }
         } else {
             // Create a new page
-            let new_page = self.catalog.allocate_page()?;
+            let new_page = self.database.allocate_page()?;
             let mut new_page_data = [0u8; PAGE_SIZE];
-            let mut new_page_meta = self.catalog.read_page_metadata(new_page)?;
+            let mut new_page_meta = self.database.read_page_metadata(new_page)?;
 
             new_page_meta.num_rows += 1;
             new_page_meta.last_offset += row_bytes.len();
@@ -352,7 +353,7 @@ impl Executor {
                 .copy_from_slice(&row_bytes);
 
             PageManager::update_metadata_in_buffer(&mut new_page_data, &new_page_meta);
-            self.catalog.write_page(new_page, &new_page_data)?;
+            self.database.write_page(new_page, &new_page_data)?;
 
             // Track new page write
             if let Some(m) = metrics.as_mut() {
@@ -361,7 +362,7 @@ impl Executor {
 
             // Update the previous page's metadata to point to the new page
             last_page_meta.next_page = Some(new_page);
-            self.catalog
+            self.database
                 .update_page_metadata(last_page, &last_page_meta)?;
 
             if let Some(m) = metrics.as_mut() {
@@ -473,10 +474,10 @@ impl Executor {
 
         let page_chain = self.collect_page_chain(first_page)?;
 
-        self.catalog.drop_table(&table_name)?;
+        self.database.drop_table(&table_name)?;
 
         for page in page_chain {
-            self.catalog.free_page(page)?;
+            self.database.free_page(page)?;
         }
 
         Ok(ExecutionResult::Success {
@@ -651,7 +652,7 @@ impl Executor {
 
         while let Some(page_id) = current {
             chain.push(page_id);
-            let metadata = self.catalog.read_page_metadata(page_id)?;
+            let metadata = self.database.read_page_metadata(page_id)?;
             current = metadata.next_page;
         }
 
@@ -685,8 +686,8 @@ mod tests {
 
     fn create_test_executor(db_name: &str) -> Executor {
         let pm = PageManager::new(&format!("{}.hdb", db_name)).unwrap();
-        let catalog = TableCatalog::new(pm).unwrap();
-        Executor::new(catalog)
+        let db = Database::new(pm).unwrap();
+        Executor::new(db)
     }
 
     #[test]
@@ -1212,10 +1213,10 @@ mod tests {
             .unwrap();
 
         // Get table's first page
-        let first_page = executor.catalog.get_table("users").unwrap().first_page();
+        let first_page = executor.database.get_table("users").unwrap().first_page();
 
         // Check initial metadata
-        let metadata = executor.catalog.read_page_metadata(first_page).unwrap();
+        let metadata = executor.database.read_page_metadata(first_page).unwrap();
         assert_eq!(metadata.num_rows, 0);
         assert_eq!(metadata.last_offset, PAGE_DATA_START);
 
@@ -1231,7 +1232,7 @@ mod tests {
             .unwrap();
 
         // Check metadata updated
-        let metadata = executor.catalog.read_page_metadata(first_page).unwrap();
+        let metadata = executor.database.read_page_metadata(first_page).unwrap();
         assert_eq!(metadata.num_rows, 1);
         assert!(metadata.last_offset > PAGE_DATA_START);
 
@@ -3564,7 +3565,7 @@ mod tests {
         }
 
         // Manually verify page chain
-        let first_page = executor.catalog.get_table("users").unwrap().first_page();
+        let first_page = executor.database.get_table("users").unwrap().first_page();
 
         let mut current_page = first_page;
         let mut page_count = 0;
@@ -3576,7 +3577,7 @@ mod tests {
 
             page_count += 1;
 
-            let page_data = executor.catalog.read_page(current_page).unwrap();
+            let page_data = executor.database.read_page(current_page).unwrap();
             let page_meta = PageManager::read_metadata_from_buffer(&page_data);
 
             // Each page should have rows
@@ -4131,7 +4132,7 @@ mod tests {
         }
 
         // Get old page chain before delete
-        let first_page = executor.catalog.get_table("users").unwrap().first_page();
+        let first_page = executor.database.get_table("users").unwrap().first_page();
         let old_chain = executor.collect_page_chain(first_page).unwrap();
 
         // Delete 90% of rows

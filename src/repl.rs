@@ -1,5 +1,6 @@
 use crate::benchmark::BenchmarkRunner;
-use crate::catalog::{row::Value, table::TableCatalog};
+use crate::catalog::row::Value;
+use crate::sql::database::Database;
 use crate::sql::{
     executor::{ExecutionResult, Executor},
     parser::Parser,
@@ -136,8 +137,8 @@ impl Repl {
 
         // create new executor
         let pm = PageManager::new(filename)?;
-        let catalog = TableCatalog::new(pm)?;
-        let executor = Executor::new(catalog);
+        let db = Database::new(pm)?;
+        let executor = Executor::new(db);
         self.executor = Some(executor);
 
         println!("Opened database file: {}", filename);
@@ -667,6 +668,9 @@ mod tests {
 
         // Test various special characters in strings
         let result = repl.execute_command("INSERT INTO users VALUES ('Hello, World!');");
+        if let Err(e) = &result {
+            eprintln!("{}", e);
+        }
         assert!(result.is_ok());
 
         cleanup("test_repl_special");

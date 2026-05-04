@@ -1,6 +1,6 @@
 use crate::catalog::schema::Schema;
 use crate::constants;
-use crate::storage::page::{PageId, PageManager, PageMetadata};
+use crate::storage::page::PageManager;
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 pub struct TableMetadata {
@@ -20,11 +20,10 @@ impl TableMetadata {
 
 pub struct TableCatalog {
     tables: HashMap<String, TableMetadata>,
-    page_manager: PageManager,
 }
 
 impl TableCatalog {
-    pub fn new(mut page_manager: PageManager) -> io::Result<Self> {
+    pub fn new(page_manager: &mut PageManager) -> io::Result<Self> {
         // If this is a new database (only page 0 exists), allocate page 1 for catalog
         if page_manager.num_pages() == 1 {
             page_manager.allocate_page()?;
@@ -37,7 +36,6 @@ impl TableCatalog {
             // empty catalog - new db
             return Ok(TableCatalog {
                 tables: HashMap::new(),
-                page_manager,
             });
         }
 
@@ -89,15 +87,16 @@ impl TableCatalog {
             );
         }
 
-        Ok(TableCatalog {
-            tables,
-            page_manager,
-        })
+        Ok(TableCatalog { tables })
     }
 
-    pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
+    pub fn create_table(
+        &mut self,
+        schema: Schema,
+        page_manager: &mut PageManager,
+    ) -> io::Result<()> {
         // allocate first page for table data
-        let first_page = self.page_manager.allocate_page()?;
+        let first_page = page_manager.allocate_page()?;
 
         let table_name = schema.table_name().to_string();
         let table_metadata = TableMetadata { schema, first_page };
@@ -105,19 +104,18 @@ impl TableCatalog {
         self.tables.insert(table_name, table_metadata);
 
         // save catalog
-        self.save()?;
+        self.save(page_manager)?;
 
         Ok(())
     }
 
-    pub fn save(&mut self) -> io::Result<()> {
+    pub fn save(&mut self, page_manager: &mut PageManager) -> io::Result<()> {
         let bytes = self.to_bytes();
-        self.page_manager
-            .write_page(constants::TABLE_CATALOG_PAGE_ID, &bytes)?;
+        page_manager.write_page(constants::TABLE_CATALOG_PAGE_ID, &bytes)?;
         Ok(())
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
         // number of tables
@@ -142,10 +140,10 @@ impl TableCatalog {
         self.tables.keys().cloned().collect()
     }
 
-    pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
+    pub fn drop_table(&mut self, name: &str, page_manager: &mut PageManager) -> io::Result<()> {
         match self.tables.remove(name) {
             Some(_) => {
-                self.save()?;
+                self.save(page_manager)?;
                 return Ok(());
             }
             None => {
@@ -155,42 +153,6 @@ impl TableCatalog {
                 ));
             }
         }
-    }
-
-    pub fn read_page(&self, page_id: u32) -> io::Result<[u8; 4096]> {
-        self.page_manager.read_page(page_id)
-    }
-
-    pub fn write_page(&mut self, page_id: u32, data: &[u8]) -> io::Result<()> {
-        self.page_manager.write_page(page_id, data)
-    }
-
-    pub fn read_page_metadata(&self, page_id: u32) -> io::Result<PageMetadata> {
-        self.page_manager.read_page_metadata(page_id)
-    }
-
-    pub fn update_page_metadata(
-        &mut self,
-        page_id: u32,
-        metadata: &PageMetadata,
-    ) -> io::Result<()> {
-        self.page_manager.update_page_metadata(page_id, metadata)
-    }
-
-    pub fn number_of_pages(&self) -> u32 {
-        self.page_manager.num_pages()
-    }
-
-    pub fn allocate_page(&mut self) -> io::Result<PageId> {
-        self.page_manager.allocate_page()
-    }
-
-    pub fn free_page(&mut self, page_id: PageId) -> io::Result<()> {
-        self.page_manager.free_page(page_id)
-    }
-
-    pub fn get_first_free_page(&self) -> Option<PageId> {
-        self.page_manager.first_free_page()
     }
 }
 
@@ -209,8 +171,8 @@ mod tests {
     fn test_new_catalog_empty() {
         cleanup("test_new_catalog");
 
-        let pm = PageManager::new("test_new_catalog.hdb").unwrap();
-        let catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_new_catalog.hdb").unwrap();
+        let catalog = TableCatalog::new(&mut pm).unwrap();
 
         assert_eq!(catalog.tables.len(), 0);
 
@@ -221,8 +183,8 @@ mod tests {
     fn test_create_single_table() {
         cleanup("test_single");
 
-        let pm = PageManager::new("test_single.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_single.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
         let schema = Schema::new(
             "users",
@@ -233,7 +195,7 @@ mod tests {
         )
         .unwrap();
 
-        catalog.create_table(schema).unwrap();
+        catalog.create_table(schema, &mut pm).unwrap();
 
         assert_eq!(catalog.tables.len(), 1);
         assert!(catalog.tables.contains_key("users"));
@@ -245,13 +207,13 @@ mod tests {
     fn test_create_multiple_tables() {
         cleanup("test_multiple");
 
-        let pm = PageManager::new("test_multiple.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_multiple.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
         // Create first table
         let users_schema =
             Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap();
-        catalog.create_table(users_schema).unwrap();
+        catalog.create_table(users_schema, &mut pm).unwrap();
 
         // Create second table
         let orders_schema = Schema::new(
@@ -262,7 +224,7 @@ mod tests {
             ],
         )
         .unwrap();
-        catalog.create_table(orders_schema).unwrap();
+        catalog.create_table(orders_schema, &mut pm).unwrap();
 
         assert_eq!(catalog.tables.len(), 2);
         assert!(catalog.tables.contains_key("users"));
@@ -277,8 +239,8 @@ mod tests {
 
         // Create catalog and add table
         {
-            let pm = PageManager::new("test_persist.hdb").unwrap();
-            let mut catalog = TableCatalog::new(pm).unwrap();
+            let mut pm = PageManager::new("test_persist.hdb").unwrap();
+            let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
             let schema = Schema::new(
                 "users",
@@ -289,14 +251,14 @@ mod tests {
             )
             .unwrap();
 
-            catalog.create_table(schema).unwrap();
+            catalog.create_table(schema, &mut pm).unwrap();
             assert_eq!(catalog.tables.len(), 1);
         } // catalog dropped, file closed
 
         // Re-open and verify table still exists
         {
-            let pm = PageManager::new("test_persist.hdb").unwrap();
-            let catalog = TableCatalog::new(pm).unwrap();
+            let mut pm = PageManager::new("test_persist.hdb").unwrap();
+            let catalog = TableCatalog::new(&mut pm).unwrap();
 
             assert_eq!(catalog.tables.len(), 1);
             assert!(catalog.tables.contains_key("users"));
@@ -315,12 +277,13 @@ mod tests {
 
         // Create and save multiple tables
         {
-            let pm = PageManager::new("test_multi_persist.hdb").unwrap();
-            let mut catalog = TableCatalog::new(pm).unwrap();
+            let mut pm = PageManager::new("test_multi_persist.hdb").unwrap();
+            let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
             catalog
                 .create_table(
                     Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
+                    &mut pm,
                 )
                 .unwrap();
 
@@ -334,6 +297,7 @@ mod tests {
                         ],
                     )
                     .unwrap(),
+                    &mut pm,
                 )
                 .unwrap();
 
@@ -347,14 +311,15 @@ mod tests {
                         ],
                     )
                     .unwrap(),
+                    &mut pm,
                 )
                 .unwrap();
         }
 
         // Reload and verify all tables
         {
-            let pm = PageManager::new("test_multi_persist.hdb").unwrap();
-            let catalog = TableCatalog::new(pm).unwrap();
+            let mut pm = PageManager::new("test_multi_persist.hdb").unwrap();
+            let catalog = TableCatalog::new(&mut pm).unwrap();
 
             assert_eq!(catalog.tables.len(), 3);
             assert!(catalog.tables.contains_key("users"));
@@ -379,15 +344,16 @@ mod tests {
     fn test_first_page_allocation() {
         cleanup("test_page_alloc");
 
-        let pm = PageManager::new("test_page_alloc.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_page_alloc.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
-        let initial_pages = catalog.page_manager.num_pages();
+        let initial_pages = pm.num_pages();
 
         // Create first table
         catalog
             .create_table(
                 Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
+                &mut pm,
             )
             .unwrap();
 
@@ -398,6 +364,7 @@ mod tests {
         catalog
             .create_table(
                 Schema::new("orders", vec![Column::new("id", DataType::Integer, false)]).unwrap(),
+                &mut pm,
             )
             .unwrap();
 
@@ -411,8 +378,8 @@ mod tests {
     fn test_table_with_all_data_types() {
         cleanup("test_all_types");
 
-        let pm = PageManager::new("test_all_types.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_all_types.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
         let schema = Schema::new(
             "test_table",
@@ -425,12 +392,12 @@ mod tests {
         )
         .unwrap();
 
-        catalog.create_table(schema).unwrap();
+        catalog.create_table(schema, &mut pm).unwrap();
 
         // Reload and verify
-        drop(catalog);
-        let pm = PageManager::new("test_all_types.hdb").unwrap();
-        let catalog = TableCatalog::new(pm).unwrap();
+        drop(pm);
+        let mut pm = PageManager::new("test_all_types.hdb").unwrap();
+        let catalog = TableCatalog::new(&mut pm).unwrap();
 
         let metadata = catalog.get_table("test_table").unwrap();
         assert_eq!(metadata.schema.columns().len(), 4);
@@ -442,13 +409,13 @@ mod tests {
     fn test_empty_table_name() {
         cleanup("test_empty_name");
 
-        let pm = PageManager::new("test_empty_name.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_empty_name.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
         let schema = Schema::new("", vec![Column::new("id", DataType::Integer, true)]).unwrap();
 
         // Should still work (validation not implemented yet)
-        catalog.create_table(schema).unwrap();
+        catalog.create_table(schema, &mut pm).unwrap();
         assert!(catalog.tables.contains_key(""));
 
         cleanup("test_empty_name");
@@ -458,8 +425,8 @@ mod tests {
     fn test_table_with_long_name() {
         cleanup("test_long_name");
 
-        let pm = PageManager::new("test_long_name.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_long_name.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
         let long_name = "a".repeat(1000);
         let schema = Schema::new(
@@ -468,12 +435,12 @@ mod tests {
         )
         .unwrap();
 
-        catalog.create_table(schema).unwrap();
+        catalog.create_table(schema, &mut pm).unwrap();
 
         // Reload and verify
-        drop(catalog);
-        let pm = PageManager::new("test_long_name.hdb").unwrap();
-        let catalog = TableCatalog::new(pm).unwrap();
+        drop(pm);
+        let mut pm = PageManager::new("test_long_name.hdb").unwrap();
+        let catalog = TableCatalog::new(&mut pm).unwrap();
 
         assert!(catalog.tables.contains_key(&long_name));
 
@@ -484,12 +451,12 @@ mod tests {
     fn test_get_table_exists() {
         cleanup("test_get");
 
-        let pm = PageManager::new("test_get.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_get.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
         let schema =
             Schema::new("users", vec![Column::new("id", DataType::Integer, false)]).unwrap();
-        catalog.create_table(schema).unwrap();
+        catalog.create_table(schema, &mut pm).unwrap();
 
         let result = catalog.get_table("users");
         assert!(result.is_some());
@@ -502,8 +469,8 @@ mod tests {
     fn test_get_table_not_exists() {
         cleanup("test_get_none");
 
-        let pm = PageManager::new("test_get_none.hdb").unwrap();
-        let catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_get_none.hdb").unwrap();
+        let catalog = TableCatalog::new(&mut pm).unwrap();
 
         assert!(catalog.get_table("nonexistent").is_none());
 
@@ -514,17 +481,17 @@ mod tests {
     fn test_list_tables() {
         cleanup("test_list");
 
-        let pm = PageManager::new("test_list.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_list.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
         catalog
-            .create_table(Schema::new("users", vec![]).unwrap())
+            .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
             .unwrap();
         catalog
-            .create_table(Schema::new("orders", vec![]).unwrap())
+            .create_table(Schema::new("orders", vec![]).unwrap(), &mut pm)
             .unwrap();
         catalog
-            .create_table(Schema::new("products", vec![]).unwrap())
+            .create_table(Schema::new("products", vec![]).unwrap(), &mut pm)
             .unwrap();
 
         let tables = catalog.list_tables();
@@ -540,19 +507,19 @@ mod tests {
     fn test_drop_table() {
         cleanup("test_drop");
 
-        let pm = PageManager::new("test_drop.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_drop.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
         catalog
-            .create_table(Schema::new("users", vec![]).unwrap())
+            .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
             .unwrap();
         catalog
-            .create_table(Schema::new("orders", vec![]).unwrap())
+            .create_table(Schema::new("orders", vec![]).unwrap(), &mut pm)
             .unwrap();
 
         assert_eq!(catalog.tables.len(), 2);
 
-        catalog.drop_table("users").unwrap();
+        catalog.drop_table("users", &mut pm).unwrap();
 
         assert_eq!(catalog.tables.len(), 1);
         assert!(catalog.get_table("users").is_none());
@@ -566,22 +533,22 @@ mod tests {
         cleanup("test_drop_persist");
 
         {
-            let pm = PageManager::new("test_drop_persist.hdb").unwrap();
-            let mut catalog = TableCatalog::new(pm).unwrap();
+            let mut pm = PageManager::new("test_drop_persist.hdb").unwrap();
+            let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
             catalog
-                .create_table(Schema::new("users", vec![]).unwrap())
+                .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
                 .unwrap();
             catalog
-                .create_table(Schema::new("orders", vec![]).unwrap())
+                .create_table(Schema::new("orders", vec![]).unwrap(), &mut pm)
                 .unwrap();
-            catalog.drop_table("users").unwrap();
+            catalog.drop_table("users", &mut pm).unwrap();
         }
 
         // Reload and verify drop persisted
         {
-            let pm = PageManager::new("test_drop_persist.hdb").unwrap();
-            let catalog = TableCatalog::new(pm).unwrap();
+            let mut pm = PageManager::new("test_drop_persist.hdb").unwrap();
+            let catalog = TableCatalog::new(&mut pm).unwrap();
 
             assert_eq!(catalog.tables.len(), 1);
             assert!(catalog.get_table("users").is_none());
@@ -595,10 +562,10 @@ mod tests {
     fn test_drop_nonexistent_table() {
         cleanup("test_drop_none");
 
-        let pm = PageManager::new("test_drop_none.hdb").unwrap();
-        let mut catalog = TableCatalog::new(pm).unwrap();
+        let mut pm = PageManager::new("test_drop_none.hdb").unwrap();
+        let mut catalog = TableCatalog::new(&mut pm).unwrap();
 
-        let result = catalog.drop_table("nonexistent");
+        let result = catalog.drop_table("nonexistent", &mut pm);
         assert!(result.is_err()); // Should return error
 
         cleanup("test_drop_none");
