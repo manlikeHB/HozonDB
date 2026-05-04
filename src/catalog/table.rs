@@ -1,4 +1,5 @@
 use crate::catalog::schema::Schema;
+use crate::constants;
 use crate::storage::page::{PageId, PageManager, PageMetadata};
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
@@ -29,7 +30,7 @@ impl TableCatalog {
             page_manager.allocate_page()?;
         }
 
-        let catalog_data = page_manager.read_page(1u32)?;
+        let catalog_data = page_manager.read_page(constants::TABLE_CATALOG_PAGE_ID)?;
 
         // check if catalog is empty
         if catalog_data.iter().all(|&b| b == 0) {
@@ -111,7 +112,8 @@ impl TableCatalog {
 
     pub fn save(&mut self) -> io::Result<()> {
         let bytes = self.to_bytes();
-        self.page_manager.write_page(1u32, &bytes)?;
+        self.page_manager
+            .write_page(constants::TABLE_CATALOG_PAGE_ID, &bytes)?;
         Ok(())
     }
 
