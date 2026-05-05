@@ -96,4 +96,8 @@ impl Database {
         self.index_catalog
             .remove_index(table_name, index_name, &mut self.page_manager)
     }
+
+    pub fn total_index_count(&self) -> usize {
+        self.index_catalog.total_count()
+    }
 }

@@ -7,7 +7,6 @@ use crate::{catalog::index::index_entry::IndexEntry, constants, storage::page::P
 
 pub struct IndexCatalog {
     indexes: HashMap<String, Vec<IndexEntry>>, // table -> Vec<Indexes>
-    index_count: u32,
 }
 
 impl IndexCatalog {
@@ -24,7 +23,6 @@ impl IndexCatalog {
             // empty catalog - new db
             return Ok(IndexCatalog {
                 indexes: HashMap::new(),
-                index_count: 0_u32,
             });
         }
 
@@ -59,17 +57,14 @@ impl IndexCatalog {
                 .push(index_entry);
         }
 
-        Ok(IndexCatalog {
-            indexes,
-            index_count: num_index_entry as u32,
-        })
+        Ok(IndexCatalog { indexes })
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
         // index count
-        bytes.extend_from_slice(&self.index_count.to_le_bytes());
+        bytes.extend_from_slice(&(self.total_count() as u32).to_le_bytes());
 
         /*
         TODO-optimize;
@@ -97,8 +92,6 @@ impl IndexCatalog {
             .or_default()
             .push(entry);
 
-        self.index_count += 1;
-
         self.save(page_manager)?;
         Ok(())
     }
@@ -117,7 +110,7 @@ impl IndexCatalog {
     pub fn get_primary_index(&self, table_name: &str) -> Option<&IndexEntry> {
         if let Some(indexes) = self.indexes.get(table_name) {
             for index in indexes {
-                if index.is_primary() == true {
+                if index.is_primary() {
                     return Some(index);
                 }
             }
@@ -137,8 +130,14 @@ impl IndexCatalog {
             .or_default()
             .retain(|i| i.index_name() != index_name);
 
+        self.indexes.retain(|_, v| !v.is_empty());
+
         self.save(page_manager)?;
         Ok(())
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.indexes.values().map(|v| v.len()).sum()
     }
 }
 
@@ -167,7 +166,7 @@ mod tests {
         let (index_catalog, _) = setup("test_new_index_catalog");
 
         assert!(index_catalog.indexes.is_empty());
-        assert_eq!(index_catalog.index_count, 0_u32);
+        assert_eq!(index_catalog.indexes.values().count(), 0);
         cleanup("test_new_index_catalog");
     }
 
@@ -184,6 +183,26 @@ mod tests {
         assert!(indexes.is_some());
         assert_eq!(indexes.unwrap().len(), 1);
         cleanup("test_add_index");
+    }
+
+    #[test]
+    fn test_add_index_multiple_tables() {
+        cleanup("test_add_index_multiple_tables");
+
+        let (mut ic, mut pm) = setup("test_add_index_multiple_tables");
+
+        let users_index = IndexEntry::new("idx_users_id", "users", "id", true, 99);
+        let orders_index = IndexEntry::new("idx_orders_id", "orders", "id", true, 98);
+        ic.add_index(&mut pm, users_index).unwrap();
+        ic.add_index(&mut pm, orders_index).unwrap();
+
+        let users_indexes = ic.get_indexes_for_table("users");
+        let orders_indexes = ic.get_indexes_for_table("orders");
+        assert!(users_indexes.is_some());
+        assert_eq!(users_indexes.unwrap().len(), 1);
+        assert!(orders_indexes.is_some());
+        assert_eq!(orders_indexes.unwrap().len(), 1);
+        cleanup("test_add_index_multiple_tables");
     }
 
     #[test]
@@ -229,7 +248,7 @@ mod tests {
         ic.remove_index("users", "idx_users_id", &mut pm).unwrap();
 
         let indexes = ic.get_indexes_for_table("users");
-        assert!(indexes.unwrap().is_empty());
+        assert!(indexes.is_none());
         cleanup("test_remove_index");
     }
 
@@ -240,12 +259,14 @@ mod tests {
         {
             let (mut ic, mut pm) = setup("test_catalog_persist");
 
-            let index = IndexEntry::new("idx_users_id", "users", "id", true, 99);
-            ic.add_index(&mut pm, index).unwrap();
+            let index_1 = IndexEntry::new("idx_users_id", "users", "id", true, 99);
+            let index_2 = IndexEntry::new("idx_users_id", "users", "email", false, 98);
+            ic.add_index(&mut pm, index_1).unwrap();
+            ic.add_index(&mut pm, index_2).unwrap();
 
             let indexes = ic.get_indexes_for_table("users");
             assert!(indexes.is_some());
-            assert_eq!(indexes.unwrap().len(), 1);
+            assert_eq!(indexes.unwrap().len(), 2);
         }
 
         {
@@ -253,7 +274,7 @@ mod tests {
 
             let indexes = ic.get_indexes_for_table("users");
             assert!(indexes.is_some());
-            assert_eq!(indexes.unwrap().len(), 1);
+            assert_eq!(indexes.unwrap().len(), 2);
         }
 
         cleanup("test_catalog_persist");
