@@ -225,8 +225,8 @@ impl PageManager {
 
         let mut page_data = [0u8; PAGE_SIZE];
 
-        // page 0 = headers, page 1 = catalog
-        if self.num_pages > 2 {
+        // page 0 = headers, page 1 = tables catalog, page 2 = index catalog
+        if self.num_pages > 3 {
             // Create page buffer with metadata
             Self::init_page_metadata_buffer(&mut page_data);
         }
@@ -541,14 +541,16 @@ mod tests {
 
         let mut pm = PageManager::new("test_metadata_init.db").unwrap();
 
-        let page_id_1 = pm.allocate_page().unwrap(); // page id 1 is for catalog
+        let page_id_1 = pm.allocate_page().unwrap(); // page id 1 is for table catalog
         assert_eq!(page_id_1, 1);
-        // Allocate page 2 (should have initialized metadata)
-        let page_id_2 = pm.allocate_page().unwrap();
+        let page_id_2 = pm.allocate_page().unwrap(); // page id 2 is for index catalog
         assert_eq!(page_id_2, 2);
+        // Allocate page 3 (should have initialized metadata)
+        let page_id_3 = pm.allocate_page().unwrap();
+        assert_eq!(page_id_3, 3);
 
         // Read metadata
-        let metadata = pm.read_page_metadata(page_id_2).unwrap();
+        let metadata = pm.read_page_metadata(page_id_3).unwrap();
 
         // Check initial values
         assert_eq!(metadata.is_full, false);

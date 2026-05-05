@@ -2,6 +2,7 @@ use std::io;
 
 use crate::{
     catalog::{
+        index::{IndexCatalog, IndexEntry},
         schema::Schema,
         table::{TableCatalog, TableMetadata},
     },
@@ -11,14 +12,17 @@ use crate::{
 pub struct Database {
     page_manager: PageManager,
     table_catalog: TableCatalog,
+    index_catalog: IndexCatalog,
 }
 
 impl Database {
     pub fn new(mut page_manager: PageManager) -> io::Result<Self> {
         let table_catalog = TableCatalog::new(&mut page_manager)?;
+        let index_catalog = IndexCatalog::new(&mut page_manager)?;
         Ok(Database {
             page_manager,
             table_catalog,
+            index_catalog,
         })
     }
 
@@ -74,5 +78,22 @@ impl Database {
 
     pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
         self.table_catalog.drop_table(name, &mut self.page_manager)
+    }
+
+    pub fn add_new_index(&mut self, entry: IndexEntry) -> io::Result<()> {
+        self.index_catalog.add_index(&mut self.page_manager, entry)
+    }
+
+    pub fn get_indexes_for_table(&self, table_name: &str) -> Option<&Vec<IndexEntry>> {
+        self.index_catalog.get_indexes_for_table(table_name)
+    }
+
+    pub fn get_primary_index(&self, table_name: &str) -> Option<&IndexEntry> {
+        self.index_catalog.get_primary_index(table_name)
+    }
+
+    pub fn remove_index(&mut self, table_name: &str, index_name: &str) -> io::Result<()> {
+        self.index_catalog
+            .remove_index(table_name, index_name, &mut self.page_manager)
     }
 }
