@@ -76,8 +76,14 @@ impl Database {
         self.table_catalog.list_tables()
     }
 
-    pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
-        self.table_catalog.drop_table(name, &mut self.page_manager)
+    pub fn drop_table(&mut self, table_name: &str) -> io::Result<()> {
+        self.table_catalog
+            .drop_table(table_name, &mut self.page_manager)?;
+        // drop indexes for the table
+        self.index_catalog
+            .remove_table_indexes(table_name, &mut self.page_manager)?;
+
+        Ok(())
     }
 
     pub fn add_new_index(&mut self, entry: IndexEntry) -> io::Result<()> {

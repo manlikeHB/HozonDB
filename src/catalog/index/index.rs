@@ -139,6 +139,16 @@ impl IndexCatalog {
     pub fn total_count(&self) -> usize {
         self.indexes.values().map(|v| v.len()).sum()
     }
+
+    pub fn remove_table_indexes(
+        &mut self,
+        table_name: &str,
+        page_manager: &mut PageManager,
+    ) -> io::Result<()> {
+        self.indexes.remove(table_name);
+        self.save(page_manager)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -260,7 +270,7 @@ mod tests {
             let (mut ic, mut pm) = setup("test_catalog_persist");
 
             let index_1 = IndexEntry::new("idx_users_id", "users", "id", true, 99);
-            let index_2 = IndexEntry::new("idx_users_id", "users", "email", false, 98);
+            let index_2 = IndexEntry::new("idx_users_email", "users", "email", false, 98);
             ic.add_index(&mut pm, index_1).unwrap();
             ic.add_index(&mut pm, index_2).unwrap();
 
@@ -278,5 +288,24 @@ mod tests {
         }
 
         cleanup("test_catalog_persist");
+    }
+
+    #[test]
+    fn test_remove_table_indexes() {
+        cleanup("test_remove_table");
+        let (mut ic, mut pm) = setup("test_remove_table");
+
+        let index_1 = IndexEntry::new("idx_users_id", "users", "id", true, 99);
+        let index_2 = IndexEntry::new("idx_users_email", "users", "email", false, 98);
+
+        ic.add_index(&mut pm, index_1).unwrap();
+        ic.add_index(&mut pm, index_2).unwrap();
+
+        ic.remove_table_indexes("users", &mut pm).unwrap();
+
+        let indexes = ic.get_indexes_for_table("users");
+        assert!(indexes.is_none());
+
+        cleanup("test_remove_table");
     }
 }
