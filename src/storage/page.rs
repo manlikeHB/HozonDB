@@ -1,3 +1,4 @@
+use crate::constants::PageId;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -5,7 +6,6 @@ use std::sync::Mutex;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const HEADER_SIZE: usize = 12;
-pub type PageId = u32;
 pub const MAGIC_NUMBER: u32 = 0x484F5A4E; // 
 
 pub const PAGE_METADATA_SIZE: usize = 9;

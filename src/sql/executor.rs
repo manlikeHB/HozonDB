@@ -1,7 +1,7 @@
 use crate::{
     benchmark::metrics::QueryMetrics,
+    constants::PageId,
     sql::{database::Database, evaluator::evaluate_expr},
-    storage::page::PageId,
 };
 use std::io::{self, Error, ErrorKind};
 

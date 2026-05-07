@@ -6,7 +6,8 @@ use crate::{
         schema::Schema,
         table::{TableCatalog, TableMetadata},
     },
-    storage::page::{PageId, PageManager, PageMetadata},
+    constants::PageId,
+    storage::page::{PageManager, PageMetadata},
 };
 
 pub struct Database {
