@@ -1,14 +1,6 @@
-use crate::{
-    constants::PageId,
-    index::{key::IndexKey, node::LeafNode},
-};
+use crate::index::node::{LeafNode, internal::InternalNode};
 
 pub enum Node {
     Internal(InternalNode),
     Leaf(LeafNode),
-}
-
-pub struct InternalNode {
-    keys: Vec<IndexKey>,
-    children: Vec<PageId>,
 }
