@@ -88,6 +88,10 @@ impl LeafNode {
 
         (split_key, new_leaf_node)
     }
+
+    pub fn is_full(&self, order: usize) -> bool {
+        self.entry.len() >= order
+    }
 }
 
 #[cfg(test)]
@@ -217,5 +221,23 @@ mod tests {
 
         assert_eq!(row.page_id(), page_id);
         assert_eq!(row.slot(), slot);
+    }
+
+    #[test]
+    fn test_leaf_node_is_full() {
+        let order = 4;
+        let mut leaf = LeafNode::new();
+
+        assert!(!leaf.is_full(order));
+
+        for key in 1..=5 {
+            leaf.insert(LeafEntry::new(
+                IndexKey::Integer(key),
+                RowLocation::default(),
+            ));
+        }
+
+        assert!(leaf.entry.len() == 5);
+        assert!(leaf.is_full(order));
     }
 }
