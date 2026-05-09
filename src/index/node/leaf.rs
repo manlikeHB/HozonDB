@@ -92,6 +92,14 @@ impl LeafNode {
     pub fn is_full(&self, order: usize) -> bool {
         self.entry.len() >= order
     }
+
+    pub fn entry(&self) -> &Vec<LeafEntry> {
+        &self.entry
+    }
+
+    pub fn next(&self) -> Option<PageId> {
+        self.next
+    }
 }
 
 #[cfg(test)]

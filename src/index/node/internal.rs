@@ -37,6 +37,14 @@ impl InternalNode {
     pub fn is_full(&self, order: usize) -> bool {
         self.keys.len() >= order
     }
+
+    pub fn keys(&self) -> &Vec<IndexKey> {
+        &self.keys
+    }
+
+    pub fn children(&self) -> &Vec<PageId> {
+        &self.children
+    }
 }
 
 #[cfg(test)]
