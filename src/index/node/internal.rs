@@ -1,5 +1,8 @@
+use std::io::{self, Error, ErrorKind};
+
 use crate::{constants::PageId, index::key::IndexKey};
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct InternalNode {
     keys: Vec<IndexKey>,
     children: Vec<PageId>,
@@ -44,6 +47,81 @@ impl InternalNode {
 
     pub fn children(&self) -> &Vec<PageId> {
         &self.children
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // add key count
+        bytes.extend_from_slice(&(self.keys().len() as u32).to_le_bytes());
+        // add keys
+        for key in self.keys() {
+            bytes.extend_from_slice(&key.to_bytes());
+        }
+
+        // add children count
+        bytes.extend_from_slice(&(self.children().len() as u32).to_le_bytes());
+        // add children
+        for child in self.children() {
+            bytes.extend_from_slice(&child.to_le_bytes());
+        }
+
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let mut offset = 0;
+        let mut keys = Vec::new();
+        let mut children = Vec::new();
+
+        if bytes.len() < offset + 4 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Not enough bytes for Internal node keys count",
+            ));
+        };
+
+        let keys_count = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        offset += 4;
+
+        for _ in 0..keys_count {
+            let (key, bytes_consumed) = IndexKey::from_bytes(&bytes[offset..])?;
+            keys.push(key);
+            offset += bytes_consumed;
+        }
+
+        if bytes.len() < offset + 4 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Not enough bytes for Internal node children count",
+            ));
+        };
+
+        let children_count = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        offset += 4;
+
+        for _ in 0..children_count {
+            let child = u32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]);
+            children.push(child);
+            offset += 4;
+        }
+
+        Ok((Self::new(keys, children), offset))
     }
 }
 
@@ -135,5 +213,22 @@ mod tests {
         );
 
         assert!(internal.is_full(2));
+    }
+
+    #[test]
+    fn test_internal_node_serialization() {
+        let internal = InternalNode::new(
+            vec![
+                IndexKey::Integer(5),
+                IndexKey::Integer(10),
+                IndexKey::Integer(15),
+            ],
+            vec![1, 2, 3, 4],
+        );
+
+        let bytes = internal.to_bytes();
+        let (internal_node, _) = InternalNode::from_bytes(&bytes).unwrap();
+
+        assert_eq!(internal_node, internal);
     }
 }
