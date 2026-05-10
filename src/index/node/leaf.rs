@@ -1,5 +1,8 @@
+use std::io::{self, Error, ErrorKind};
+
 use crate::{constants::PageId, index::key::IndexKey};
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct LeafNode {
     entry: Vec<LeafEntry>,
     next: Option<PageId>,
@@ -23,6 +26,27 @@ impl LeafEntry {
     pub fn get_row(&self) -> RowLocation {
         self.row
     }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        bytes.extend_from_slice(&self.key.to_bytes());
+        bytes.extend_from_slice(&self.row.to_bytes());
+
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let mut offset = 0;
+        let (key, bytes_consumed) = IndexKey::from_bytes(&bytes)?;
+        offset += bytes_consumed;
+
+        let (row, bytes_consumed) = RowLocation::from_bytes(&bytes[offset..])?;
+        offset += bytes_consumed;
+
+        let leaf_entry = LeafEntry::new(key, row);
+        Ok((leaf_entry, offset))
+    }
 }
 
 #[derive(Debug, PartialEq, PartialOrd, Eq, Ord, Clone, Copy)]
@@ -42,6 +66,48 @@ impl RowLocation {
 
     pub fn slot(&self) -> u16 {
         self.slot
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // add page_id
+        bytes.extend_from_slice(&self.page_id().to_le_bytes());
+        // add slot
+        bytes.extend_from_slice(&self.slot().to_le_bytes());
+
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let mut offset = 0;
+
+        if bytes.len() < offset + 4 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Not enough bytes for row's page id",
+            ));
+        };
+
+        let page_id = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        offset += 4;
+
+        if bytes.len() < offset + 2 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Not enough bytes for row's slot",
+            ));
+        };
+
+        let slot = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+        offset += 2;
+
+        Ok((RowLocation::new(page_id, slot), offset))
     }
 }
 
@@ -108,6 +174,93 @@ impl LeafNode {
         } else {
             false
         }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        // add entry count
+        bytes.extend_from_slice(&(self.entry().len() as u32).to_le_bytes());
+
+        // add each entry
+        for entry in self.entry() {
+            bytes.extend_from_slice(&entry.to_bytes());
+        }
+
+        // encode if next is some (1) or none (0) - u8 (1 byte)
+        // if some, add next
+        match self.next {
+            Some(page_id) => {
+                bytes.extend_from_slice(&(1 as u8).to_le_bytes());
+                bytes.extend_from_slice(&page_id.to_le_bytes());
+            }
+            None => {
+                bytes.extend_from_slice(&(0 as u8).to_le_bytes());
+            }
+        }
+
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let mut offset = 0;
+        let mut entry = Vec::new();
+
+        if bytes.len() < offset + 4 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Not enough bytes for leaf node entry count",
+            ));
+        };
+
+        let count = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        offset += 4;
+
+        for _ in 0..count {
+            let (leaf_entry, bytes_consumed) = LeafEntry::from_bytes(&bytes[offset..])?;
+
+            entry.push(leaf_entry);
+            offset += bytes_consumed;
+        }
+
+        let next = match u8::from_le_bytes([bytes[offset]]) {
+            0 => {
+                offset += 1;
+                None
+            }
+            1 => {
+                offset += 1;
+
+                if bytes.len() < offset + 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for leaf node next page id",
+                    ));
+                };
+                let next_page_id = u32::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]);
+
+                Some(next_page_id)
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid value for lead node next page id option value",
+                ));
+            }
+        };
+
+        let leaf_node = LeafNode { entry, next };
+
+        Ok((leaf_node, offset))
     }
 }
 
@@ -276,5 +429,69 @@ mod tests {
         // remove non existing key
         assert!(!leaf.remove(&IndexKey::Integer(99)));
         assert!(leaf.entry().len() == 4);
+    }
+
+    #[test]
+    fn test_row_location_serialization() {
+        let row = RowLocation::new(234, 543);
+
+        let bytes = row.to_bytes();
+        let (row_location, _) = RowLocation::from_bytes(&bytes).unwrap();
+
+        assert_eq!(row_location, row);
+    }
+
+    #[test]
+    fn test_leaf_entry_serialization() {
+        let key = IndexKey::Text("hello@example.com".to_string());
+        let row = RowLocation::new(234, 543);
+
+        let leaf_entry = LeafEntry::new(key, row);
+
+        let bytes = leaf_entry.to_bytes();
+        let (entry, _) = LeafEntry::from_bytes(&bytes).unwrap();
+
+        assert_eq!(entry, leaf_entry);
+    }
+
+    #[test]
+    fn test_leaf_node_serialization_next_some_variant() {
+        let mut leaf_node = LeafNode::new();
+
+        for key in 1..=5 {
+            let entry = LeafEntry::new(
+                IndexKey::Integer(key),
+                RowLocation::new(key as u32, key as u16),
+            );
+
+            leaf_node.insert(entry);
+        }
+
+        // split leaf guarantying next is Some
+        let right_leaf_page_id = 99;
+        leaf_node.split(right_leaf_page_id);
+
+        let bytes = leaf_node.to_bytes();
+        let (node, _) = LeafNode::from_bytes(&bytes).unwrap();
+
+        assert_eq!(leaf_node, node);
+    }
+
+    #[test]
+    fn test_leaf_node_serialization_next_non_variant() {
+        let key = IndexKey::Text("hello@example.com".to_string());
+        let row = RowLocation::new(234, 543);
+
+        let leaf_entry = LeafEntry::new(key, row);
+
+        let mut leaf_node = LeafNode::new();
+
+        // single insert, next is None
+        leaf_node.insert(leaf_entry);
+
+        let bytes = leaf_node.to_bytes();
+        let (node, _) = LeafNode::from_bytes(&bytes).unwrap();
+
+        assert_eq!(leaf_node, node);
     }
 }
