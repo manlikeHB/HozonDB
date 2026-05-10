@@ -20,7 +20,7 @@ impl LeafEntry {
         &self.key
     }
 
-    pub fn get_row(self) -> RowLocation {
+    pub fn get_row(&self) -> RowLocation {
         self.row
     }
 }

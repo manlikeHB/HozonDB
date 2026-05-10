@@ -155,7 +155,7 @@ impl BPlusTree {
                     let pos = internal
                         .keys()
                         .iter()
-                        .position(|k| key <= k)
+                        .position(|k| key < k)
                         .unwrap_or(internal.keys().len());
                     cur = internal.children()[pos];
                 }
@@ -177,16 +177,50 @@ impl BPlusTree {
         self.nodes.insert(new_root_page, Node::Internal(new_root));
         self.root = Some(new_root_page);
     }
+
+    pub fn search(&self, key: &IndexKey) -> io::Result<Option<RowLocation>> {
+        match self.root {
+            Some(root_page_id) => {
+                let (leaf_page_id, _) = self.find_leaf(key, root_page_id)?;
+
+                let node = self.nodes.get(&leaf_page_id).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::NotFound,
+                        format!("Node for {} not found", leaf_page_id),
+                    )
+                })?;
+
+                match node {
+                    Node::Leaf(leaf) => {
+                        if let Some(pos) =
+                            leaf.entry().iter().position(|entry| entry.get_key() == key)
+                        {
+                            return Ok(Some(leaf.entry()[pos].get_row()));
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    Node::Internal(_) => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "Expected a leaf node, found Internal node".to_string(),
+                        ));
+                    }
+                }
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn get_rows(order: usize) -> Vec<RowLocation> {
+    fn get_rows(count: usize) -> Vec<RowLocation> {
         let mut rows = Vec::new();
         let page_id = 99;
-        for i in 1..=order {
+        for i in 1..=count {
             let row = RowLocation::new((page_id + i) as u32, (page_id + i) as u16);
             rows.push(row);
         }
@@ -297,5 +331,77 @@ mod tests {
             Node::Leaf(_) => panic!("expected an internal node after leaf split"),
             Node::Internal(_) => (),
         }
+    }
+
+    #[test]
+    fn test_search_empty_tree() {
+        let btree = BPlusTree::new();
+
+        let res = btree.search(&IndexKey::Integer(5)).unwrap();
+
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_search_tree_with_leaf_nodes() {
+        let mut btree = BPlusTree::new();
+
+        let row_1_page_id = 100;
+        let row_1_slot = 232;
+        let row_1 = RowLocation::new(row_1_page_id, row_1_slot);
+
+        let key_1 = IndexKey::Integer(5);
+
+        let row_2_page_id = 200;
+        let row_2_slot = 400;
+        let row_2 = RowLocation::new(row_2_page_id, row_2_slot);
+
+        let key_2 = IndexKey::Integer(15);
+
+        btree.insert(key_1.clone(), row_1).unwrap();
+        btree.insert(key_2.clone(), row_2).unwrap();
+
+        let row_res = btree.search(&key_2).unwrap().unwrap();
+
+        assert_eq!(row_res, row_2);
+
+        let row_res = btree.search(&key_1).unwrap().unwrap();
+
+        assert_eq!(row_res, row_1);
+    }
+    #[test]
+
+    fn test_search_tree_with_internal_nodes() {
+        let mut btree = BPlusTree::new();
+
+        let rows = get_rows(15);
+        let keys = get_integer_keys(15);
+
+        for i in 0..15 {
+            btree.insert(keys[i].clone(), rows[i]).unwrap();
+        }
+
+        let row_1_page_id = 100;
+        let row_1_slot = 232;
+        let row_1 = RowLocation::new(row_1_page_id, row_1_slot);
+
+        let key_1 = IndexKey::Integer(30);
+
+        let row_2_page_id = 200;
+        let row_2_slot = 400;
+        let row_2 = RowLocation::new(row_2_page_id, row_2_slot);
+
+        let key_2 = IndexKey::Integer(27);
+
+        btree.insert(key_1.clone(), row_1).unwrap();
+        btree.insert(key_2.clone(), row_2).unwrap();
+
+        let row_res = btree.search(&key_2).unwrap().unwrap();
+
+        assert_eq!(row_res, row_2);
+
+        let row_res = btree.search(&key_1).unwrap().unwrap();
+
+        assert_eq!(row_res, row_1);
     }
 }
