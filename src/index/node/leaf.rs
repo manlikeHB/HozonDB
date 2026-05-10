@@ -100,6 +100,15 @@ impl LeafNode {
     pub fn next(&self) -> Option<PageId> {
         self.next
     }
+
+    pub fn remove(&mut self, key: &IndexKey) -> bool {
+        if let Some(pos) = self.entry.iter().position(|entry| &entry.key == key) {
+            self.entry.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +256,25 @@ mod tests {
 
         assert!(leaf.entry.len() == 5);
         assert!(leaf.is_full(order));
+    }
+
+    #[test]
+    fn test_remove_key() {
+        let mut leaf = LeafNode::new();
+
+        for key in 1..=5 {
+            leaf.insert(LeafEntry::new(
+                IndexKey::Integer(key),
+                RowLocation::default(),
+            ));
+        }
+
+        assert!(leaf.entry().len() == 5);
+        // remove existing key
+        assert!(leaf.remove(&IndexKey::Integer(3)));
+        assert!(leaf.entry().len() == 4);
+        // remove non existing key
+        assert!(!leaf.remove(&IndexKey::Integer(99)));
+        assert!(leaf.entry().len() == 4);
     }
 }

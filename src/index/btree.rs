@@ -145,6 +145,9 @@ impl BPlusTree {
         }
     }
 
+    /// finds a leaf node containing the index key
+    ///
+    /// returns (leaf node page id, path to the leaf node)
     fn find_leaf(&self, key: &IndexKey, start: PageId) -> io::Result<(PageId, Vec<PageId>)> {
         let mut path = Vec::new();
         let mut cur = start;
@@ -209,6 +212,36 @@ impl BPlusTree {
                 }
             }
             None => Ok(None),
+        }
+    }
+
+    /// removes a key from leaf node if it exist
+    pub fn delete(&mut self, key: &IndexKey) -> io::Result<()> {
+        if let Some(root_page_id) = self.root {
+            let (leaf_page_id, _) = self.find_leaf(key, root_page_id)?;
+
+            if let Some(node) = self.nodes.get_mut(&leaf_page_id) {
+                match node {
+                    Node::Leaf(leaf) => match leaf.remove(key) {
+                        true => Ok(()),
+                        false => Err(Error::new(ErrorKind::NotFound, "key doesn't exist")),
+                    },
+                    Node::Internal(_) => Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Expected a leaf node, found Internal node",
+                    )),
+                }
+            } else {
+                Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("No node with page id {}", leaf_page_id),
+                ))
+            }
+        } else {
+            Err(Error::new(
+                ErrorKind::NotFound,
+                "tree root page id not present",
+            ))
         }
     }
 }
@@ -369,8 +402,8 @@ mod tests {
 
         assert_eq!(row_res, row_1);
     }
-    #[test]
 
+    #[test]
     fn test_search_tree_with_internal_nodes() {
         let mut btree = BPlusTree::new();
 
@@ -403,5 +436,33 @@ mod tests {
         let row_res = btree.search(&key_1).unwrap().unwrap();
 
         assert_eq!(row_res, row_1);
+    }
+
+    #[test]
+    fn test_delete_key() {
+        let mut btree = BPlusTree::new();
+
+        let rows = get_rows(15);
+        let keys = get_integer_keys(15);
+
+        for i in 0..15 {
+            btree.insert(keys[i].clone(), rows[i]).unwrap();
+        }
+
+        // delete existing key
+        btree.delete(&IndexKey::Integer(1)).unwrap();
+        assert!(btree.search(&IndexKey::Integer(1)).unwrap().is_none());
+
+        // delete non existing key
+        assert!(btree.delete(&IndexKey::Integer(99)).is_err());
+
+        // check delete didn't corrupt tree
+        for i in 1..=15 {
+            if i == 1 {
+                continue;
+            }
+
+            assert!(btree.search(&IndexKey::Integer(i)).unwrap().is_some());
+        }
     }
 }
