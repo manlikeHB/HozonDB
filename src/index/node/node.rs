@@ -51,19 +51,17 @@ impl Node {
         match node_type {
             0 => {
                 let (node, _) = InternalNode::from_bytes(&bytes[offset..])?;
-                return Ok(Node::Internal(node));
+                Ok(Node::Internal(node))
             }
             1 => {
                 let (node, _) = LeafNode::from_bytes(&bytes[offset..])?;
-                return Ok(Node::Leaf(node));
+                Ok(Node::Leaf(node))
             }
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Unknown value for node type: {}", node_type),
-                ));
-            }
-        };
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Unknown value for node type: {}", node_type),
+            )),
+        }
     }
 }
 

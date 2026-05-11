@@ -216,12 +216,29 @@ mod tests {
     }
 
     #[test]
-    fn test_internal_node_serialization() {
+    fn test_internal_node_serialization_integer_keys() {
         let internal = InternalNode::new(
             vec![
                 IndexKey::Integer(5),
                 IndexKey::Integer(10),
                 IndexKey::Integer(15),
+            ],
+            vec![1, 2, 3, 4],
+        );
+
+        let bytes = internal.to_bytes();
+        let (internal_node, _) = InternalNode::from_bytes(&bytes).unwrap();
+
+        assert_eq!(internal_node, internal);
+    }
+
+    #[test]
+    fn test_internal_node_serialization_text_keys() {
+        let internal = InternalNode::new(
+            vec![
+                IndexKey::Text("aalan".to_string()),
+                IndexKey::Text("mike".to_string()),
+                IndexKey::Text("charles".to_string()),
             ],
             vec![1, 2, 3, 4],
         );

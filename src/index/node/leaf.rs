@@ -190,11 +190,11 @@ impl LeafNode {
         // if some, add next
         match self.next {
             Some(page_id) => {
-                bytes.extend_from_slice(&(1 as u8).to_le_bytes());
+                bytes.push(1u8);
                 bytes.extend_from_slice(&page_id.to_le_bytes());
             }
             None => {
-                bytes.extend_from_slice(&(0 as u8).to_le_bytes());
+                bytes.push(0u8);
             }
         }
 
