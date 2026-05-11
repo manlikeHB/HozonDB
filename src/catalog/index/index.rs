@@ -230,6 +230,7 @@ mod tests {
         let primary = ic.get_primary_index("users");
         assert!(primary.is_some());
         assert_eq!(primary.unwrap().index_name(), "idx_users_id");
+        cleanup("test_get_primary_index");
     }
 
     #[test]
