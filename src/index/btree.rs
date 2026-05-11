@@ -18,7 +18,7 @@ use crate::{
 pub struct BPlusTree {
     root: Option<PageId>,
     order: usize,
-    nodes: HashMap<PageId, Node>,
+    cache: HashMap<PageId, Node>,
 }
 
 impl BPlusTree {
@@ -26,7 +26,7 @@ impl BPlusTree {
         BPlusTree {
             root: None,
             order: 3,
-            nodes: HashMap::new(),
+            cache: HashMap::new(),
         }
     }
 
@@ -52,7 +52,7 @@ impl BPlusTree {
             let mut new_right_page: Option<PageId> = None;
 
             loop {
-                if let Some(node) = self.nodes.get_mut(&cur_page) {
+                if let Some(node) = self.cache.get_mut(&cur_page) {
                     match node {
                         Node::Leaf(leaf) => {
                             leaf.insert(LeafEntry::new(cur_key.clone(), row_location));
@@ -65,7 +65,7 @@ impl BPlusTree {
                                 let (k, new_leaf) = leaf.split(new_page);
 
                                 // add leaf node to the node list
-                                self.nodes.insert(new_page, Node::Leaf(new_leaf));
+                                self.cache.insert(new_page, Node::Leaf(new_leaf));
 
                                 cur_key = k;
                                 new_right_page = Some(new_page);
@@ -102,7 +102,7 @@ impl BPlusTree {
                                 let (k, new_internal) = internal.split();
 
                                 // add to node list
-                                self.nodes.insert(new_page, Node::Internal(new_internal));
+                                self.cache.insert(new_page, Node::Internal(new_internal));
 
                                 cur_key = k;
                                 new_right_page = Some(new_page);
@@ -141,7 +141,7 @@ impl BPlusTree {
             let new_page = pm.allocate_page()?;
 
             // add the new leaf to nodes
-            self.nodes.insert(new_page, Node::Leaf(leaf));
+            self.cache.insert(new_page, Node::Leaf(leaf));
             // set root to new leaf node
             self.root = Some(new_page);
             Ok(())
@@ -155,7 +155,7 @@ impl BPlusTree {
         let mut path = Vec::new();
         let mut cur = start;
         loop {
-            match self.nodes.get(&cur) {
+            match self.cache.get(&cur) {
                 Some(Node::Internal(internal)) => {
                     path.push(cur);
                     let pos = internal
@@ -185,7 +185,7 @@ impl BPlusTree {
     ) -> io::Result<()> {
         let new_root_page = pm.allocate_page()?;
         let new_root = InternalNode::new(vec![key], vec![left, right]);
-        self.nodes.insert(new_root_page, Node::Internal(new_root));
+        self.cache.insert(new_root_page, Node::Internal(new_root));
         self.root = Some(new_root_page);
         Ok(())
     }
@@ -195,7 +195,7 @@ impl BPlusTree {
             Some(root_page_id) => {
                 let (leaf_page_id, _) = self.find_leaf(key, root_page_id)?;
 
-                let node = self.nodes.get(&leaf_page_id).ok_or_else(|| {
+                let node = self.cache.get(&leaf_page_id).ok_or_else(|| {
                     Error::new(
                         ErrorKind::NotFound,
                         format!("Node for {} not found", leaf_page_id),
@@ -229,7 +229,7 @@ impl BPlusTree {
         if let Some(root_page_id) = self.root {
             let (leaf_page_id, _) = self.find_leaf(key, root_page_id)?;
 
-            if let Some(node) = self.nodes.get_mut(&leaf_page_id) {
+            if let Some(node) = self.cache.get_mut(&leaf_page_id) {
                 match node {
                     Node::Leaf(leaf) => match leaf.remove(key) {
                         true => Ok(()),
@@ -289,17 +289,17 @@ mod tests {
         let rows = get_rows(btree.order);
         let keys = get_integer_keys(btree.order);
 
-        assert_eq!(btree.nodes.len(), 0);
+        assert_eq!(btree.cache.len(), 0);
         assert!(btree.root.is_none());
 
         btree.insert(keys[0].clone(), rows[0], &mut pm).unwrap();
         btree.insert(keys[1].clone(), rows[1], &mut pm).unwrap();
 
         // leaves should still be in the same page before split
-        assert_eq!(btree.nodes.len(), 1);
+        assert_eq!(btree.cache.len(), 1);
         assert!(btree.root.is_some());
 
-        let node = btree.nodes.get(&btree.root.unwrap()).unwrap();
+        let node = btree.cache.get(&btree.root.unwrap()).unwrap();
 
         match node {
             Node::Leaf(_) => (),
@@ -318,7 +318,7 @@ mod tests {
         let rows = get_rows(btree.order);
         let keys = get_integer_keys(btree.order);
 
-        assert_eq!(btree.nodes.len(), 0);
+        assert_eq!(btree.cache.len(), 0);
         assert!(btree.root.is_none());
 
         for i in 0..btree.order {
@@ -326,10 +326,10 @@ mod tests {
         }
 
         // multiple nodes of both internal and leaf should be present
-        assert_eq!(btree.nodes.len(), 3);
+        assert_eq!(btree.cache.len(), 3);
         assert!(btree.root.is_some());
 
-        let node = btree.nodes.get(&btree.root.unwrap()).unwrap();
+        let node = btree.cache.get(&btree.root.unwrap()).unwrap();
 
         match node {
             Node::Leaf(_) => panic!("expected an internal node after leaf split"),
@@ -348,7 +348,7 @@ mod tests {
         let rows = get_rows(btree.order);
         let keys = get_integer_keys(9);
 
-        assert_eq!(btree.nodes.len(), 0);
+        assert_eq!(btree.cache.len(), 0);
         assert!(btree.root.is_none());
 
         for i in 0..btree.order {
@@ -356,12 +356,12 @@ mod tests {
         }
 
         // multiple nodes of both internal and leaf should be present
-        assert_eq!(btree.nodes.len(), 3);
+        assert_eq!(btree.cache.len(), 3);
         assert!(btree.root.is_some());
 
         let before_root = btree.root.unwrap();
 
-        let node = btree.nodes.get(&btree.root.unwrap()).unwrap();
+        let node = btree.cache.get(&btree.root.unwrap()).unwrap();
 
         match node {
             Node::Leaf(_) => panic!("expected an internal node after leaf split"),
@@ -380,7 +380,7 @@ mod tests {
         let after_root = btree.root.unwrap();
         assert_ne!(before_root, after_root);
 
-        let node = btree.nodes.get(&btree.root.unwrap()).unwrap();
+        let node = btree.cache.get(&btree.root.unwrap()).unwrap();
 
         match node {
             Node::Leaf(_) => panic!("expected an internal node after leaf split"),
