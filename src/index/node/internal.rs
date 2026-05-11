@@ -50,23 +50,25 @@ impl InternalNode {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut buf = Vec::new();
+        self.write_to(&mut buf);
+        buf
+    }
 
+    pub fn write_to(&self, buf: &mut Vec<u8>) {
         // add key count
-        bytes.extend_from_slice(&(self.keys().len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.keys().len() as u32).to_le_bytes());
         // add keys
         for key in self.keys() {
-            bytes.extend_from_slice(&key.to_bytes());
+            key.write_to(buf);
         }
 
         // add children count
-        bytes.extend_from_slice(&(self.children().len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.children().len() as u32).to_le_bytes());
         // add children
         for child in self.children() {
-            bytes.extend_from_slice(&child.to_le_bytes());
+            buf.extend_from_slice(&child.to_le_bytes());
         }
-
-        bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {

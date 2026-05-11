@@ -10,26 +10,29 @@ const INTEGER_INDEX_KEY: u8 = 0;
 const TEXT_INDEX_KEY: u8 = 1;
 
 impl IndexKey {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+    pub fn write_to(&self, buf: &mut Vec<u8>) {
         match self {
             IndexKey::Integer(value) => {
                 // add index type
-                bytes.extend_from_slice(&INTEGER_INDEX_KEY.to_le_bytes());
+                buf.push(INTEGER_INDEX_KEY);
                 // add value
-                bytes.extend_from_slice(&value.to_le_bytes());
+                buf.extend_from_slice(&value.to_le_bytes());
             }
             IndexKey::Text(value) => {
                 // add index type
-                bytes.extend_from_slice(&TEXT_INDEX_KEY.to_le_bytes());
+                buf.push(TEXT_INDEX_KEY);
                 // add text (length + value)
                 let value_bytes = value.as_bytes();
-                bytes.extend_from_slice(&(value_bytes.len() as u8).to_le_bytes());
-                bytes.extend_from_slice(&value_bytes);
+                buf.extend_from_slice(&(value_bytes.len() as u8).to_le_bytes());
+                buf.extend_from_slice(&value_bytes);
             }
         }
+    }
 
-        bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_to(&mut buf);
+        buf
     }
 
     pub fn from_bytes(bytes: &[u8]) -> io::Result<(IndexKey, usize)> {

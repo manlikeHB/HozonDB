@@ -15,24 +15,27 @@ impl Node {
             Node::Leaf(_) => 1,
         }
     }
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
 
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_to(&mut buf);
+        buf
+    }
+
+    pub fn write_to(&self, buf: &mut Vec<u8>) {
         // add node type
-        bytes.extend_from_slice(&self.to_u8().to_le_bytes());
+        buf.push(self.to_u8());
 
         match self {
             Node::Leaf(leaf) => {
                 // add node
-                bytes.extend_from_slice(&leaf.to_bytes());
+                leaf.write_to(buf);
             }
             Node::Internal(internal) => {
                 // add node
-                bytes.extend_from_slice(&internal.to_bytes());
+                internal.write_to(buf);
             }
         }
-
-        bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {

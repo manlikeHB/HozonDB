@@ -27,13 +27,15 @@ impl LeafEntry {
         self.row
     }
 
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_to(&mut buf);
+        buf
+    }
 
-        bytes.extend_from_slice(&self.key.to_bytes());
-        bytes.extend_from_slice(&self.row.to_bytes());
-
-        bytes
+    pub fn write_to(&self, buf: &mut Vec<u8>) {
+        self.get_key().write_to(buf);
+        self.get_row().write_to(buf);
     }
 
     fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
@@ -68,15 +70,17 @@ impl RowLocation {
         self.slot
     }
 
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_to(&mut buf);
+        buf
+    }
 
+    pub fn write_to(&self, buf: &mut Vec<u8>) {
         // add page_id
-        bytes.extend_from_slice(&self.page_id().to_le_bytes());
+        buf.extend_from_slice(&self.page_id().to_le_bytes());
         // add slot
-        bytes.extend_from_slice(&self.slot().to_le_bytes());
-
-        bytes
+        buf.extend_from_slice(&self.slot().to_le_bytes());
     }
 
     fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
@@ -177,28 +181,31 @@ impl LeafNode {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut buf = Vec::new();
+        self.write_to(&mut buf);
+        buf
+    }
+
+    pub fn write_to(&self, buf: &mut Vec<u8>) {
         // add entry count
-        bytes.extend_from_slice(&(self.entry().len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.entry().len() as u32).to_le_bytes());
 
         // add each entry
         for entry in self.entry() {
-            bytes.extend_from_slice(&entry.to_bytes());
+            entry.write_to(buf);
         }
 
         // encode if next is some (1) or none (0) - u8 (1 byte)
         // if some, add next
         match self.next {
             Some(page_id) => {
-                bytes.push(1u8);
-                bytes.extend_from_slice(&page_id.to_le_bytes());
+                buf.push(1u8);
+                buf.extend_from_slice(&page_id.to_le_bytes());
             }
             None => {
-                bytes.push(0u8);
+                buf.push(0u8);
             }
         }
-
-        bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
