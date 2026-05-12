@@ -1,8 +1,11 @@
 use std::io::{self, Error, ErrorKind};
 
-use crate::index::node::{LeafNode, internal::InternalNode};
+use crate::{
+    constants,
+    index::node::{LeafNode, internal::InternalNode},
+};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Node {
     Internal(InternalNode),
     Leaf(LeafNode),
@@ -11,8 +14,8 @@ pub enum Node {
 impl Node {
     fn to_u8(&self) -> u8 {
         match self {
-            Node::Internal(_) => 0,
-            Node::Leaf(_) => 1,
+            Node::Internal(_) => constants::INTERNAL_NODE_TYPE,
+            Node::Leaf(_) => constants::LEAF_NODE_TYPE,
         }
     }
 
@@ -52,11 +55,11 @@ impl Node {
         offset += 1;
 
         match node_type {
-            0 => {
+            constants::INTERNAL_NODE_TYPE => {
                 let (node, _) = InternalNode::from_bytes(&bytes[offset..])?;
                 Ok(Node::Internal(node))
             }
-            1 => {
+            constants::LEAF_NODE_TYPE => {
                 let (node, _) = LeafNode::from_bytes(&bytes[offset..])?;
                 Ok(Node::Leaf(node))
             }

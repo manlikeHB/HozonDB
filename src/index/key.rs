@@ -120,6 +120,17 @@ mod test {
     }
 
     #[test]
+    fn test_integer_index_key_serialization_multiple_values() {
+        for i in 1..100 {
+            let key = IndexKey::Integer(i);
+
+            let bytes = key.to_bytes();
+            let (index_key, _) = IndexKey::from_bytes(&bytes).unwrap();
+            assert_eq!(index_key, key);
+        }
+    }
+
+    #[test]
     fn test_text_index_key_serialization() {
         let key = IndexKey::Text("hello@email.com".to_string());
 

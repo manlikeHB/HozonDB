@@ -2,7 +2,7 @@ use std::io::{self, Error, ErrorKind};
 
 use crate::{constants::PageId, index::key::IndexKey};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct InternalNode {
     keys: Vec<IndexKey>,
     children: Vec<PageId>,

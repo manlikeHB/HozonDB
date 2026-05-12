@@ -2,7 +2,7 @@ use std::io::{self, Error, ErrorKind};
 
 use crate::{constants::PageId, index::key::IndexKey};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct LeafNode {
     entry: Vec<LeafEntry>,
     next: Option<PageId>,
@@ -38,7 +38,7 @@ impl LeafEntry {
         self.get_row().write_to(buf);
     }
 
-    fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
         let mut offset = 0;
         let (key, bytes_consumed) = IndexKey::from_bytes(&bytes)?;
         offset += bytes_consumed;
@@ -83,7 +83,7 @@ impl RowLocation {
         buf.extend_from_slice(&self.slot().to_le_bytes());
     }
 
-    fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
         let mut offset = 0;
 
         if bytes.len() < offset + 4 {

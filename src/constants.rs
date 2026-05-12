@@ -10,3 +10,7 @@ pub const BTREE_TEXT_ORDER: usize = 15;
 
 // index
 pub const MAX_TEXT_INDEX_KEY_BYTES: usize = 255;
+
+// Node data type byte representation
+pub const INTERNAL_NODE_TYPE: u8 = 1;
+pub const LEAF_NODE_TYPE: u8 = 2;
