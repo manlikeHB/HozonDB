@@ -2,7 +2,7 @@ use crate::{
     benchmark::metrics::QueryMetrics,
     constants::PageId,
     index::{key::IndexKey, node::leaf::RowLocation},
-    sql::{database::Database, evaluator::evaluate_expr},
+    sql::{database::Database, evaluator::evaluate_expr, parser::BinaryOperator},
 };
 use std::io::{self, Error, ErrorKind};
 
@@ -33,6 +33,12 @@ pub enum ExecutionResult {
 impl Executor {
     pub fn new(database: Database) -> Self {
         Executor { database }
+    }
+
+    fn read_row_at_location(&self, location: RowLocation) -> io::Result<Row> {
+        let page_data = self.database.read_page(location.page_id())?;
+        let (row, _) = Row::from_bytes(&page_data[location.slot() as usize..])?;
+        Ok(row)
     }
 
     /// Read all rows from a page
@@ -427,37 +433,81 @@ impl Executor {
     ) -> io::Result<ExecutionResult> {
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
-        let (rows, _) = self.read_all_table_rows(first_page, metrics)?;
-
         // Extract column names
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
-        // check if there are any rows in this table
-        if rows.len() == 0 {
-            return Ok(ExecutionResult::Rows {
-                columns: all_column_names,
-                rows: Vec::<Row>::new(),
-            });
+        let mut index_used = false;
+        let mut filtered_rows = Vec::new();
+
+        // check for index-eligible WHERE clause
+
+        // TODO: range scan support (WHERE col > x, WHERE col BETWEEN x AND y)
+        // Currently only equality predicates use the index.
+        // Non-equality WHERE clauses on indexed columns fall back to full scan.
+        // Implementing range scans requires walking the leaf linked list
+        // from the first matching leaf — a natural extension of the current B+ tree.
+        if let Some(Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Equals,
+            right,
+        }) = &where_clause
+        {
+            if let (Expr::Column(col), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                // check if column is indexed
+                if let Some(entry) = self
+                    .database
+                    .get_indexes_for_table(&table_name)
+                    .and_then(|entries| entries.iter().find(|entry| entry.column_name() == col))
+                    .cloned()
+                {
+                    let key = IndexKey::try_from(val.clone())?;
+                    let result = self.database.search_index(entry.index_name(), &key)?;
+
+                    match result {
+                        Some(row_location) => {
+                            let row = self.read_row_at_location(row_location)?;
+                            filtered_rows.push(row);
+
+                            if let Some(m) = metrics.as_mut() {
+                                m.pages_read += 1; // one data page read
+                                m.rows_scanned += 1;
+                            }
+
+                            index_used = true;
+                        }
+                        None => {}
+                    }
+                }
+            }
         }
 
-        // filter rows based on the where clause
-        let filtered_rows: Vec<Row> = rows
-            .into_iter()
-            .filter_map(|row| {
+        if !index_used {
+            // full scan
+            let (rows, _) = self.read_all_table_rows(first_page, metrics)?;
+
+            // check if there are any rows in this table
+            if rows.len() == 0 {
+                return Ok(ExecutionResult::Rows {
+                    columns: all_column_names,
+                    rows: Vec::<Row>::new(),
+                });
+            }
+
+            // filter rows based on the where clause
+            for row in rows {
                 if let Some(ref expr) = where_clause {
                     match evaluate_expr(expr, &row, &all_column_names) {
-                        Ok(true) => Some(row),
-                        Ok(false) => None,
+                        Ok(true) => filtered_rows.push(row),
+                        Ok(false) => (),
                         Err(e) => {
                             eprintln!("Warning: Error evaluating WHERE clause: {}", e);
-                            None
                         }
                     }
                 } else {
-                    Some(row)
+                    filtered_rows.push(row);
                 }
-            })
-            .collect();
+            }
+        }
 
         // Handle column selection
         match select_columns {
@@ -2935,7 +2985,7 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer, true),
+                        Column::new("id", DataType::Integer, false),
                         Column::new("age", DataType::Integer, false),
                         Column::new("active", DataType::Boolean, false),
                     ],
@@ -4306,5 +4356,255 @@ mod tests {
         assert!(indexes.is_none());
 
         cleanup("test_create_table_no_pk");
+    }
+
+    #[test]
+    fn test_select_uses_index_for_primary_key_equality() {
+        cleanup("test_select_index_eq");
+        let mut executor = create_test_executor("test_select_index_eq");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        for i in 1..=10 {
+            executor
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text(format!("user_{}", i))],
+                    },
+                    &mut None,
+                )
+                .unwrap();
+        }
+
+        // select by primary key
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(5))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get_value(0), Some(&Value::Integer(5)));
+                assert_eq!(
+                    rows[0].get_value(1),
+                    Some(&Value::Text("user_5".to_string()))
+                );
+            }
+            _ => panic!("expected rows"),
+        }
+
+        cleanup("test_select_index_eq");
+    }
+
+    #[test]
+    fn test_select_index_key_not_found_returns_empty() {
+        cleanup("test_select_index_not_found");
+        let mut executor = create_test_executor("test_select_index_not_found");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(999))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            _ => panic!("expected rows"),
+        }
+
+        cleanup("test_select_index_not_found");
+    }
+
+    #[test]
+    fn test_select_index_vs_full_scan_page_reads() {
+        cleanup("test_select_index_metrics");
+        let mut executor = create_test_executor("test_select_index_metrics");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        for i in 1..=250 {
+            executor
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text(format!("user_{}", i))],
+                    },
+                    &mut None,
+                )
+                .unwrap();
+        }
+
+        // full scan metrics
+        let mut full_scan_metrics = Some(QueryMetrics::new());
+        executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("name".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Text("user_250".to_string()))),
+                    }),
+                },
+                &mut full_scan_metrics,
+            )
+            .unwrap();
+
+        // index scan metrics — same query on indexed column
+        let mut index_metrics = Some(QueryMetrics::new());
+        executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(250))),
+                    }),
+                },
+                &mut index_metrics,
+            )
+            .unwrap();
+
+        let full_scan_pages = full_scan_metrics.unwrap().pages_read;
+        let index_pages = index_metrics.unwrap().pages_read;
+
+        // index should read significantly fewer pages
+        assert!(
+            index_pages < full_scan_pages,
+            "index read {} pages, full scan read {} pages — index should be faster",
+            index_pages,
+            full_scan_pages
+        );
+
+        cleanup("test_select_index_metrics");
+    }
+
+    #[test]
+    fn test_select_non_indexed_column_falls_back_to_full_scan() {
+        cleanup("test_select_no_index_fallback");
+        let mut executor = create_test_executor("test_select_no_index_fallback");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        for i in 1..=5 {
+            executor
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text(format!("user_{}", i))],
+                    },
+                    &mut None,
+                )
+                .unwrap();
+        }
+
+        // WHERE on non-indexed column — should fall back to full scan and still work
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("name".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Text("user_3".to_string()))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_value(1),
+                    Some(&Value::Text("user_3".to_string()))
+                );
+            }
+            _ => panic!("expected rows"),
+        }
+
+        cleanup("test_select_no_index_fallback");
     }
 }

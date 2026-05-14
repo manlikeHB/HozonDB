@@ -185,4 +185,20 @@ impl Database {
     pub fn indexes(&self) -> &HashMap<String, BPlusTree> {
         &self.indexes
     }
+
+    pub fn search_index(
+        &mut self,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> io::Result<Option<RowLocation>> {
+        let Database {
+            indexes,
+            page_manager,
+            ..
+        } = self;
+        let btree = indexes
+            .get_mut(index_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
+        btree.search(key, page_manager)
+    }
 }
