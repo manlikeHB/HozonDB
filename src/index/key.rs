@@ -1,5 +1,7 @@
 use std::io::{self, Error, ErrorKind};
 
+use crate::catalog::row::Value;
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub enum IndexKey {
     Integer(i32),
@@ -106,6 +108,20 @@ impl IndexKey {
     }
 }
 
+impl TryFrom<Value> for IndexKey {
+    type Error = io::Error;
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Integer(int) => Ok(IndexKey::Integer(int)),
+            Value::Text(txt) => Ok(IndexKey::Text(txt)),
+            other => Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("cannot index value of type {:?}", other),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -137,5 +153,21 @@ mod test {
         let bytes = key.to_bytes();
         let (index_key, _) = IndexKey::from_bytes(&bytes).unwrap();
         assert_eq!(index_key, key);
+    }
+
+    #[test]
+    fn test_try_from_value() {
+        let null_value = Value::Null;
+        let int_value = Value::Integer(5);
+        let text_value = Value::Text("hello".to_string());
+        let bool_value = Value::Boolean(true);
+
+        assert!(IndexKey::try_from(null_value).is_err());
+        assert!(IndexKey::try_from(bool_value).is_err());
+        assert_eq!(IndexKey::try_from(int_value).unwrap(), IndexKey::Integer(5));
+        assert_eq!(
+            IndexKey::try_from(text_value).unwrap(),
+            IndexKey::Text("hello".to_string())
+        );
     }
 }

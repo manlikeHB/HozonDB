@@ -149,12 +149,16 @@ impl IndexCatalog {
         self.save(page_manager)?;
         Ok(())
     }
+
+    pub fn all_indexes(&self) -> Vec<&IndexEntry> {
+        self.indexes.values().flatten().collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::table::TableCatalog;
+    use crate::catalog::{index::index_entry::IndexColumnType, table::TableCatalog};
     use std::fs;
 
     fn cleanup(basename: &str) {
@@ -186,7 +190,14 @@ mod tests {
 
         let (mut ic, mut pm) = setup("test_add_index");
 
-        let index = IndexEntry::new("idx_users_id", "users", "id", true, 99);
+        let index = IndexEntry::new(
+            "idx_users_id",
+            "users",
+            "id",
+            IndexColumnType::Integer,
+            true,
+            99,
+        );
         ic.add_index(&mut pm, index).unwrap();
 
         let indexes = ic.get_indexes_for_table("users");
@@ -201,8 +212,22 @@ mod tests {
 
         let (mut ic, mut pm) = setup("test_add_index_multiple_tables");
 
-        let users_index = IndexEntry::new("idx_users_id", "users", "id", true, 99);
-        let orders_index = IndexEntry::new("idx_orders_id", "orders", "id", true, 98);
+        let users_index = IndexEntry::new(
+            "idx_users_id",
+            "users",
+            "id",
+            IndexColumnType::Integer,
+            true,
+            99,
+        );
+        let orders_index = IndexEntry::new(
+            "idx_orders_id",
+            "orders",
+            "id",
+            IndexColumnType::Integer,
+            true,
+            98,
+        );
         ic.add_index(&mut pm, users_index).unwrap();
         ic.add_index(&mut pm, orders_index).unwrap();
 
@@ -221,8 +246,22 @@ mod tests {
 
         let (mut ic, mut pm) = setup("test_get_primary_index");
 
-        let index_1 = IndexEntry::new("idx_users_id", "users", "id", true, 99);
-        let index_2 = IndexEntry::new("idx_users_name", "users", "name", false, 99);
+        let index_1 = IndexEntry::new(
+            "idx_users_id",
+            "users",
+            "id",
+            IndexColumnType::Integer,
+            true,
+            99,
+        );
+        let index_2 = IndexEntry::new(
+            "idx_users_name",
+            "users",
+            "name",
+            IndexColumnType::Text,
+            false,
+            99,
+        );
 
         ic.add_index(&mut pm, index_1).unwrap();
         ic.add_index(&mut pm, index_2).unwrap();
@@ -239,7 +278,14 @@ mod tests {
 
         let (mut ic, mut pm): (IndexCatalog, PageManager) = setup("test_get_primary_index_none");
 
-        let index = IndexEntry::new("idx_users_id", "users", "id", false, 99);
+        let index = IndexEntry::new(
+            "idx_users_id",
+            "users",
+            "id",
+            IndexColumnType::Integer,
+            false,
+            99,
+        );
 
         ic.add_index(&mut pm, index).unwrap();
 
@@ -253,7 +299,14 @@ mod tests {
 
         let (mut ic, mut pm) = setup("test_remove_index");
 
-        let index = IndexEntry::new("idx_users_id", "users", "id", true, 99);
+        let index = IndexEntry::new(
+            "idx_users_id",
+            "users",
+            "id",
+            IndexColumnType::Integer,
+            true,
+            99,
+        );
 
         ic.add_index(&mut pm, index).unwrap();
         ic.remove_index("users", "idx_users_id", &mut pm).unwrap();
@@ -270,8 +323,22 @@ mod tests {
         {
             let (mut ic, mut pm) = setup("test_catalog_persist");
 
-            let index_1 = IndexEntry::new("idx_users_id", "users", "id", true, 99);
-            let index_2 = IndexEntry::new("idx_users_email", "users", "email", false, 98);
+            let index_1 = IndexEntry::new(
+                "idx_users_id",
+                "users",
+                "id",
+                IndexColumnType::Integer,
+                true,
+                99,
+            );
+            let index_2 = IndexEntry::new(
+                "idx_users_email",
+                "users",
+                "email",
+                IndexColumnType::Integer,
+                false,
+                98,
+            );
             ic.add_index(&mut pm, index_1).unwrap();
             ic.add_index(&mut pm, index_2).unwrap();
 
@@ -296,8 +363,22 @@ mod tests {
         cleanup("test_remove_table");
         let (mut ic, mut pm) = setup("test_remove_table");
 
-        let index_1 = IndexEntry::new("idx_users_id", "users", "id", true, 99);
-        let index_2 = IndexEntry::new("idx_users_email", "users", "email", false, 98);
+        let index_1 = IndexEntry::new(
+            "idx_users_id",
+            "users",
+            "id",
+            IndexColumnType::Integer,
+            true,
+            99,
+        );
+        let index_2 = IndexEntry::new(
+            "idx_users_email",
+            "users",
+            "email",
+            IndexColumnType::Text,
+            false,
+            98,
+        );
 
         ic.add_index(&mut pm, index_1).unwrap();
         ic.add_index(&mut pm, index_2).unwrap();
@@ -308,5 +389,44 @@ mod tests {
         assert!(indexes.is_none());
 
         cleanup("test_remove_table");
+    }
+
+    #[test]
+    fn test_all_indexes() {
+        cleanup("test_all_indexes");
+        let (mut ic, mut pm) = setup("test_all_indexes");
+
+        let index_1 = IndexEntry::new(
+            "idx_users_id",
+            "users",
+            "id",
+            IndexColumnType::Integer,
+            true,
+            99,
+        );
+        let index_2 = IndexEntry::new(
+            "idx_users_email",
+            "users",
+            "email",
+            IndexColumnType::Text,
+            false,
+            98,
+        );
+        let index_3 = IndexEntry::new(
+            "idx_orders_id",
+            "orders",
+            "id",
+            IndexColumnType::Integer,
+            false,
+            97,
+        );
+
+        ic.add_index(&mut pm, index_1).unwrap();
+        ic.add_index(&mut pm, index_2).unwrap();
+        ic.add_index(&mut pm, index_3).unwrap();
+
+        assert_eq!(ic.total_count(), ic.all_indexes().len());
+
+        cleanup("test_all_indexes");
     }
 }

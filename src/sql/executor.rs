@@ -1,6 +1,7 @@
 use crate::{
     benchmark::metrics::QueryMetrics,
     constants::PageId,
+    index::{key::IndexKey, node::leaf::RowLocation},
     sql::{database::Database, evaluator::evaluate_expr},
 };
 use std::io::{self, Error, ErrorKind};
@@ -279,6 +280,7 @@ impl Executor {
         metrics: &mut Option<QueryMetrics>,
     ) -> io::Result<ExecutionResult> {
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
+        let columns = columns.to_vec();
 
         // Validate value count
         if values.len() != columns.len() {
@@ -288,8 +290,11 @@ impl Executor {
             ));
         }
 
+        let value_and_col_pairs: Vec<(&Value, &Column)> =
+            values.iter().zip(columns.iter()).collect();
+
         // Validate data types
-        for (value, column) in values.iter().zip(columns.iter()) {
+        for (value, column) in &value_and_col_pairs {
             if !validate_value_type(value, column.data_type()) {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
@@ -322,10 +327,10 @@ impl Executor {
         }
 
         let mut last_page_meta = PageManager::read_metadata_from_buffer(&last_page_data);
-        let row_bytes = Row::new(values).to_bytes();
+        let row_bytes = Row::to_bytes_from_values(&values);
 
         // try to append new row to last page
-        if last_page_meta.last_offset + row_bytes.len() < PAGE_SIZE {
+        let (row_page_id, slot) = if last_page_meta.last_offset + row_bytes.len() < PAGE_SIZE {
             let offset = last_page_meta.last_offset;
 
             last_page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
@@ -340,6 +345,8 @@ impl Executor {
             if let Some(m) = metrics.as_mut() {
                 m.pages_written += 1;
             }
+
+            (last_page, offset)
         } else {
             // Create a new page
             let new_page = self.database.allocate_page()?;
@@ -368,6 +375,38 @@ impl Executor {
             if let Some(m) = metrics.as_mut() {
                 m.pages_written += 1;
             }
+
+            (new_page, PAGE_DATA_START)
+        };
+
+        // add new row if table was indexed
+        let index_entries = self
+            .database
+            .get_indexes_for_table(&table_name)
+            .map(|entries| entries.to_vec())
+            .unwrap_or_default();
+
+        for entry in index_entries {
+            let row_location = RowLocation::new(row_page_id, slot as u16);
+
+            let (val, _) = value_and_col_pairs
+                .iter()
+                .find(|(_, c)| c.name() == entry.column_name())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "indexed column '{}' not found in schema",
+                            entry.column_name()
+                        ),
+                    )
+                })?;
+
+            self.database.insert_into_index(
+                entry.index_name(),
+                IndexKey::try_from((*val).clone())?,
+                row_location,
+            )?;
         }
 
         if let Some(m) = metrics.as_mut() {
@@ -1250,7 +1289,7 @@ mod tests {
                 Statement::CreateTable {
                     name: "users".to_string(),
                     columns: vec![
-                        Column::new("id", DataType::Integer, true),
+                        Column::new("id", DataType::Integer, false),
                         Column::new("name", DataType::Text, false),
                     ],
                 },
@@ -4165,5 +4204,107 @@ mod tests {
         assert!(freed_pages.len() > 0);
 
         cleanup("test_compact_specific");
+    }
+
+    #[test]
+    fn test_insert_updates_index() {
+        cleanup("test_insert_updates_index");
+        let mut executor = create_test_executor("test_insert_updates_index");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // insert some rows
+        for i in 1..=5 {
+            executor
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text(format!("user_{}", i))],
+                    },
+                    &mut None,
+                )
+                .unwrap();
+        }
+
+        // verify index exists in catalog
+        let index_entries = executor
+            .database
+            .get_indexes_for_table("users")
+            .expect("index should exist for primary key table");
+        assert!(!index_entries.is_empty());
+
+        // verify index has the primary key column
+        let pk_index = index_entries.iter().find(|e| e.is_primary());
+        assert!(pk_index.is_some());
+
+        cleanup("test_insert_updates_index");
+    }
+
+    #[test]
+    fn test_create_table_with_primary_key_creates_index() {
+        cleanup("test_create_table_pk_index");
+        let mut executor = create_test_executor("test_create_table_pk_index");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // index should exist in catalog
+        let indexes = executor.database.get_indexes_for_table("users");
+        assert!(indexes.is_some());
+        let indexes = indexes.unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert!(indexes[0].is_primary());
+        assert_eq!(indexes[0].column_name(), "id");
+
+        // index tree should be loaded in memory
+        assert!(!executor.database.indexes().is_empty());
+
+        cleanup("test_create_table_pk_index");
+    }
+
+    #[test]
+    fn test_create_table_without_primary_key_no_index() {
+        cleanup("test_create_table_no_pk");
+        let mut executor = create_test_executor("test_create_table_no_pk");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "logs".to_string(),
+                    columns: vec![
+                        Column::new("message", DataType::Text, false),
+                        Column::new("level", DataType::Integer, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // no index should be created
+        let indexes = executor.database.get_indexes_for_table("logs");
+        assert!(indexes.is_none());
+
+        cleanup("test_create_table_no_pk");
     }
 }

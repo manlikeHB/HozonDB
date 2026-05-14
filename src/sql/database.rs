@@ -1,12 +1,16 @@
-use std::io;
+use std::{
+    collections::HashMap,
+    io::{self, Error, ErrorKind},
+};
 
 use crate::{
     catalog::{
-        index::{IndexCatalog, IndexEntry},
+        index::{IndexCatalog, IndexEntry, index_entry::IndexColumnType},
         schema::Schema,
         table::{TableCatalog, TableMetadata},
     },
     constants::PageId,
+    index::{btree::BPlusTree, key::IndexKey, node::leaf::RowLocation},
     storage::page::{PageManager, PageMetadata},
 };
 
@@ -14,19 +18,31 @@ pub struct Database {
     page_manager: PageManager,
     table_catalog: TableCatalog,
     index_catalog: IndexCatalog,
+    indexes: HashMap<String, BPlusTree>, // index name -> B+ tree
 }
 
 impl Database {
     pub fn new(mut page_manager: PageManager) -> io::Result<Self> {
         let table_catalog = TableCatalog::new(&mut page_manager)?;
         let index_catalog = IndexCatalog::new(&mut page_manager)?;
+        let mut indexes = HashMap::new();
+
+        // load b+ tree for all indexes
+        for entry in index_catalog.all_indexes() {
+            let btree = BPlusTree::load(entry.root_page_id(), entry.column_type().order());
+
+            indexes.insert(entry.index_name().to_owned(), btree);
+        }
+
         Ok(Database {
             page_manager,
             table_catalog,
             index_catalog,
+            indexes,
         })
     }
 
+    // page manager methods
     pub fn read_page(&self, page_id: u32) -> io::Result<[u8; 4096]> {
         self.page_manager.read_page(page_id)
     }
@@ -63,9 +79,36 @@ impl Database {
         self.page_manager.first_free_page()
     }
 
+    pub fn pm(&mut self) -> &mut PageManager {
+        &mut self.page_manager
+    }
+
+    // table catalog
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
         self.table_catalog
-            .create_table(schema, &mut self.page_manager)?;
+            .create_table(schema.clone(), &mut self.page_manager)?;
+
+        if let Some(pk_col) = schema.columns().iter().find(|c| c.is_primary_key()) {
+            let column_type = IndexColumnType::try_from(*pk_col.data_type())?;
+            let btree = BPlusTree::new(column_type.order(), &mut self.page_manager)?;
+            let root_page_id = btree.root().ok_or_else(|| {
+                return Error::new(ErrorKind::InvalidData, "b+ tree root page id not set");
+            })?;
+
+            let index_name = format!("idx-{}-{}", schema.table_name(), pk_col.name());
+            let index_entry = IndexEntry::new(
+                &index_name,
+                schema.table_name(),
+                pk_col.name(),
+                column_type,
+                true,
+                root_page_id,
+            );
+
+            // register new index
+            self.add_new_index(index_entry)?;
+        }
+
         Ok(())
     }
 
@@ -87,8 +130,16 @@ impl Database {
         Ok(())
     }
 
+    // Index catalog methods
     pub fn add_new_index(&mut self, entry: IndexEntry) -> io::Result<()> {
-        self.index_catalog.add_index(&mut self.page_manager, entry)
+        let btree = BPlusTree::load(entry.root_page_id(), entry.column_type().order());
+        let index_name = entry.index_name().to_owned();
+
+        self.index_catalog
+            .add_index(&mut self.page_manager, entry)?;
+        self.indexes.insert(index_name, btree);
+
+        Ok(())
     }
 
     pub fn get_indexes_for_table(&self, table_name: &str) -> Option<&Vec<IndexEntry>> {
@@ -106,5 +157,32 @@ impl Database {
 
     pub fn total_index_count(&self) -> usize {
         self.index_catalog.total_count()
+    }
+
+    // Indexes
+    pub fn insert_into_index(
+        &mut self,
+        index_name: &str,
+        key: IndexKey,
+        row_location: RowLocation,
+    ) -> io::Result<()> {
+        let Database {
+            indexes,
+            page_manager,
+            ..
+        } = self;
+
+        let btree = indexes.get_mut(index_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("index '{}' not found", index_name),
+            )
+        })?;
+
+        btree.insert(key, row_location, page_manager)
+    }
+
+    pub fn indexes(&self) -> &HashMap<String, BPlusTree> {
+        &self.indexes
     }
 }

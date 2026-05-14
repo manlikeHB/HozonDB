@@ -23,7 +23,7 @@ pub struct BPlusTree {
 
 impl BPlusTree {
     /// This creates a fresh index
-    /// allocates root page and writes empty leaf to disk 
+    /// allocates root page and writes empty leaf to disk
     pub fn new(order: usize, pm: &mut PageManager) -> io::Result<Self> {
         let root_page_id = pm.allocate_page()?;
         let root_leaf = Node::Leaf(LeafNode::new());
@@ -348,6 +348,10 @@ impl BPlusTree {
         // update cache
         self.cache.insert(page_id, node);
         Ok(())
+    }
+
+    pub fn root(&self) -> Option<PageId> {
+        self.root
     }
 }
 

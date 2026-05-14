@@ -27,10 +27,10 @@ impl Row {
         self.values.get(index)
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes_from_values(values: &[Value]) -> Vec<u8> {
         let mut bytes = Vec::new();
 
-        for value in self.values.iter() {
+        for value in values.iter() {
             match value {
                 Value::Integer(val) => {
                     bytes.push(1);
@@ -54,6 +54,10 @@ impl Row {
 
         bytes.push(0); // Row terminator
         bytes
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        Self::to_bytes_from_values(&self.values)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {

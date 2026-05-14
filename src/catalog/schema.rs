@@ -1,6 +1,7 @@
 use std::io::{self, Error, ErrorKind};
 
-#[derive(Debug)]
+// TODO: use constant values to represent DataType u8 values
+#[derive(Debug, Clone, Copy)]
 pub enum DataType {
     Integer,
     Text,
@@ -8,7 +9,7 @@ pub enum DataType {
     Null,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Column {
     name: String,
     data_type: DataType,
@@ -37,7 +38,7 @@ impl Column {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Schema {
     table_name: String,
     columns: Vec<Column>,
