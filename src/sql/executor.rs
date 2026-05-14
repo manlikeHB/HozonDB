@@ -314,6 +314,44 @@ impl Executor {
             }
         }
 
+        // get table indexes
+        let index_entries = self
+            .database
+            .get_indexes_for_table(&table_name)
+            .map(|entries| entries.to_vec())
+            .unwrap_or_default();
+
+        // check for duplicate primary key
+        for entry in &index_entries {
+            if entry.is_primary() {
+                let (val, _) = value_and_col_pairs
+                    .iter()
+                    .find(|(_, col)| entry.column_name() == col.name())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "indexed column '{}' not found in schema",
+                                entry.column_name()
+                            ),
+                        )
+                    })?;
+
+                if let Some(_) = self
+                    .database
+                    .search_index(entry.index_name(), &IndexKey::try_from((*val).clone())?)?
+                {
+                    return Err(Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "duplicate primary key value for column '{}'",
+                            entry.column_name()
+                        ),
+                    ));
+                }
+            }
+        }
+
         // get last page
         let mut last_page = first_page;
 
@@ -386,12 +424,6 @@ impl Executor {
         };
 
         // add new row if table was indexed
-        let index_entries = self
-            .database
-            .get_indexes_for_table(&table_name)
-            .map(|entries| entries.to_vec())
-            .unwrap_or_default();
-
         for entry in index_entries {
             let row_location = RowLocation::new(row_page_id, slot as u16);
 
@@ -4606,5 +4638,131 @@ mod tests {
         }
 
         cleanup("test_select_no_index_fallback");
+    }
+
+    #[test]
+    fn test_insert_duplicate_primary_key_rejected() {
+        cleanup("test_duplicate_pk");
+        let mut executor = create_test_executor("test_duplicate_pk");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // first insert should succeed
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // duplicate primary key should fail
+        let result = executor.execute(
+            Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1), Value::Text("Bob".to_string())],
+            },
+            &mut None,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        // verify only one row exists — duplicate was not inserted
+        let select = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match select {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_value(1),
+                    Some(&Value::Text("Alice".to_string()))
+                );
+            }
+            _ => panic!("expected rows"),
+        }
+
+        cleanup("test_duplicate_pk");
+    }
+
+    #[test]
+    fn test_insert_duplicate_allowed_on_non_pk_column() {
+        cleanup("test_duplicate_non_pk");
+        let mut executor = create_test_executor("test_duplicate_non_pk");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // two rows with same name but different pk — should both succeed
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(2), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        let select = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match select {
+            ExecutionResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            _ => panic!("expected rows"),
+        }
+
+        cleanup("test_duplicate_non_pk");
     }
 }
