@@ -613,6 +613,7 @@ impl Executor {
         metrics: &mut Option<QueryMetrics>,
     ) -> io::Result<ExecutionResult> {
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
+        let columns = columns.to_vec();
 
         // get all rows
         let (rows, old_chain) = self.read_all_table_rows(first_page, metrics)?;
@@ -629,27 +630,52 @@ impl Executor {
         }
 
         // filter rows based on the where clause
-        let filtered_rows: Vec<Row> = rows
-            .into_iter()
-            .filter_map(|row| {
-                if let Some(ref expr) = where_clause {
-                    match evaluate_expr(expr, &row, &all_column_names) {
-                        Ok(true) => None, // if row matches filter out
-                        Ok(false) => Some(row),
-                        Err(e) => {
-                            eprintln!("Warning: Error evaluating WHERE clause: {}", e);
-                            None
+        let mut kept_rows = Vec::new();
+        let mut deleted_rows = Vec::new();
+
+        for row in rows {
+            if let Some(ref expr) = where_clause {
+                match evaluate_expr(expr, &row, &all_column_names) {
+                    Ok(true) => deleted_rows.push(row), // matches = deleted
+                    Ok(false) => kept_rows.push(row),   // no match = kept
+                    Err(e) => {
+                        eprintln!("Warning: Error evaluating WHERE clause: {}", e);
+                    }
+                }
+            } else {
+                deleted_rows.push(row); // no WHERE = delete all
+            }
+        }
+
+        // delete indexed keys
+
+        // TODO: deletion requires full page chain rewrite, making index-assisted
+        // deletion impossible with the current design. With MVCC, a DELETE would mark rows as
+        // deleted in-place, allowing the index to locate the exact row via RowLocation without
+        // a full scan. Physical removal would happen during compaction/vacuum.
+        // This is also foundational for distributed systems — MVCC enables concurrent reads
+        // and writes across nodes without locking conflicts.
+        let index_entries = self
+            .database
+            .get_indexes_for_table(&table_name)
+            .map(|e| e.to_vec())
+            .unwrap_or_default();
+
+        for row in &deleted_rows {
+            for entry in &index_entries {
+                if let Some(pos) = columns.iter().position(|c| c.name() == entry.column_name()) {
+                    if let Some(val) = row.get_value(pos) {
+                        if let Ok(key) = IndexKey::try_from(val.clone()) {
+                            self.database.delete_from_index(entry.index_name(), &key)?;
                         }
                     }
-                } else {
-                    None // if no where clause then delete all rows
                 }
-            })
-            .collect();
+            }
+        }
 
-        self.write_all_table_rows(&filtered_rows, Some(&old_chain), metrics)?;
+        self.write_all_table_rows(&kept_rows, Some(&old_chain), metrics)?;
 
-        let num_rows = rows_len - filtered_rows.len();
+        let num_rows = rows_len - kept_rows.len();
 
         if let Some(m) = metrics {
             m.rows_modified = num_rows;
@@ -4764,5 +4790,168 @@ mod tests {
         }
 
         cleanup("test_duplicate_non_pk");
+    }
+
+    #[test]
+    fn test_delete_updates_index() {
+        cleanup("test_delete_updates_index");
+        let mut executor = create_test_executor("test_delete_updates_index");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        for i in 1..=5 {
+            executor
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text(format!("user_{}", i))],
+                    },
+                    &mut None,
+                )
+                .unwrap();
+        }
+
+        // delete row with id = 3
+        executor
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(3))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // index lookup for deleted key should return nothing
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(3))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            _ => panic!("expected rows"),
+        }
+
+        // other keys should still be findable via index
+        for i in [1, 2, 4, 5] {
+            let result = executor
+                .execute(
+                    Statement::Select {
+                        table_name: "users".to_string(),
+                        columns: SelectColumns::All,
+                        where_clause: Some(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Integer(i))),
+                        }),
+                    },
+                    &mut None,
+                )
+                .unwrap();
+
+            match result {
+                ExecutionResult::Rows { rows, .. } => {
+                    assert_eq!(rows.len(), 1, "key {} should still exist", i);
+                }
+                _ => panic!("expected rows"),
+            }
+        }
+
+        cleanup("test_delete_updates_index");
+    }
+
+    #[test]
+    fn test_delete_all_rows_clears_index() {
+        cleanup("test_delete_all_clears_index");
+        let mut executor = create_test_executor("test_delete_all_clears_index");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        for i in 1..=3 {
+            executor
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i), Value::Text(format!("user_{}", i))],
+                    },
+                    &mut None,
+                )
+                .unwrap();
+        }
+
+        // delete all rows
+        executor
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // all index lookups should return empty
+        for i in 1..=3 {
+            let result = executor
+                .execute(
+                    Statement::Select {
+                        table_name: "users".to_string(),
+                        columns: SelectColumns::All,
+                        where_clause: Some(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Integer(i))),
+                        }),
+                    },
+                    &mut None,
+                )
+                .unwrap();
+
+            match result {
+                ExecutionResult::Rows { rows, .. } => {
+                    assert_eq!(rows.len(), 0, "key {} should be gone", i);
+                }
+                _ => panic!("expected rows"),
+            }
+        }
+
+        cleanup("test_delete_all_clears_index");
     }
 }

@@ -201,4 +201,17 @@ impl Database {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
         btree.search(key, page_manager)
     }
+
+    pub fn delete_from_index(&mut self, index_name: &str, key: &IndexKey) -> io::Result<()> {
+        let Database {
+            indexes,
+            page_manager,
+            ..
+        } = self;
+
+        let btree = indexes
+            .get_mut(index_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
+        btree.delete(key, page_manager)
+    }
 }
