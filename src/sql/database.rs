@@ -164,6 +164,15 @@ impl Database {
             .remove_table_indexes(table_name, &mut self.page_manager)
     }
 
+    pub fn get_table_last_page(&self, table_name: &str) -> Option<PageId> {
+        self.table_catalog.get_last_page(table_name)
+    }
+
+    pub fn update_table_last_page(&mut self, table_name: &str, page_id: PageId) -> io::Result<()> {
+        self.table_catalog
+            .update_last_page(table_name, page_id, &mut self.page_manager)
+    }
+
     // Indexes
     pub fn insert_into_index(
         &mut self,

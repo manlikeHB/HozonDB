@@ -227,7 +227,7 @@ impl Executor {
         values: Vec<Value>,
         metrics: &mut Option<QueryMetrics>,
     ) -> io::Result<ExecutionResult> {
-        let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
+        let (_, columns) = self.get_table_first_page_and_cols(&table_name)?;
         let columns = columns.to_vec();
 
         // Validate value count
@@ -295,10 +295,19 @@ impl Executor {
         }
 
         // get last page
-        let last_page = self.get_last_page(first_page)?;
+        let last_page = self
+            .database
+            .get_table_last_page(&table_name)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    format!("Last page for {} not found", &table_name),
+                )
+            })?;
 
         // insert row
-        let (row_page_id, slot) = self.insert_row_into_page(last_page, &values, metrics)?;
+        let (row_page_id, slot) =
+            self.insert_row_into_page(&table_name, last_page, &values, metrics)?;
         // Index new row if table was indexed
         let row_location = RowLocation::new(row_page_id, slot);
         self.index_new_row(&index_entries, &value_and_col_pairs, row_location)?;
@@ -314,6 +323,7 @@ impl Executor {
 
     fn insert_row_into_page(
         &mut self,
+        table_name: &str,
         last_page: PageId,
         values: &[Value],
         metrics: &mut Option<QueryMetrics>,
@@ -399,24 +409,13 @@ impl Executor {
                 m.pages_written += 1;
             }
 
+            // update table's last page
+            self.database.update_table_last_page(table_name, new_page)?;
+
             (new_page, new_page_meta.slot_count - 1)
         };
 
         Ok((row_page_id, slot))
-    }
-
-    fn get_last_page(&self, page_id: PageId) -> io::Result<PageId> {
-        //TODO: cache last page ID per table so the page-finding loop will no longer be needed
-        let mut last_page = page_id;
-        loop {
-            let page_meta = self.database.read_page_metadata(last_page)?;
-            match page_meta.next_page {
-                Some(next_page) => last_page = next_page,
-                None => break,
-            }
-        }
-
-        Ok(last_page)
     }
 
     fn index_new_row(
@@ -635,6 +634,7 @@ impl Executor {
     // needed to pack live rows together, reset free_space_start/free_space_end,
     // and return fully-dead pages to the free list. Without this, repeated
     // deletes gradually waste page space permanently.
+    // TODO: update tables last page when table is compacted
     fn execute_delete(
         &mut self,
         table_name: String,
@@ -739,7 +739,15 @@ impl Executor {
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
         // get last page
-        let last_page = self.get_last_page(first_page)?;
+        let last_page = self
+            .database
+            .get_table_last_page(&table_name)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    format!("Last page for {} not found", &table_name),
+                )
+            })?;
 
         // Validate assignments (column exists + type matches)
         for (col_name, value) in &assignments {
@@ -857,8 +865,12 @@ impl Executor {
                     self.index_new_row(&index_entries, &new_value_and_col_pairs, loc)?;
                 } else {
                     // insert updated row as new row
-                    let (row_page_id, slot) =
-                        self.insert_row_into_page(last_page, &updated_row.values(), metrics)?;
+                    let (row_page_id, slot) = self.insert_row_into_page(
+                        &table_name,
+                        last_page,
+                        &updated_row.values(),
+                        metrics,
+                    )?;
                     // index new row
                     let row_location = RowLocation::new(row_page_id, slot);
                     self.index_new_row(&index_entries, &new_value_and_col_pairs, row_location)?;
@@ -5236,4 +5248,7 @@ mod tests {
 
         cleanup("test_update_index_new_slot");
     }
+
+    #[test]
+    fn test_table_last_page() {}
 }

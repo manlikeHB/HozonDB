@@ -1,20 +1,29 @@
 use crate::catalog::schema::Schema;
-use crate::constants;
+use crate::constants::{self, PageId};
 use crate::storage::page::{PAGE_SIZE, PageManager};
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 pub struct TableMetadata {
     schema: Schema,
-    first_page: u32,
+    first_page: PageId,
+    last_page: PageId,
 }
 
 impl TableMetadata {
-    pub fn first_page(&self) -> u32 {
+    pub fn first_page(&self) -> PageId {
         self.first_page
+    }
+
+    pub fn last_page(&self) -> PageId {
+        self.last_page
     }
 
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    pub fn update_last_page(&mut self, page_id: PageId) {
+        self.last_page = page_id
     }
 }
 
@@ -79,7 +88,26 @@ impl TableCatalog {
             ]);
             offset += 4;
 
-            let table_metadata = TableMetadata { schema, first_page };
+            if catalog_data.len() < offset + 4 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Not enough bytes for last page".to_string(),
+                ));
+            }
+
+            let last_page = u32::from_le_bytes([
+                catalog_data[offset],
+                catalog_data[offset + 1],
+                catalog_data[offset + 2],
+                catalog_data[offset + 3],
+            ]);
+            offset += 4;
+
+            let table_metadata = TableMetadata {
+                schema,
+                first_page,
+                last_page,
+            };
 
             tables.insert(
                 table_metadata.schema.table_name().to_string(),
@@ -99,7 +127,11 @@ impl TableCatalog {
         let first_page = page_manager.allocate_page()?;
 
         let table_name = schema.table_name().to_string();
-        let table_metadata = TableMetadata { schema, first_page };
+        let table_metadata = TableMetadata {
+            schema,
+            first_page,
+            last_page: first_page,
+        };
 
         self.tables.insert(table_name, table_metadata);
 
@@ -136,6 +168,9 @@ impl TableCatalog {
 
             // first page
             bytes.extend_from_slice(&metadata.first_page.to_le_bytes());
+
+            // last page
+            bytes.extend_from_slice(&metadata.last_page.to_le_bytes());
         }
 
         bytes
@@ -162,6 +197,24 @@ impl TableCatalog {
                 ));
             }
         }
+    }
+
+    pub fn update_last_page(
+        &mut self,
+        table_name: &str,
+        page_id: PageId,
+        page_manager: &mut PageManager,
+    ) -> io::Result<()> {
+        if let Some(meta) = self.tables.get_mut(table_name) {
+            meta.update_last_page(page_id);
+        }
+
+        self.save(page_manager)?;
+        Ok(())
+    }
+
+    pub fn get_last_page(&self, table_name: &str) -> Option<PageId> {
+        self.tables.get(table_name).map(|meta| meta.last_page())
     }
 }
 
@@ -208,6 +261,9 @@ mod tests {
 
         assert_eq!(catalog.tables.len(), 1);
         assert!(catalog.tables.contains_key("users"));
+        // check fist page and last page is same for new table
+        let table_meta = catalog.tables.get("users").unwrap();
+        assert_eq!(table_meta.first_page(), table_meta.last_page());
 
         cleanup("test_single");
     }
@@ -578,5 +634,67 @@ mod tests {
         assert!(result.is_err()); // Should return error
 
         cleanup("test_drop_none");
+    }
+
+    #[test]
+    fn test_table_first_and_last_name_persists() {
+        cleanup("test_table_first_and_last_name_persists");
+
+        {
+            let mut pm = PageManager::new("test_table_first_and_last_name_persists.hdb").unwrap();
+            let mut catalog = TableCatalog::new(&mut pm).unwrap();
+
+            catalog
+                .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
+                .unwrap();
+
+            let table_meta = catalog.tables.get("users").unwrap();
+            assert_eq!(table_meta.first_page(), table_meta.last_page());
+        }
+
+        // Reload and verify drop persisted
+        {
+            let mut pm = PageManager::new("test_table_first_and_last_name_persists.hdb").unwrap();
+            let catalog = TableCatalog::new(&mut pm).unwrap();
+
+            let table_meta = catalog.tables.get("users").unwrap();
+            assert_eq!(table_meta.first_page(), table_meta.last_page());
+        }
+
+        cleanup("test_table_first_and_last_name_persists");
+    }
+
+    #[test]
+    fn test_update_table_last_page_persists() {
+        cleanup("test_update_table_last_page");
+        let new_last_page = 128;
+
+        {
+            let mut pm = PageManager::new("test_update_table_last_page.hdb").unwrap();
+            let mut catalog = TableCatalog::new(&mut pm).unwrap();
+
+            catalog
+                .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
+                .unwrap();
+
+            let table_meta = catalog.tables.get("users").unwrap();
+            assert_eq!(table_meta.first_page(), table_meta.last_page());
+
+            // update last page
+            catalog
+                .update_last_page("users", new_last_page, &mut pm)
+                .unwrap();
+            assert_eq!(catalog.get_last_page("users").unwrap(), new_last_page);
+        }
+
+        // Reload and verify drop persisted
+        {
+            let mut pm = PageManager::new("test_update_table_last_page.hdb").unwrap();
+            let catalog = TableCatalog::new(&mut pm).unwrap();
+
+            assert_eq!(catalog.get_last_page("users").unwrap(), new_last_page);
+        }
+
+        cleanup("test_update_table_last_page");
     }
 }
