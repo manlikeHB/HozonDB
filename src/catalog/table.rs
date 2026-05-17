@@ -1,6 +1,6 @@
 use crate::catalog::schema::Schema;
 use crate::constants;
-use crate::storage::page::PageManager;
+use crate::storage::page::{PAGE_SIZE, PageManager};
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 pub struct TableMetadata {
@@ -111,6 +111,15 @@ impl TableCatalog {
 
     pub fn save(&mut self, page_manager: &mut PageManager) -> io::Result<()> {
         let bytes = self.to_bytes();
+
+        // TODO: catalog is limited to a single 4KB page. Needs multi-page catalog
+        // support with a page chain, similar to how table data pages are chained.
+        if bytes.len() > PAGE_SIZE {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "catalog exceeds page size limit",
+            ));
+        }
         page_manager.write_page(constants::TABLE_CATALOG_PAGE_ID, &bytes)?;
         Ok(())
     }
