@@ -18,7 +18,6 @@ pub struct BenchmarkResult {
 }
 
 impl<'a> BenchmarkRunner<'a> {
-    // Creates a new benchmark runner with a temporary table
     pub fn new(executor: &'a mut Executor, num_rows: usize) -> Self {
         let temp_table_name = format!(
             "benchmark_temp_{}",
@@ -35,32 +34,33 @@ impl<'a> BenchmarkRunner<'a> {
         }
     }
 
-    // Sets up the temporary table and inserts test data
     pub fn setup(&mut self) -> io::Result<()> {
-        // Create table with schema: (id INTEGER, name TEXT, age INTEGER)
         let columns = vec![
             Column::new("id", DataType::Integer, true),
             Column::new("name", DataType::Text, false),
             Column::new("age", DataType::Integer, false),
         ];
-        let create_stm = Statement::CreateTable {
-            name: self.temp_table_name.clone(),
-            columns,
-        };
-        self.executor.execute(create_stm, &mut None)?;
+        self.executor.execute(
+            Statement::CreateTable {
+                name: self.temp_table_name.clone(),
+                columns,
+            },
+            &mut None,
+        )?;
 
-        // Insert num_rows rows with test data
         for i in 1..=self.num_rows {
             let values = vec![
                 Value::Integer(i as i32),
                 Value::Text(format!("Name{}", i)),
                 Value::Integer((20 + (i % 30)) as i32),
             ];
-            let insert_stm = Statement::Insert {
-                table_name: self.temp_table_name.clone(),
-                values,
-            };
-            self.executor.execute(insert_stm, &mut None)?;
+            self.executor.execute(
+                Statement::Insert {
+                    table_name: self.temp_table_name.clone(),
+                    values,
+                },
+                &mut None,
+            )?;
 
             if i % 10000 == 0 {
                 println!("Inserted {} rows...", i);
@@ -70,45 +70,51 @@ impl<'a> BenchmarkRunner<'a> {
         Ok(())
     }
 
-    // Cleans up by dropping the temporary table
     pub fn cleanup(&mut self) -> io::Result<()> {
-        let stm = Statement::DropTable {
-            name: self.temp_table_name.clone(),
-        };
-
-        self.executor.execute(stm, &mut None)?;
+        self.executor.execute(
+            Statement::DropTable {
+                name: self.temp_table_name.clone(),
+            },
+            &mut None,
+        )?;
         Ok(())
     }
 
-    // Runs all benchmarks and returns results
     pub fn run_all_benchmarks(&mut self) -> io::Result<Vec<BenchmarkResult>> {
         let mut results = Vec::new();
 
-        // READ benchmarks
+        // READ benchmarks — no WHERE clause
         results.push(self.benchmark_select_full_scan()?);
-        results.push(self.benchmark_select_first()?);
-        results.push(self.benchmark_select_middle()?);
-        results.push(self.benchmark_select_last()?);
-        results.push(self.benchmark_select_nonexistent()?);
+
+        // READ benchmarks — indexed (WHERE on primary key)
+        results.push(self.benchmark_select_by_id("SELECT idx seek (first)", 1)?);
+        results.push(self.benchmark_select_by_id("SELECT idx seek (middle)", self.num_rows / 2)?);
+        results.push(self.benchmark_select_by_id("SELECT idx seek (last)", self.num_rows)?);
+        results.push(self.benchmark_select_by_id("SELECT idx seek (missing)", self.num_rows + 1)?);
+
+        // READ benchmarks — non-indexed (WHERE on age, full scan)
+        results.push(self.benchmark_select_by_age("SELECT scan by age=25", 25)?);
+        results.push(self.benchmark_select_by_age("SELECT scan by age=49", 49)?);
 
         // WRITE benchmarks
         results.push(self.benchmark_insert_single()?);
-        results.push(self.benchmark_update_single()?);
+        results.push(self.benchmark_update_inplace()?);
+        results.push(self.benchmark_update_new_slot()?);
         results.push(self.benchmark_update_bulk()?);
-        // Bulk delete benchmark coming before single delete to avoid conflicts,
-        // while 10% is deleted from the start, a single row is deleted from the end
+        // bulk delete before single to avoid id conflicts
         results.push(self.benchmark_delete_bulk()?);
         results.push(self.benchmark_delete_single()?);
 
         Ok(results)
     }
 
-    fn benchmark_select(
+    // SELECT WHERE id = value (uses index seek)
+    fn benchmark_select_by_id(
         &mut self,
-        metrics: &mut Option<QueryMetrics>,
+        label: &str,
         id_value: usize,
-    ) -> io::Result<usize> {
-        // SELECT * FROM temp_table WHERE id = id_value;
+    ) -> io::Result<BenchmarkResult> {
+        let mut metrics = Some(QueryMetrics::new());
 
         let stm = Statement::Select {
             table_name: self.temp_table_name.clone(),
@@ -120,67 +126,52 @@ impl<'a> BenchmarkRunner<'a> {
             }),
         };
 
-        let result = self.executor.execute(stm, metrics)?;
-
+        let result = self.executor.execute(stm, &mut metrics)?;
         let rows_affected = match result {
             ExecutionResult::Rows { rows, .. } => rows.len(),
             _ => 0,
         };
 
-        Ok(rows_affected)
-    }
-
-    fn benchmark_select_first(&mut self) -> io::Result<BenchmarkResult> {
-        // SELECT * FROM temp_table WHERE id = 1;
-
-        let mut metrics = Some(QueryMetrics::new());
-        let rows_affected = self.benchmark_select(&mut metrics, 1)?;
-
         Ok(BenchmarkResult {
-            operation: "SELECT (first row)".to_string(),
+            operation: label.to_string(),
             metrics: metrics.unwrap(),
             rows_affected,
         })
     }
 
-    fn benchmark_select_middle(&mut self) -> io::Result<BenchmarkResult> {
-        // SELECT * FROM temp_table WHERE id = (num_rows / 2);
+    // SELECT WHERE age = value (non-indexed, forces full scan)
+    fn benchmark_select_by_age(
+        &mut self,
+        label: &str,
+        age_value: i32,
+    ) -> io::Result<BenchmarkResult> {
         let mut metrics = Some(QueryMetrics::new());
-        let rows_affected = self.benchmark_select(&mut metrics, self.num_rows / 2)?;
+
+        let stm = Statement::Select {
+            table_name: self.temp_table_name.clone(),
+            columns: SelectColumns::All,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column("age".to_string())),
+                op: BinaryOperator::Equals,
+                right: Box::new(Expr::Literal(Value::Integer(age_value))),
+            }),
+        };
+
+        let result = self.executor.execute(stm, &mut metrics)?;
+        let rows_affected = match result {
+            ExecutionResult::Rows { rows, .. } => rows.len(),
+            _ => 0,
+        };
 
         Ok(BenchmarkResult {
-            operation: "SELECT (middle row)".to_string(),
-            metrics: metrics.unwrap(),
-            rows_affected,
-        })
-    }
-
-    fn benchmark_select_last(&mut self) -> io::Result<BenchmarkResult> {
-        // SELECT * FROM temp_table WHERE id = num_rows;
-        let mut metrics = Some(QueryMetrics::new());
-        let rows_affected = self.benchmark_select(&mut metrics, self.num_rows)?;
-
-        Ok(BenchmarkResult {
-            operation: "SELECT (last row)".to_string(),
-            metrics: metrics.unwrap(),
-            rows_affected,
-        })
-    }
-
-    fn benchmark_select_nonexistent(&mut self) -> io::Result<BenchmarkResult> {
-        // SELECT * FROM temp_table WHERE id = (num_rows + 1);
-        let mut metrics = Some(QueryMetrics::new());
-        let rows_affected = self.benchmark_select(&mut metrics, self.num_rows + 1)?;
-
-        Ok(BenchmarkResult {
-            operation: "SELECT (non-existent row)".to_string(),
+            operation: label.to_string(),
             metrics: metrics.unwrap(),
             rows_affected,
         })
     }
 
     fn benchmark_select_full_scan(&mut self) -> io::Result<BenchmarkResult> {
-        // SELECT * FROM temp_table;
+        let mut metrics = Some(QueryMetrics::new());
 
         let stm = Statement::Select {
             table_name: self.temp_table_name.clone(),
@@ -188,23 +179,21 @@ impl<'a> BenchmarkRunner<'a> {
             where_clause: None,
         };
 
-        let mut metrics = Some(QueryMetrics::new());
         let result = self.executor.execute(stm, &mut metrics)?;
-
         let rows_affected = match result {
             ExecutionResult::Rows { rows, .. } => rows.len(),
             _ => 0,
         };
 
         Ok(BenchmarkResult {
-            operation: "SELECT (full table scan)".to_string(),
+            operation: "SELECT full scan".to_string(),
             metrics: metrics.unwrap(),
             rows_affected,
         })
     }
 
-    fn benchmark_update_single(&mut self) -> io::Result<BenchmarkResult> {
-        // UPDATE temp_table SET age = age + 1 WHERE id = 1;
+    // UPDATE in-place — new value same size as old (age column, integer)
+    fn benchmark_update_inplace(&mut self) -> io::Result<BenchmarkResult> {
         let mut metrics = Some(QueryMetrics::new());
 
         let stm = Statement::Update {
@@ -218,11 +207,36 @@ impl<'a> BenchmarkRunner<'a> {
         };
 
         let _ = self.executor.execute(stm, &mut metrics)?;
-
         let rows_affected = metrics.as_ref().unwrap().rows_modified;
 
         Ok(BenchmarkResult {
-            operation: "UPDATE (single row)".to_string(),
+            operation: "UPDATE (fits slot)".to_string(),
+            metrics: metrics.unwrap(),
+            rows_affected,
+        })
+    }
+
+    // UPDATE new slot — new value larger than old (name column, short → long text)
+    fn benchmark_update_new_slot(&mut self) -> io::Result<BenchmarkResult> {
+        let mut metrics = Some(QueryMetrics::new());
+
+        // "Name2" is ~5 chars, replacing with 200-char string forces new slot
+        let long_name = "X".repeat(200);
+        let stm = Statement::Update {
+            table_name: self.temp_table_name.clone(),
+            assignments: vec![("name".to_string(), Value::Text(long_name))],
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column("id".to_string())),
+                op: BinaryOperator::Equals,
+                right: Box::new(Expr::Literal(Value::Integer(2))),
+            }),
+        };
+
+        let _ = self.executor.execute(stm, &mut metrics)?;
+        let rows_affected = metrics.as_ref().unwrap().rows_modified;
+
+        Ok(BenchmarkResult {
+            operation: "UPDATE (exceeds slot)".to_string(),
             metrics: metrics.unwrap(),
             rows_affected,
         })
@@ -230,8 +244,7 @@ impl<'a> BenchmarkRunner<'a> {
 
     fn benchmark_update_bulk(&mut self) -> io::Result<BenchmarkResult> {
         let mut metrics = Some(QueryMetrics::new());
-
-        let bulk_val = self.num_rows / 10; // Update 10% of rows
+        let bulk_val = self.num_rows / 10;
 
         let stm = Statement::Update {
             table_name: self.temp_table_name.clone(),
@@ -244,18 +257,16 @@ impl<'a> BenchmarkRunner<'a> {
         };
 
         let _ = self.executor.execute(stm, &mut metrics)?;
-
         let rows_affected = metrics.as_ref().unwrap().rows_modified;
 
         Ok(BenchmarkResult {
-            operation: "UPDATE (bulk rows - 10%)".to_string(),
+            operation: "UPDATE bulk in-place 10%".to_string(),
             metrics: metrics.unwrap(),
             rows_affected,
         })
     }
 
     fn benchmark_delete_single(&mut self) -> io::Result<BenchmarkResult> {
-        // DELETE FROM temp_table WHERE id = 1;
         let mut metrics = Some(QueryMetrics::new());
 
         let stm = Statement::Delete {
@@ -268,7 +279,6 @@ impl<'a> BenchmarkRunner<'a> {
         };
 
         let _ = self.executor.execute(stm, &mut metrics)?;
-
         let rows_affected = metrics.as_ref().unwrap().rows_modified;
 
         Ok(BenchmarkResult {
@@ -280,8 +290,7 @@ impl<'a> BenchmarkRunner<'a> {
 
     fn benchmark_delete_bulk(&mut self) -> io::Result<BenchmarkResult> {
         let mut metrics = Some(QueryMetrics::new());
-
-        let bulk_val = self.num_rows / 10; // Delete 10% of rows
+        let bulk_val = self.num_rows / 10;
 
         let stm = Statement::Delete {
             table_name: self.temp_table_name.clone(),
@@ -293,11 +302,10 @@ impl<'a> BenchmarkRunner<'a> {
         };
 
         let _ = self.executor.execute(stm, &mut metrics)?;
-
         let rows_affected = metrics.as_ref().unwrap().rows_modified;
 
         Ok(BenchmarkResult {
-            operation: "DELETE (bulk rows - 10%)".to_string(),
+            operation: "DELETE bulk 10%".to_string(),
             metrics: metrics.unwrap(),
             rows_affected,
         })
@@ -309,18 +317,17 @@ impl<'a> BenchmarkRunner<'a> {
         let stmt = Statement::Insert {
             table_name: self.temp_table_name.clone(),
             values: vec![
-                Value::Integer(self.num_rows as i32 + 1), // New ID
+                Value::Integer(self.num_rows as i32 + 1),
                 Value::Text("NewUser".to_string()),
                 Value::Integer(25),
             ],
         };
 
         let _ = self.executor.execute(stmt, &mut metrics)?;
-
         let rows_affected = metrics.as_ref().unwrap().rows_modified;
 
         Ok(BenchmarkResult {
-            operation: "INSERT (1 row)".to_string(),
+            operation: "INSERT (single row)".to_string(),
             metrics: metrics.unwrap(),
             rows_affected,
         })
