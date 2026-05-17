@@ -3,9 +3,16 @@ use crate::{
     catalog::index::IndexEntry,
     constants::PageId,
     index::{key::IndexKey, node::leaf::RowLocation},
-    sql::database::Database,
+    sql::{
+        database::Database,
+        executor::evaluator::evaluate_expr,
+        parser::{BinaryOperator, Expr},
+    },
 };
-use std::io::{self, Error, ErrorKind};
+use std::{
+    collections::HashMap,
+    io::{self, Error, ErrorKind},
+};
 
 use crate::{
     catalog::{
@@ -72,7 +79,7 @@ pub fn read_all_table_rows(
 
         // track rows scanned
         if let Some(m) = metrics.as_mut() {
-            m.rows_scanned += rows.len();
+            m.rows_scanned += rows_and_slot.len();
         }
         let mut new_rows = rows_and_slot.into_iter().map(|(row, _)| row).collect();
         rows.append(&mut new_rows);
@@ -87,7 +94,7 @@ pub fn read_all_table_rows(
     Ok(rows)
 }
 
-pub fn scan_table_with_locations(
+fn scan_table_with_locations(
     pm: &PageManager,
     first_page: u32,
     metrics: &mut Option<QueryMetrics>,
@@ -319,4 +326,124 @@ pub fn validate_value_type(value: &Value, data_type: &DataType) -> bool {
         (Value::Null, _) => true, // NULL can go in any column
         _ => false,
     }
+}
+
+pub fn resolve_rows(
+    db: &mut Database,
+    table_name: &str,
+    first_page: u32,
+    where_clause: &Option<Expr>,
+    column_names: &[String],
+    metrics: &mut Option<QueryMetrics>,
+) -> io::Result<Vec<(Row, RowLocation)>> {
+    let mut filtered_rows_and_loc = Vec::new();
+
+    // try index seek first
+    let index_used = if let Some(Expr::BinaryOp { left, op, right }) = &where_clause {
+        if let (Expr::Column(col), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+            if let Some(entry) = db
+                .get_indexes_for_table(table_name)
+                .and_then(|entries| entries.iter().find(|e| e.column_name() == col))
+                .cloned()
+            {
+                let key = IndexKey::try_from(val.clone())?;
+                // cache already read pages, to avoid multiple reads from same page
+                let mut page_cache: HashMap<PageId, [u8; PAGE_SIZE]> = HashMap::new();
+
+                match op {
+                    BinaryOperator::Equals => {
+                        // point lookup
+                        match db.search_index(entry.index_name(), &key)? {
+                            Some(loc) => {
+                                let row = read_row_at_location(db.pm(), loc)?;
+                                filtered_rows_and_loc.push((row, loc));
+                                if let Some(m) = metrics.as_mut() {
+                                    m.pages_read += 1;
+                                    m.rows_scanned += 1;
+                                }
+                            }
+                            None => {}
+                        }
+                        true
+                    }
+                    BinaryOperator::LessThan | BinaryOperator::LessOrEqual => {
+                        // range scan — end bound only
+                        let locations =
+                            db.range_index_scan(entry.index_name(), None, Some(&key), op)?;
+                        for loc in locations {
+                            let row = read_row_with_cache(db.pm(), loc, &mut page_cache)?;
+                            if let Some(m) = metrics.as_mut() {
+                                m.pages_read = page_cache.len();
+                                m.rows_scanned += 1;
+                            }
+                            filtered_rows_and_loc.push((row, loc));
+                        }
+                        true
+                    }
+                    BinaryOperator::GreaterThan | BinaryOperator::GreaterOrEqual => {
+                        // range scan — start bound only
+                        let locations =
+                            db.range_index_scan(entry.index_name(), Some(&key), None, op)?;
+                        for loc in locations {
+                            let row = read_row_with_cache(db.pm(), loc, &mut page_cache)?;
+                            if let Some(m) = metrics.as_mut() {
+                                m.pages_read = page_cache.len();
+                                m.rows_scanned += 1;
+                            }
+                            filtered_rows_and_loc.push((row, loc));
+                        }
+                        true
+                    }
+                    _ => false, // AND, OR, NotEquals — fall through to full scan
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // fall back to full scan if index not used
+    if !index_used {
+        let rows_and_loc = scan_table_with_locations(db.pm(), first_page, metrics)?;
+        for (row, loc) in rows_and_loc {
+            let matches = if let Some(expr) = where_clause {
+                match evaluate_expr(expr, &row, column_names) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        eprintln!("Warning: Error evaluating WHERE clause: {}", e);
+                        false
+                    }
+                }
+            } else {
+                true // no WHERE = include all
+            };
+            if matches {
+                filtered_rows_and_loc.push((row, loc));
+            }
+        }
+    }
+
+    Ok(filtered_rows_and_loc)
+}
+
+pub fn read_row_with_cache(
+    pm: &mut PageManager,
+    loc: RowLocation,
+    page_cache: &mut HashMap<PageId, [u8; PAGE_SIZE]>,
+) -> io::Result<Row> {
+    if !page_cache.contains_key(&loc.page_id()) {
+        let page_data = pm.read_page(loc.page_id())?;
+        page_cache.insert(loc.page_id(), page_data);
+    }
+
+    let page_data = page_cache.get(&loc.page_id()).unwrap();
+    let (row_offset, row_length) = PageManager::read_slot(page_data, loc.slot());
+    let (row, _) =
+        Row::from_bytes(&page_data[row_offset as usize..(row_offset + row_length) as usize])?;
+
+    Ok(row)
 }

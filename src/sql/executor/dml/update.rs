@@ -6,10 +6,9 @@ use crate::{
         database::Database,
         executor::{
             ExecutionResult,
-            evaluator::evaluate_expr,
             helpers::{
                 delete_indexes, get_table_first_page_and_cols, index_new_row, insert_row_into_page,
-                scan_table_with_locations, validate_value_type,
+                resolve_rows, validate_value_type,
             },
         },
     },
@@ -80,7 +79,14 @@ pub fn execute_update(
         }
     }
 
-    let rows_and_locs = scan_table_with_locations(db.pm(), first_page, metrics)?;
+    let rows_and_locs = resolve_rows(
+        db,
+        &table_name,
+        first_page,
+        &where_clause,
+        &all_column_names,
+        metrics,
+    )?;
 
     // Check if table is empty
     if rows_and_locs.len() == 0 {
@@ -94,107 +100,84 @@ pub fn execute_update(
         .map(|e| e.to_vec())
         .unwrap_or_default();
 
-    // TODO: if WHERE clause is on an indexed column, use index seek instead of
-    // full table scan. Look up RowLocation directly from the B+ tree and jump
-    // to the exact page/slot — avoids scanning the entire table.
-
     // Update rows based on WHERE clause
     let mut updated_count = 0;
     let mut dirty_pages: HashMap<PageId, [u8; PAGE_SIZE]> = HashMap::new();
     let mut deleted_rows = Vec::new();
     for (row, loc) in rows_and_locs {
-        let should_update = if let Some(ref expr) = where_clause {
-            match evaluate_expr(expr, &row, &all_column_names) {
-                Ok(true) => true,
-                Ok(false) => false,
-                Err(e) => {
-                    eprintln!("Warning: Error evaluating WHERE clause: {}", e);
-                    false
-                }
+        let mut updated_values = row.values().clone();
+
+        // Apply assignments
+        for (col_name, val) in &assignments {
+            if let Some(index) = all_column_names.iter().position(|c| c == col_name) {
+                updated_values[index] = val.clone();
             }
+        }
+
+        updated_count += 1;
+        let updated_row = Row::new(updated_values);
+
+        let old_value_and_col_pairs: Vec<(&Value, &Column)> =
+            row.values().iter().zip(columns.iter()).collect();
+        let new_value_and_col_pairs: Vec<(&Value, &Column)> =
+            updated_row.values().iter().zip(columns.iter()).collect();
+
+        let old_bytes = row.to_bytes();
+        let new_bytes = updated_row.to_bytes();
+
+        // if updated row fit previous space, write into old location else re-insert
+        if new_bytes.len() <= old_bytes.len() {
+            if !dirty_pages.contains_key(&loc.page_id()) {
+                let page_data = db.read_page(loc.page_id())?;
+
+                dirty_pages.insert(loc.page_id(), page_data);
+            }
+
+            if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
+                let (row_offset, _) = PageManager::read_slot(page_data, loc.slot());
+
+                // write new row
+                page_data[row_offset as usize..row_offset as usize + new_bytes.len()]
+                    .copy_from_slice(&new_bytes);
+
+                // update slot to reflect new row length
+                PageManager::write_slot(page_data, loc.slot(), row_offset, new_bytes.len() as u16);
+            }
+
+            // delete old row index
+            delete_indexes(db, &index_entries, &old_value_and_col_pairs)?;
+            // index row
+            index_new_row(db, &index_entries, &new_value_and_col_pairs, loc)?;
         } else {
-            true // No WHERE = update all
-        };
+            // insert updated row as new row
+            let (row_page_id, slot) =
+                insert_row_into_page(db, &table_name, last_page, &updated_row.values(), metrics)?;
+            // index new row
+            let row_location = RowLocation::new(row_page_id, slot);
+            index_new_row(db, &index_entries, &new_value_and_col_pairs, row_location)?;
 
-        if should_update {
-            let mut updated_values = row.values().clone();
+            // delete old row
+            if !dirty_pages.contains_key(&loc.page_id()) {
+                let page_data = db.read_page(loc.page_id())?;
 
-            // Apply assignments
-            for (col_name, val) in &assignments {
-                if let Some(index) = all_column_names.iter().position(|c| c == col_name) {
-                    updated_values[index] = val.clone();
-                }
+                dirty_pages.insert(loc.page_id(), page_data);
             }
 
-            updated_count += 1;
-            let updated_row = Row::new(updated_values);
-
-            let old_value_and_col_pairs: Vec<(&Value, &Column)> =
-                row.values().iter().zip(columns.iter()).collect();
-            let new_value_and_col_pairs: Vec<(&Value, &Column)> =
-                updated_row.values().iter().zip(columns.iter()).collect();
-
-            // if updated row fit previous space, write into old location else re-insert
-            if updated_row.to_bytes().len() <= row.to_bytes().len() {
-                if !dirty_pages.contains_key(&loc.page_id()) {
-                    let page_data = db.read_page(loc.page_id())?;
-
-                    dirty_pages.insert(loc.page_id(), page_data);
-                }
-
-                if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
-                    let (row_offset, _) = PageManager::read_slot(page_data, loc.slot());
-
-                    let new_bytes = updated_row.to_bytes();
-                    // write new row
-                    page_data[row_offset as usize..row_offset as usize + new_bytes.len()]
-                        .copy_from_slice(&new_bytes);
-
-                    // update slot to reflect new row length
-                    PageManager::write_slot(
-                        page_data,
-                        loc.slot(),
-                        row_offset,
-                        new_bytes.len() as u16,
-                    );
-                }
-
-                // delete old row index
-                delete_indexes(db, &index_entries, &old_value_and_col_pairs)?;
-                // index row
-                index_new_row(db, &index_entries, &new_value_and_col_pairs, loc)?;
-            } else {
-                // insert updated row as new row
-                let (row_page_id, slot) = insert_row_into_page(
-                    db,
-                    &table_name,
-                    last_page,
-                    &updated_row.values(),
-                    metrics,
-                )?;
-                // index new row
-                let row_location = RowLocation::new(row_page_id, slot);
-                index_new_row(db, &index_entries, &new_value_and_col_pairs, row_location)?;
-
-                // delete old row
-                if !dirty_pages.contains_key(&loc.page_id()) {
-                    let page_data = db.read_page(loc.page_id())?;
-
-                    dirty_pages.insert(loc.page_id(), page_data);
-                }
-
-                if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
-                    PageManager::mark_slot_dead(page_data, loc.slot());
-                }
-                // collect old row to be freed if indexed
-                deleted_rows.push(row);
+            if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
+                PageManager::mark_slot_dead(page_data, loc.slot());
             }
-        };
+            // collect old row to be freed if indexed
+            deleted_rows.push(row);
+        }
     }
 
     // write update pages to disk
     for (page_id, page_data) in &dirty_pages {
         db.write_page(*page_id, page_data)?;
+
+        if let Some(metrics) = metrics {
+            metrics.pages_written += 1;
+        }
     }
 
     // delete indexed keys for deleted rows

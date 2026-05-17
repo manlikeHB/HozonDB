@@ -11,6 +11,7 @@ use crate::{
     },
     constants::PageId,
     index::{btree::BPlusTree, key::IndexKey, node::leaf::RowLocation},
+    sql::parser::BinaryOperator,
     storage::page::{PageManager, PageMetadata},
 };
 
@@ -227,5 +228,25 @@ impl Database {
             .get_mut(index_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
         btree.delete(key, page_manager)
+    }
+
+    pub fn range_index_scan(
+        &mut self,
+        index_name: &str,
+        start: Option<&IndexKey>,
+        end: Option<&IndexKey>,
+        op: &BinaryOperator,
+    ) -> io::Result<Vec<RowLocation>> {
+        let Database {
+            indexes,
+            page_manager,
+            ..
+        } = self;
+
+        let btree = indexes
+            .get_mut(index_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
+
+        btree.range_scan(start, end, op, page_manager)
     }
 }

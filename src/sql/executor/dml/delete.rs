@@ -5,8 +5,7 @@ use crate::{
         database::Database,
         executor::{
             ExecutionResult,
-            evaluator::evaluate_expr,
-            helpers::{delete_indexes, get_table_first_page_and_cols, scan_table_with_locations},
+            helpers::{delete_indexes, get_table_first_page_and_cols, resolve_rows},
         },
     },
 };
@@ -32,15 +31,21 @@ pub fn execute_delete(
     let (first_page, columns) = get_table_first_page_and_cols(db, &table_name)?;
     let columns = columns.to_vec();
 
-    // get all rows with row location
-    let rows_and_loc = scan_table_with_locations(db.pm(), first_page, metrics)?;
-    let rows_len = rows_and_loc.len();
-
     // Extract column names
     let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
+    // get all rows with row location
+    let rows_and_loc = resolve_rows(
+        db,
+        &table_name,
+        first_page,
+        &where_clause,
+        &all_column_names,
+        metrics,
+    )?;
+
     // check if there are any rows in this table
-    if rows_len == 0 {
+    if rows_and_loc.len() == 0 {
         return Ok(ExecutionResult::Success {
             message: "0 rows deleted".to_string(),
         });
@@ -51,29 +56,15 @@ pub fn execute_delete(
     let mut dirty_pages: HashMap<PageId, [u8; PAGE_SIZE]> = HashMap::new();
 
     for (row, loc) in rows_and_loc {
-        let should_delete = if let Some(ref expr) = where_clause {
-            match evaluate_expr(expr, &row, &all_column_names) {
-                Ok(result) => result,
-                Err(e) => {
-                    eprintln!("Warning: Error evaluating WHERE clause: {}", e);
-                    false
-                }
-            }
-        } else {
-            true
-        }; // no WHERE = delete all
-
-        if should_delete {
-            if !dirty_pages.contains_key(&loc.page_id()) {
-                let page_data = db.read_page(loc.page_id())?;
-                dirty_pages.insert(loc.page_id(), page_data);
-            }
-
-            if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
-                PageManager::mark_slot_dead(page_data, loc.slot());
-            }
-            deleted_rows.push(row);
+        if !dirty_pages.contains_key(&loc.page_id()) {
+            let page_data = db.read_page(loc.page_id())?;
+            dirty_pages.insert(loc.page_id(), page_data);
         }
+
+        if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
+            PageManager::mark_slot_dead(page_data, loc.slot());
+        }
+        deleted_rows.push(row);
     }
 
     // TODO: index deletion happens after pages are written to disk.
@@ -83,6 +74,10 @@ pub fn execute_delete(
     // enabling recovery to a consistent state on crash.
     for (page_id, page_data) in &dirty_pages {
         db.write_page(*page_id, page_data)?;
+
+        if let Some(metrics) = metrics {
+            metrics.pages_written += 1;
+        }
     }
 
     // delete indexed keys

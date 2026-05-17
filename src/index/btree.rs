@@ -12,6 +12,7 @@ use crate::{
             leaf::{LeafEntry, RowLocation},
         },
     },
+    sql::parser::BinaryOperator,
     storage::page::PageManager,
 };
 
@@ -340,6 +341,10 @@ impl BPlusTree {
         })
     }
 
+    // TODO: write_node flushes to disk on every insert/delete.
+    // For bulk operations this causes O(n) disk writes on B+ tree nodes.
+    // A buffer pool that caches dirty nodes and flushes in batches would
+    // dramatically reduce I/O for bulk write operations.
     fn write_node(&mut self, page_id: PageId, node: Node, pm: &mut PageManager) -> io::Result<()> {
         // serialize node
         let node_bytes = node.to_bytes();
@@ -353,7 +358,111 @@ impl BPlusTree {
     pub fn root(&self) -> Option<PageId> {
         self.root
     }
+
+    pub fn range_scan(
+        &mut self,
+        start: Option<&IndexKey>, // None = from beginning
+        end: Option<&IndexKey>,   // None = to end
+        op: &BinaryOperator,      // to know if bounds are inclusive/exclusive
+        pm: &mut PageManager,
+    ) -> io::Result<Vec<RowLocation>> {
+        let mut row_locations = Vec::new();
+
+        if let Some(root_page_id) = self.root() {
+            // if start is None, then we need the first leaf in this tree
+            let start_leaf = match start {
+                Some(key) => {
+                    let (leaf_page_id, _) = self.find_leaf(key, root_page_id, pm)?;
+                    leaf_page_id
+                }
+                None => {
+                    // find left most leaf node
+                    let mut cur = root_page_id;
+
+                    loop {
+                        match self.load_node(cur, pm)? {
+                            Node::Internal(internal) => {
+                                cur = internal.children()[0];
+                            }
+                            Node::Leaf(_) => break,
+                        }
+                    }
+
+                    cur
+                }
+            };
+
+            let mut cur_leaf = start_leaf;
+            let mut done = false;
+
+            // transverse leaves to get row location of the rows that fit
+            loop {
+                match self.load_node(cur_leaf, pm)? {
+                    Node::Leaf(leaf) => {
+                        for entry in leaf.entry() {
+                            let key = entry.get_key();
+
+                            let in_range = match op {
+                                BinaryOperator::LessThan => {
+                                    key < end.ok_or_else(|| {
+                                        Error::new(ErrorKind::InvalidInput, "expected end bound")
+                                    })?
+                                }
+                                BinaryOperator::LessOrEqual => {
+                                    key <= end.ok_or_else(|| {
+                                        Error::new(ErrorKind::InvalidInput, "expected end bound")
+                                    })?
+                                }
+                                BinaryOperator::GreaterThan => {
+                                    key > start.ok_or_else(|| {
+                                        Error::new(ErrorKind::InvalidInput, "expected start bound")
+                                    })?
+                                }
+                                BinaryOperator::GreaterOrEqual => {
+                                    key >= start.ok_or_else(|| {
+                                        Error::new(ErrorKind::InvalidInput, "expected start bound")
+                                    })?
+                                }
+                                _ => unreachable!("range_scan called with non-range operator"),
+                            };
+
+                            if in_range {
+                                row_locations.push(entry.get_row());
+                            } else if matches!(
+                                op,
+                                BinaryOperator::LessThan | BinaryOperator::LessOrEqual
+                            ) {
+                                // if the op is '<' or '<=', since the keys are sorted, that means every other key is '>' the end key
+                                done = true;
+                                break;
+                            }
+                        }
+
+                        if done {
+                            break;
+                        }
+
+                        if let Some(next_leaf_page_id) = leaf.next() {
+                            cur_leaf = next_leaf_page_id;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "expected leaf node during range scan",
+                        ));
+                    }
+                }
+            }
+        };
+
+        Ok(row_locations)
+    }
 }
+
+// return Err(Error::new(ErrorKind::InvalidData, "expected a leaf node"))
 
 #[cfg(test)]
 mod tests {
@@ -378,6 +487,23 @@ mod tests {
     fn cleanup(basename: &str) {
         let _ = fs::remove_file(format!("{}.hdb", basename));
         let _ = fs::remove_file(format!("{}.hdb.lock", basename));
+    }
+
+    fn setup_tree(name: &str, count: i32) -> (BPlusTree, PageManager) {
+        let mut pm = PageManager::new(&format!("{}.hdb", name)).unwrap();
+        let mut btree = BPlusTree::new(4, &mut pm).unwrap();
+
+        for i in 1..=count {
+            btree
+                .insert(
+                    IndexKey::Integer(i),
+                    RowLocation::new(i as u32, i as u16),
+                    &mut pm,
+                )
+                .unwrap();
+        }
+
+        (btree, pm)
     }
 
     #[test]
@@ -953,5 +1079,173 @@ mod tests {
         }
 
         cleanup("test_root_changes_multiple_times");
+    }
+
+    #[test]
+    fn test_range_scan_less_than() {
+        let name = "test_range_scan_lt";
+        cleanup(name);
+
+        let (mut btree, mut pm) = setup_tree(name, 10);
+
+        let end = IndexKey::Integer(5);
+        let results = btree
+            .range_scan(None, Some(&end), &BinaryOperator::LessThan, &mut pm)
+            .unwrap();
+
+        // should return 1, 2, 3, 4
+        assert_eq!(results.len(), 4);
+        for (i, loc) in results.iter().enumerate() {
+            assert_eq!(loc.page_id(), (i + 1) as u32);
+        }
+
+        cleanup(name);
+    }
+
+    #[test]
+    fn test_range_scan_less_than_or_equal() {
+        let name = "test_range_scan_lte";
+        cleanup(name);
+
+        let (mut btree, mut pm) = setup_tree(name, 10);
+
+        let end = IndexKey::Integer(5);
+        let results = btree
+            .range_scan(None, Some(&end), &BinaryOperator::LessOrEqual, &mut pm)
+            .unwrap();
+
+        // should return 1, 2, 3, 4, 5
+        assert_eq!(results.len(), 5);
+
+        cleanup(name);
+    }
+
+    #[test]
+    fn test_range_scan_greater_than() {
+        let name = "test_range_scan_gt";
+        cleanup(name);
+
+        let (mut btree, mut pm) = setup_tree(name, 10);
+
+        let start = IndexKey::Integer(7);
+        let results = btree
+            .range_scan(Some(&start), None, &BinaryOperator::GreaterThan, &mut pm)
+            .unwrap();
+
+        // should return 8, 9, 10
+        assert_eq!(results.len(), 3);
+
+        cleanup(name);
+    }
+
+    #[test]
+    fn test_range_scan_greater_than_or_equal() {
+        let name = "test_range_scan_gte";
+        cleanup(name);
+
+        let (mut btree, mut pm) = setup_tree(name, 10);
+
+        let start = IndexKey::Integer(7);
+        let results = btree
+            .range_scan(Some(&start), None, &BinaryOperator::GreaterOrEqual, &mut pm)
+            .unwrap();
+
+        // should return 7, 8, 9, 10
+        assert_eq!(results.len(), 4);
+
+        cleanup(name);
+    }
+
+    #[test]
+    fn test_range_scan_no_matches() {
+        let name = "test_range_scan_no_match";
+        cleanup(name);
+
+        let (mut btree, mut pm) = setup_tree(name, 10);
+
+        let end = IndexKey::Integer(0); // nothing less than 1
+        let results = btree
+            .range_scan(None, Some(&end), &BinaryOperator::LessThan, &mut pm)
+            .unwrap();
+
+        assert_eq!(results.len(), 0);
+
+        cleanup(name);
+    }
+
+    #[test]
+    fn test_range_scan_all_rows_less_than_or_equal() {
+        let name = "test_range_scan_all_lte";
+        cleanup(name);
+
+        let (mut btree, mut pm) = setup_tree(name, 10);
+
+        let end = IndexKey::Integer(10);
+        let results = btree
+            .range_scan(None, Some(&end), &BinaryOperator::LessOrEqual, &mut pm)
+            .unwrap();
+
+        assert_eq!(results.len(), 10);
+
+        cleanup(name);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_range_scan_invalid_op_returns_error() {
+        let name = "test_range_scan_invalid_op";
+        cleanup(name);
+
+        let (mut btree, mut pm) = setup_tree(name, 5);
+
+        btree
+            .range_scan(None, None, &BinaryOperator::Equals, &mut pm)
+            .unwrap();
+
+        cleanup(name);
+    }
+
+    #[test]
+    fn test_range_scan_missing_bound_returns_error() {
+        let name = "test_range_scan_missing_bound";
+        cleanup(name);
+
+        let (mut btree, mut pm) = setup_tree(name, 5);
+
+        // LessThan without end bound
+        let result = btree.range_scan(None, None, &BinaryOperator::LessThan, &mut pm);
+
+        assert!(result.is_err());
+
+        cleanup(name);
+    }
+
+    #[test]
+    fn test_range_scan_spans_multiple_leaves() {
+        let name = "test_range_scan_multi_leaf";
+        cleanup(name);
+
+        // order 3 with 15 keys guarantees multiple leaf nodes
+        let mut pm = PageManager::new(&format!("{}.hdb", name)).unwrap();
+        let mut btree = BPlusTree::new(3, &mut pm).unwrap();
+
+        for i in 1..=15 {
+            btree
+                .insert(
+                    IndexKey::Integer(i),
+                    RowLocation::new(i as u32, i as u16),
+                    &mut pm,
+                )
+                .unwrap();
+        }
+
+        let end = IndexKey::Integer(10);
+        let results = btree
+            .range_scan(None, Some(&end), &BinaryOperator::LessOrEqual, &mut pm)
+            .unwrap();
+
+        assert_eq!(results.len(), 10);
+
+        cleanup(name);
     }
 }

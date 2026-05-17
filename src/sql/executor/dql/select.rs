@@ -1,14 +1,11 @@
 use crate::{
     benchmark::metrics::QueryMetrics,
-    index::key::IndexKey,
     sql::{
         database::Database,
         executor::{
             ExecutionResult,
-            evaluator::evaluate_expr,
-            helpers::{get_table_first_page_and_cols, read_all_table_rows, read_row_at_location},
+            helpers::{get_table_first_page_and_cols, resolve_rows},
         },
-        parser::BinaryOperator,
     },
 };
 use std::io::{self, Error, ErrorKind};
@@ -30,83 +27,31 @@ pub fn execute_select(
     // Extract column names
     let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
-    let mut index_used = false;
-    let mut filtered_rows = Vec::new();
+    let filtered_rows_and_loc = resolve_rows(
+        db,
+        &table_name,
+        first_page,
+        &where_clause,
+        &all_column_names,
+        metrics,
+    )?;
 
-    // check for index-eligible WHERE clause
-
-    // TODO: range scan support (WHERE col > x, WHERE col BETWEEN x AND y)
-    // Currently only equality predicates use the index.
-    // Non-equality WHERE clauses on indexed columns fall back to full scan.
-    // Implementing range scans requires walking the leaf linked list
-    // from the first matching leaf — a natural extension of the current B+ tree.
-    if let Some(Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Equals,
-        right,
-    }) = &where_clause
-    {
-        if let (Expr::Column(col), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
-            // check if column is indexed
-            if let Some(entry) = db
-                .get_indexes_for_table(&table_name)
-                .and_then(|entries| entries.iter().find(|entry| entry.column_name() == col))
-                .cloned()
-            {
-                let key = IndexKey::try_from(val.clone())?;
-                let result = db.search_index(entry.index_name(), &key)?;
-
-                match result {
-                    Some(row_location) => {
-                        let row = read_row_at_location(db.pm(), row_location)?;
-                        filtered_rows.push(row);
-
-                        if let Some(m) = metrics.as_mut() {
-                            m.pages_read += 1; // one data page read
-                            m.rows_scanned += 1;
-                        }
-
-                        index_used = true;
-                    }
-                    None => {}
-                }
-            }
-        }
-    }
-
-    if !index_used {
-        // full scan
-        let rows = read_all_table_rows(db.pm(), first_page, metrics)?;
-
-        // check if there are any rows in this table
-        if rows.len() == 0 {
-            return Ok(ExecutionResult::Rows {
-                columns: all_column_names,
-                rows: Vec::<Row>::new(),
-            });
-        }
-
-        // filter rows based on the where clause
-        for row in rows {
-            if let Some(ref expr) = where_clause {
-                match evaluate_expr(expr, &row, &all_column_names) {
-                    Ok(true) => filtered_rows.push(row),
-                    Ok(false) => (),
-                    Err(e) => {
-                        eprintln!("Warning: Error evaluating WHERE clause: {}", e);
-                    }
-                }
-            } else {
-                filtered_rows.push(row);
-            }
-        }
+    // check if there are any rows in this table
+    if filtered_rows_and_loc.len() == 0 {
+        return Ok(ExecutionResult::Rows {
+            columns: all_column_names,
+            rows: Vec::<Row>::new(),
+        });
     }
 
     // Handle column selection
     match select_columns {
         SelectColumns::All => Ok(ExecutionResult::Rows {
             columns: all_column_names,
-            rows: filtered_rows,
+            rows: filtered_rows_and_loc
+                .into_iter()
+                .map(|(row, _)| row)
+                .collect(),
         }),
         SelectColumns::Specific(requested_cols) => {
             // Find indices of requested columns
@@ -132,9 +77,9 @@ pub fn execute_select(
             }
 
             // Project rows to only include selected columns
-            let projected_rows: Vec<Row> = filtered_rows
+            let projected_rows: Vec<Row> = filtered_rows_and_loc
                 .iter()
-                .map(|row| {
+                .map(|(row, _)| {
                     let values: Vec<Value> = column_indices
                         .iter()
                         .filter_map(|&idx| row.get_value(idx).cloned())
@@ -158,7 +103,7 @@ mod tests {
         catalog::schema::{Column, DataType},
         sql::{
             executor::test_helpers::*,
-            parser::{SelectColumns, Statement},
+            parser::{BinaryOperator, SelectColumns, Statement},
         },
         storage::page::{PAGE_SIZE, SLOT_DIRECTORY_START},
     };
