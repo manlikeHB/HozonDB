@@ -159,6 +159,11 @@ impl Database {
         self.index_catalog.total_count()
     }
 
+    pub fn drop_table_indexes(&mut self, table_name: &str) -> io::Result<()> {
+        self.index_catalog
+            .remove_table_indexes(table_name, &mut self.page_manager)
+    }
+
     // Indexes
     pub fn insert_into_index(
         &mut self,

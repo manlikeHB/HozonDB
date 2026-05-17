@@ -52,7 +52,6 @@ impl Row {
             }
         }
 
-        bytes.push(0); // Row terminator
         bytes
     }
 
@@ -65,7 +64,7 @@ impl Row {
         let mut offset = 0;
 
         // Read until we hit zero terminator
-        while offset < bytes.len() && bytes[offset] != 0 {
+        while offset < bytes.len() {
             let value_type = bytes[offset];
             offset += 1;
 
@@ -144,11 +143,6 @@ impl Row {
             }
         }
 
-        // Skip the terminator
-        if offset < bytes.len() && bytes[offset] == 0 {
-            offset += 1;
-        }
-
         Ok((Row { values }, offset))
     }
 }
@@ -179,18 +173,5 @@ mod tests {
                 _ => panic!("Mismatched value types"),
             }
         }
-    }
-
-    #[test]
-    fn test_row_with_terminator() {
-        let row = Row::new(vec![Value::Integer(42), Value::Text("test".to_string())]);
-
-        let bytes = row.to_bytes();
-
-        // Should end with 0
-        assert_eq!(bytes[bytes.len() - 1], 0);
-
-        let (parsed_row, _) = Row::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed_row.values().len(), 2);
     }
 }

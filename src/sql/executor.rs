@@ -1,10 +1,14 @@
 use crate::{
     benchmark::metrics::QueryMetrics,
+    catalog::index::IndexEntry,
     constants::PageId,
     index::{key::IndexKey, node::leaf::RowLocation},
     sql::{database::Database, evaluator::evaluate_expr, parser::BinaryOperator},
 };
-use std::io::{self, Error, ErrorKind};
+use std::{
+    collections::HashMap,
+    io::{self, Error, ErrorKind},
+};
 
 use crate::{
     catalog::{
@@ -12,7 +16,7 @@ use crate::{
         schema::{Column, DataType, Schema},
     },
     sql::parser::{Expr, SelectColumns, Statement},
-    storage::page::{PAGE_DATA_START, PAGE_SIZE, PageManager, PageMetadata},
+    storage::page::{PAGE_SIZE, PageManager},
 };
 
 pub struct Executor {
@@ -37,22 +41,34 @@ impl Executor {
 
     fn read_row_at_location(&self, location: RowLocation) -> io::Result<Row> {
         let page_data = self.database.read_page(location.page_id())?;
-        let (row, _) = Row::from_bytes(&page_data[location.slot() as usize..])?;
+        let (row_offset, row_length) = PageManager::read_slot(&page_data, location.slot());
+        let (row, _) =
+            Row::from_bytes(&page_data[row_offset as usize..(row_offset + row_length) as usize])?;
         Ok(row)
     }
 
     /// Read all rows from a page
-    fn read_rows_from_page(page_data: &[u8], num_rows: usize) -> io::Result<Vec<Row>> {
-        let mut rows = Vec::new();
-        let mut offset = PAGE_DATA_START;
+    fn read_rows_from_page(
+        page_data: &[u8; PAGE_SIZE],
+        slot_count: u16,
+    ) -> io::Result<Vec<(Row, u16)>> {
+        let mut rows_and_slots = Vec::new();
 
-        for _ in 0..num_rows {
-            let (row, bytes_consumed) = Row::from_bytes(&page_data[offset..])?;
-            rows.push(row);
-            offset += bytes_consumed;
+        for idx in 0..slot_count {
+            let (row_offset, row_length) = PageManager::read_slot(page_data, idx);
+
+            if row_length == 0 {
+                continue; // skip deleted row
+            }
+
+            let (row, _) = Row::from_bytes(
+                &page_data[row_offset as usize..(row_offset + row_length) as usize],
+            )?;
+
+            rows_and_slots.push((row, idx));
         }
 
-        Ok(rows)
+        Ok(rows_and_slots)
     }
 
     // Read all rows from a table
@@ -78,12 +94,13 @@ impl Executor {
             let page_meta = PageManager::read_metadata_from_buffer(&page_data);
 
             // Parse all rows from the page
-            let mut new_rows = Self::read_rows_from_page(&page_data, page_meta.num_rows)?;
+            let rows_and_slot = Self::read_rows_from_page(&page_data, page_meta.slot_count)?;
 
             // track rows scanned
             if let Some(m) = metrics.as_mut() {
                 m.rows_scanned += rows.len();
             }
+            let mut new_rows = rows_and_slot.into_iter().map(|(row, _)| row).collect();
             rows.append(&mut new_rows);
 
             // collect old chain pages
@@ -99,121 +116,46 @@ impl Executor {
         Ok((rows, old_chain))
     }
 
-    /// Write rows to a single page buffer
-    /// Returns the number of rows written and final offset when page is full
-    fn write_rows_to_page(
-        page_data: &mut [u8; 4096],
-        rows: &[Row],
-        mut offset: usize,
-    ) -> io::Result<(usize, usize)> {
-        let mut rows_written = 0;
-
-        // Serialize rows
-        for row in rows {
-            let row_bytes = row.to_bytes();
-
-            // Check if row fits
-            if offset + row_bytes.len() > PAGE_SIZE {
-                // stop here and return rows written and last offset
-                break;
-            }
-
-            // write row
-            page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
-            offset += row_bytes.len();
-            rows_written += 1;
-        }
-
-        Ok((rows_written, offset))
-    }
-
-    /// writes rows of a table to as many pages as is required
-    fn write_all_table_rows(
-        &mut self,
-        rows: &[Row],
-        old_chain: Option<&[u32]>,
+    fn scan_table_with_locations(
+        &self,
+        first_page: u32,
         metrics: &mut Option<QueryMetrics>,
-    ) -> io::Result<()> {
-        let mut remaining_rows = rows; // shrinks as we write
-        let mut new_chain = Vec::new();
-
-        let old_page_ids = if let Some(page_ids) = old_chain {
-            page_ids
-        } else {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "list of old chain can't be empty",
-            ));
-        };
-
-        let mut cur_index = 0;
-        let mut current_page_id = old_page_ids[cur_index];
+    ) -> io::Result<Vec<(Row, RowLocation)>> {
+        let mut rows_and_location = Vec::new();
+        let mut cur_page = first_page;
 
         loop {
-            // collect page chain
-            new_chain.push(current_page_id);
+            // Read page data
+            let page_data = self.database.read_page(cur_page)?;
 
-            let mut page_data = [0u8; PAGE_SIZE];
-
-            // Write as many rows as fit
-            let (rows_written, final_offset) =
-                Self::write_rows_to_page(&mut page_data, remaining_rows, PAGE_DATA_START)?;
-
-            // Update page metadata
-            let has_more_rows = rows_written < remaining_rows.len();
-
-            let next_page = if has_more_rows {
-                // check if there are more pages in old chain
-                if cur_index < old_page_ids.len() - 1 {
-                    cur_index += 1;
-                    Some(old_page_ids[cur_index])
-                } else {
-                    // else allocate new page
-                    // Need another page - allocate it
-                    let new_page = self.database.allocate_page()?;
-                    Some(new_page)
-                }
-            } else {
-                None // Last page
-            };
-
-            let metadata = PageMetadata {
-                is_full: has_more_rows,
-                last_offset: final_offset,
-                num_rows: rows_written,
-                next_page,
-            };
-            PageManager::update_metadata_in_buffer(&mut page_data, &metadata);
-
-            // Write page to disk
-            self.database.write_page(current_page_id, &page_data)?;
-
-            // track page write
+            // track page reads
             if let Some(m) = metrics.as_mut() {
-                m.pages_written += 1;
+                m.pages_read += 1;
             }
 
-            // Move to remaining rows
-            remaining_rows = &remaining_rows[rows_written..];
+            let page_meta = PageManager::read_metadata_from_buffer(&page_data);
 
-            // Move to next page if needed
-            if let Some(next) = next_page {
-                current_page_id = next;
+            // Parse all rows from the page
+            let rows_and_slots = Self::read_rows_from_page(&page_data, page_meta.slot_count)?;
+
+            for (row, slot) in rows_and_slots {
+                // track rows scanned
+                if let Some(m) = metrics.as_mut() {
+                    m.rows_scanned += 1;
+                }
+
+                let row_location = RowLocation::new(cur_page, slot);
+                rows_and_location.push((row, row_location));
+            }
+
+            if let Some(next_page) = page_meta.next_page {
+                cur_page = next_page;
             } else {
                 break;
             }
         }
 
-        // Free any leftover pages from old chain
-        if let Some(old_chain) = old_chain {
-            for old_page in old_chain {
-                if !new_chain.contains(old_page) {
-                    self.database.free_page(*old_page)?;
-                }
-            }
-        }
-
-        Ok(())
+        Ok(rows_and_location)
     }
 
     pub fn execute(
@@ -353,16 +295,29 @@ impl Executor {
         }
 
         // get last page
-        let mut last_page = first_page;
+        let last_page = self.get_last_page(first_page)?;
 
-        loop {
-            let page_meta = self.database.read_page_metadata(last_page)?;
-            match page_meta.next_page {
-                Some(next_page) => last_page = next_page,
-                None => break,
-            }
+        // insert row
+        let (row_page_id, slot) = self.insert_row_into_page(last_page, &values, metrics)?;
+        // Index new row if table was indexed
+        let row_location = RowLocation::new(row_page_id, slot);
+        self.index_new_row(&index_entries, &value_and_col_pairs, row_location)?;
+
+        if let Some(m) = metrics.as_mut() {
+            m.rows_modified += 1;
         }
 
+        Ok(ExecutionResult::Success {
+            message: "1 row inserted.".to_string(),
+        })
+    }
+
+    fn insert_row_into_page(
+        &mut self,
+        last_page: PageId,
+        values: &[Value],
+        metrics: &mut Option<QueryMetrics>,
+    ) -> io::Result<(PageId, u16)> {
         let mut last_page_data = self.database.read_page(last_page)?;
 
         // Track page read
@@ -371,17 +326,31 @@ impl Executor {
         }
 
         let mut last_page_meta = PageManager::read_metadata_from_buffer(&last_page_data);
-        let row_bytes = Row::to_bytes_from_values(&values);
+        let row_bytes = Row::to_bytes_from_values(values);
 
-        // try to append new row to last page
-        let (row_page_id, slot) = if last_page_meta.last_offset + row_bytes.len() < PAGE_SIZE {
-            let offset = last_page_meta.last_offset;
+        let space_needed = row_bytes.len() + 4;
+        let available = last_page_meta.free_space_end - last_page_meta.free_space_start;
 
-            last_page_data[offset..offset + row_bytes.len()].copy_from_slice(&row_bytes);
+        // try to write new row to last page
+        let (row_page_id, slot) = if space_needed <= available as usize {
+            // get row offset to insert new row
+            let row_offset = last_page_meta.free_space_end as usize - row_bytes.len();
+            // write row to page data
+            last_page_data[row_offset..row_offset + row_bytes.len()].copy_from_slice(&row_bytes);
+            // write slot to page data
+            PageManager::write_slot(
+                &mut last_page_data,
+                last_page_meta.slot_count,
+                row_offset as u16,
+                row_bytes.len() as u16,
+            );
 
-            last_page_meta.num_rows += 1;
-            last_page_meta.last_offset += row_bytes.len();
+            // update metadata
+            last_page_meta.slot_count += 1;
+            last_page_meta.free_space_start += 4;
+            last_page_meta.free_space_end -= row_bytes.len() as u16;
 
+            // update metadata and write page to disk
             PageManager::update_metadata_in_buffer(&mut last_page_data, &last_page_meta);
             self.database.write_page(last_page, &last_page_data)?;
 
@@ -390,18 +359,28 @@ impl Executor {
                 m.pages_written += 1;
             }
 
-            (last_page, offset)
+            (last_page, last_page_meta.slot_count - 1)
         } else {
             // Create a new page
             let new_page = self.database.allocate_page()?;
-            let mut new_page_data = [0u8; PAGE_SIZE];
-            let mut new_page_meta = self.database.read_page_metadata(new_page)?;
+            let mut new_page_data = self.database.read_page(new_page)?;
+            let mut new_page_meta = PageManager::read_metadata_from_buffer(&new_page_data);
+            // get row offset
+            let row_offset = new_page_meta.free_space_end as usize - row_bytes.len();
+            // write row to page data
+            new_page_data[row_offset..row_offset + row_bytes.len()].copy_from_slice(&row_bytes);
+            // write slot
+            PageManager::write_slot(
+                &mut new_page_data,
+                new_page_meta.slot_count,
+                row_offset as u16,
+                row_bytes.len() as u16,
+            );
 
-            new_page_meta.num_rows += 1;
-            new_page_meta.last_offset += row_bytes.len();
-
-            new_page_data[PAGE_DATA_START..PAGE_DATA_START + row_bytes.len()]
-                .copy_from_slice(&row_bytes);
+            // update metadata
+            new_page_meta.slot_count += 1;
+            new_page_meta.free_space_start += 4;
+            new_page_meta.free_space_end -= row_bytes.len() as u16;
 
             PageManager::update_metadata_in_buffer(&mut new_page_data, &new_page_meta);
             self.database.write_page(new_page, &new_page_data)?;
@@ -420,13 +399,33 @@ impl Executor {
                 m.pages_written += 1;
             }
 
-            (new_page, PAGE_DATA_START)
+            (new_page, new_page_meta.slot_count - 1)
         };
 
-        // add new row if table was indexed
-        for entry in index_entries {
-            let row_location = RowLocation::new(row_page_id, slot as u16);
+        Ok((row_page_id, slot))
+    }
 
+    fn get_last_page(&self, page_id: PageId) -> io::Result<PageId> {
+        //TODO: cache last page ID per table so the page-finding loop will no longer be needed
+        let mut last_page = page_id;
+        loop {
+            let page_meta = self.database.read_page_metadata(last_page)?;
+            match page_meta.next_page {
+                Some(next_page) => last_page = next_page,
+                None => break,
+            }
+        }
+
+        Ok(last_page)
+    }
+
+    fn index_new_row(
+        &mut self,
+        index_entries: &[IndexEntry],
+        value_and_col_pairs: &[(&Value, &Column)],
+        row_location: RowLocation,
+    ) -> io::Result<()> {
+        for entry in index_entries {
             let (val, _) = value_and_col_pairs
                 .iter()
                 .find(|(_, c)| c.name() == entry.column_name())
@@ -447,13 +446,33 @@ impl Executor {
             )?;
         }
 
-        if let Some(m) = metrics.as_mut() {
-            m.rows_modified += 1;
+        Ok(())
+    }
+
+    fn delete_indexes(
+        &mut self,
+        index_entries: &[IndexEntry],
+        value_and_col_pairs: &[(&Value, &Column)],
+    ) -> io::Result<()> {
+        for entry in index_entries {
+            let (val, _) = value_and_col_pairs
+                .iter()
+                .find(|(_, c)| c.name() == entry.column_name())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "indexed column '{}' not found in schema",
+                            entry.column_name()
+                        ),
+                    )
+                })?;
+
+            self.database
+                .delete_from_index(entry.index_name(), &IndexKey::try_from((*val).clone())?)?;
         }
 
-        Ok(ExecutionResult::Success {
-            message: "1 row inserted.".to_string(),
-        })
+        Ok(())
     }
 
     fn execute_select(
@@ -601,11 +620,21 @@ impl Executor {
             self.database.free_page(page)?;
         }
 
+        // TODO: drop_table does not free B+ tree index pages — only the index
+        // catalog entry is removed. Index pages are orphaned on disk until
+        // compaction. Fixing this requires BPlusTree to expose a full page
+        // traversal method.
+        self.database.drop_table_indexes(&table_name)?;
+
         Ok(ExecutionResult::Success {
             message: format!("{} table successfully dropped", table_name),
         })
     }
 
+    // TODO: dead slots are never reclaimed within a page. A compaction pass is
+    // needed to pack live rows together, reset free_space_start/free_space_end,
+    // and return fully-dead pages to the free list. Without this, repeated
+    // deletes gradually waste page space permanently.
     fn execute_delete(
         &mut self,
         table_name: String,
@@ -615,9 +644,9 @@ impl Executor {
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
         let columns = columns.to_vec();
 
-        // get all rows
-        let (rows, old_chain) = self.read_all_table_rows(first_page, metrics)?;
-        let rows_len = rows.len();
+        // get all rows with row location
+        let rows_and_loc = self.scan_table_with_locations(first_page, metrics)?;
+        let rows_len = rows_and_loc.len();
 
         // Extract column names
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
@@ -630,31 +659,45 @@ impl Executor {
         }
 
         // filter rows based on the where clause
-        let mut kept_rows = Vec::new();
         let mut deleted_rows = Vec::new();
+        let mut dirty_pages: HashMap<PageId, [u8; PAGE_SIZE]> = HashMap::new();
 
-        for row in rows {
-            if let Some(ref expr) = where_clause {
+        for (row, loc) in rows_and_loc {
+            let should_delete = if let Some(ref expr) = where_clause {
                 match evaluate_expr(expr, &row, &all_column_names) {
-                    Ok(true) => deleted_rows.push(row), // matches = deleted
-                    Ok(false) => kept_rows.push(row),   // no match = kept
+                    Ok(result) => result,
                     Err(e) => {
                         eprintln!("Warning: Error evaluating WHERE clause: {}", e);
+                        false
                     }
                 }
             } else {
-                deleted_rows.push(row); // no WHERE = delete all
+                true
+            }; // no WHERE = delete all
+
+            if should_delete {
+                if !dirty_pages.contains_key(&loc.page_id()) {
+                    let page_data = self.database.read_page(loc.page_id())?;
+                    dirty_pages.insert(loc.page_id(), page_data);
+                }
+
+                if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
+                    PageManager::mark_slot_dead(page_data, loc.slot());
+                }
+                deleted_rows.push(row);
             }
         }
 
-        // delete indexed keys
+        // TODO: index deletion happens after pages are written to disk.
+        // If index deletion fails mid-way, rows are dead on disk but index entries
+        // still exist — leaving the database in an inconsistent state.
+        // WAL (Write-Ahead Logging) solves this by logging intent before any write,
+        // enabling recovery to a consistent state on crash.
+        for (page_id, page_data) in &dirty_pages {
+            self.database.write_page(*page_id, page_data)?;
+        }
 
-        // TODO: deletion requires full page chain rewrite, making index-assisted
-        // deletion impossible with the current design. With MVCC, a DELETE would mark rows as
-        // deleted in-place, allowing the index to locate the exact row via RowLocation without
-        // a full scan. Physical removal would happen during compaction/vacuum.
-        // This is also foundational for distributed systems — MVCC enables concurrent reads
-        // and writes across nodes without locking conflicts.
+        // delete indexed keys
         let index_entries = self
             .database
             .get_indexes_for_table(&table_name)
@@ -662,20 +705,12 @@ impl Executor {
             .unwrap_or_default();
 
         for row in &deleted_rows {
-            for entry in &index_entries {
-                if let Some(pos) = columns.iter().position(|c| c.name() == entry.column_name()) {
-                    if let Some(val) = row.get_value(pos) {
-                        if let Ok(key) = IndexKey::try_from(val.clone()) {
-                            self.database.delete_from_index(entry.index_name(), &key)?;
-                        }
-                    }
-                }
-            }
+            let value_and_col_pairs: Vec<(&Value, &Column)> =
+                row.values().iter().zip(columns.iter()).collect();
+            self.delete_indexes(&index_entries, &value_and_col_pairs)?;
         }
 
-        self.write_all_table_rows(&kept_rows, Some(&old_chain), metrics)?;
-
-        let num_rows = rows_len - kept_rows.len();
+        let num_rows = deleted_rows.len();
 
         if let Some(m) = metrics {
             m.rows_modified = num_rows;
@@ -698,8 +733,13 @@ impl Executor {
     ) -> io::Result<ExecutionResult> {
         let (first_page, columns) = self.get_table_first_page_and_cols(&table_name)?;
 
+        let columns = columns.to_vec();
+
         // Extract column names
         let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
+
+        // get last page
+        let last_page = self.get_last_page(first_page)?;
 
         // Validate assignments (column exists + type matches)
         for (col_name, value) in &assignments {
@@ -731,53 +771,125 @@ impl Executor {
             }
         }
 
-        let (rows, old_chain) = self.read_all_table_rows(first_page, metrics)?;
+        let rows_and_locs = self.scan_table_with_locations(first_page, metrics)?;
 
         // Check if table is empty
-        if rows.len() == 0 {
+        if rows_and_locs.len() == 0 {
             return Ok(ExecutionResult::Success {
                 message: "0 rows updated.".to_string(),
             });
         }
 
+        let index_entries = self
+            .database
+            .get_indexes_for_table(&table_name)
+            .map(|e| e.to_vec())
+            .unwrap_or_default();
+
+        // TODO: if WHERE clause is on an indexed column, use index seek instead of
+        // full table scan. Look up RowLocation directly from the B+ tree and jump
+        // to the exact page/slot — avoids scanning the entire table.
+
         // Update rows based on WHERE clause
         let mut updated_count = 0;
-        let updated_rows: Vec<Row> = rows
-            .into_iter()
-            .map(|row| {
-                let should_update = if let Some(ref expr) = where_clause {
-                    match evaluate_expr(expr, &row, &all_column_names) {
-                        Ok(true) => true,
-                        Ok(false) => false,
-                        Err(e) => {
-                            eprintln!("Warning: Error evaluating WHERE clause: {}", e);
-                            false
-                        }
+        let mut dirty_pages: HashMap<PageId, [u8; PAGE_SIZE]> = HashMap::new();
+        let mut deleted_rows = Vec::new();
+        for (row, loc) in rows_and_locs {
+            let should_update = if let Some(ref expr) = where_clause {
+                match evaluate_expr(expr, &row, &all_column_names) {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(e) => {
+                        eprintln!("Warning: Error evaluating WHERE clause: {}", e);
+                        false
                     }
-                } else {
-                    true // No WHERE = update all
-                };
-
-                if should_update {
-                    let mut updated_values = row.values().clone();
-
-                    // Apply assignments
-                    for (col_name, val) in &assignments {
-                        if let Some(index) = all_column_names.iter().position(|c| c == col_name) {
-                            updated_values[index] = val.clone();
-                        }
-                    }
-
-                    updated_count += 1;
-                    Row::new(updated_values)
-                } else {
-                    row
                 }
-            })
-            .collect();
+            } else {
+                true // No WHERE = update all
+            };
 
-        // write updated rows to page
-        self.write_all_table_rows(&updated_rows, Some(&old_chain), metrics)?;
+            if should_update {
+                let mut updated_values = row.values().clone();
+
+                // Apply assignments
+                for (col_name, val) in &assignments {
+                    if let Some(index) = all_column_names.iter().position(|c| c == col_name) {
+                        updated_values[index] = val.clone();
+                    }
+                }
+
+                updated_count += 1;
+                let updated_row = Row::new(updated_values);
+
+                let old_value_and_col_pairs: Vec<(&Value, &Column)> =
+                    row.values().iter().zip(columns.iter()).collect();
+                let new_value_and_col_pairs: Vec<(&Value, &Column)> =
+                    updated_row.values().iter().zip(columns.iter()).collect();
+
+                // if updated row fit previous space, write into old location else re-insert
+                if updated_row.to_bytes().len() <= row.to_bytes().len() {
+                    if !dirty_pages.contains_key(&loc.page_id()) {
+                        let page_data = self.database.read_page(loc.page_id())?;
+
+                        dirty_pages.insert(loc.page_id(), page_data);
+                    }
+
+                    if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
+                        let (row_offset, _) = PageManager::read_slot(page_data, loc.slot());
+
+                        let new_bytes = updated_row.to_bytes();
+                        // write new row
+                        page_data[row_offset as usize..row_offset as usize + new_bytes.len()]
+                            .copy_from_slice(&new_bytes);
+
+                        // update slot to reflect new row length
+                        PageManager::write_slot(
+                            page_data,
+                            loc.slot(),
+                            row_offset,
+                            new_bytes.len() as u16,
+                        );
+                    }
+
+                    // delete old row index
+                    self.delete_indexes(&index_entries, &old_value_and_col_pairs)?;
+                    // index row
+                    self.index_new_row(&index_entries, &new_value_and_col_pairs, loc)?;
+                } else {
+                    // insert updated row as new row
+                    let (row_page_id, slot) =
+                        self.insert_row_into_page(last_page, &updated_row.values(), metrics)?;
+                    // index new row
+                    let row_location = RowLocation::new(row_page_id, slot);
+                    self.index_new_row(&index_entries, &new_value_and_col_pairs, row_location)?;
+
+                    // delete old row
+                    if !dirty_pages.contains_key(&loc.page_id()) {
+                        let page_data = self.database.read_page(loc.page_id())?;
+
+                        dirty_pages.insert(loc.page_id(), page_data);
+                    }
+
+                    if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
+                        PageManager::mark_slot_dead(page_data, loc.slot());
+                    }
+                    // collect old row to be freed if indexed
+                    deleted_rows.push(row);
+                }
+            };
+        }
+
+        // write update pages to disk
+        for (page_id, page_data) in &dirty_pages {
+            self.database.write_page(*page_id, page_data)?;
+        }
+
+        // delete indexed keys for deleted rows
+        for row in &deleted_rows {
+            let value_and_col_pairs: Vec<(&Value, &Column)> =
+                row.values().iter().zip(columns.iter()).collect();
+            self.delete_indexes(&index_entries, &value_and_col_pairs)?;
+        }
 
         if let Some(m) = metrics {
             m.rows_modified = updated_count;
@@ -824,6 +936,7 @@ mod tests {
     use crate::catalog::schema::{Column, DataType};
     use crate::sql::parser::BinaryOperator;
     use crate::storage::page::PageManager;
+    use crate::storage::page::SLOT_DIRECTORY_START;
     use std::fs;
 
     fn cleanup(basename: &str) {
@@ -1364,8 +1477,9 @@ mod tests {
 
         // Check initial metadata
         let metadata = executor.database.read_page_metadata(first_page).unwrap();
-        assert_eq!(metadata.num_rows, 0);
-        assert_eq!(metadata.last_offset, PAGE_DATA_START);
+        assert_eq!(metadata.slot_count, 0);
+        assert_eq!(metadata.free_space_start as usize, SLOT_DIRECTORY_START);
+        assert_eq!(metadata.free_space_end as usize, PAGE_SIZE);
 
         // Insert row
         executor
@@ -1380,8 +1494,9 @@ mod tests {
 
         // Check metadata updated
         let metadata = executor.database.read_page_metadata(first_page).unwrap();
-        assert_eq!(metadata.num_rows, 1);
-        assert!(metadata.last_offset > PAGE_DATA_START);
+        assert_eq!(metadata.slot_count, 1);
+        assert_ne!(metadata.free_space_start as usize, SLOT_DIRECTORY_START);
+        assert_ne!(metadata.free_space_end as usize, PAGE_SIZE);
 
         cleanup("test_exec_metadata");
     }
@@ -3728,7 +3843,7 @@ mod tests {
             let page_meta = PageManager::read_metadata_from_buffer(&page_data);
 
             // Each page should have rows
-            assert!(page_meta.num_rows > 0, "Page {} has 0 rows", current_page);
+            assert!(page_meta.slot_count > 0, "Page {} has 0 rows", current_page);
 
             match page_meta.next_page {
                 Some(next) => {
@@ -4245,73 +4360,6 @@ mod tests {
         }
 
         cleanup("test_delete_all_mp");
-    }
-
-    #[test]
-    fn test_delete_frees_specific_pages() {
-        cleanup("test_compact_specific");
-        let mut executor = create_test_executor("test_compact_specific");
-
-        executor
-            .execute(
-                Statement::CreateTable {
-                    name: "users".to_string(),
-                    columns: vec![
-                        Column::new("id", DataType::Integer, true),
-                        Column::new("data", DataType::Text, false),
-                    ],
-                },
-                &mut None,
-            )
-            .unwrap();
-
-        // Insert 100 rows
-        for i in 0..100 {
-            executor
-                .execute(
-                    Statement::Insert {
-                        table_name: "users".to_string(),
-                        values: vec![Value::Integer(i), Value::Text("x".repeat(80))],
-                    },
-                    &mut None,
-                )
-                .unwrap();
-        }
-
-        // Get old page chain before delete
-        let first_page = executor.database.get_table("users").unwrap().first_page();
-        let old_chain = executor.collect_page_chain(first_page).unwrap();
-
-        // Delete 90% of rows
-        executor
-            .execute(
-                Statement::Delete {
-                    table_name: "users".to_string(),
-                    where_clause: Some(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::GreaterThan,
-                        right: Box::new(Expr::Literal(Value::Integer(9))),
-                    }),
-                },
-                &mut None,
-            )
-            .unwrap();
-
-        // Get new page chain
-        let new_chain = executor.collect_page_chain(first_page).unwrap();
-
-        // Should use fewer pages
-        assert!(new_chain.len() < old_chain.len());
-
-        // Freed pages should be in free list
-        let freed_pages: Vec<_> = old_chain
-            .iter()
-            .filter(|p| !new_chain.contains(p))
-            .collect();
-
-        assert!(freed_pages.len() > 0);
-
-        cleanup("test_compact_specific");
     }
 
     #[test]
@@ -4953,5 +5001,239 @@ mod tests {
         }
 
         cleanup("test_delete_all_clears_index");
+    }
+
+    #[test]
+    fn test_update_larger_row_creates_new_slot() {
+        cleanup("test_update_new_slot");
+        let mut executor = create_test_executor("test_update_new_slot");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("short".to_string())],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // Update to a much larger value — forces new slot
+        executor
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("data".to_string(), Value::Text("x".repeat(200)))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1); // old dead slot not returned
+                match &rows[0].values()[1] {
+                    Value::Text(data) => assert_eq!(data, &"x".repeat(200)),
+                    _ => panic!("Expected Text"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_new_slot");
+    }
+
+    #[test]
+    fn test_update_index_consistency_inplace() {
+        cleanup("test_update_index_inplace");
+        let mut executor = create_test_executor("test_update_index_inplace");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // Update non-indexed column — in-place since same or smaller size
+        executor
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("name".to_string(), Value::Text("Bob".to_string()))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // index lookup by id should still find the row
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values()[1] {
+                    Value::Text(name) => assert_eq!(name, "Bob"),
+                    _ => panic!("Expected Text"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_index_inplace");
+    }
+
+    #[test]
+    fn test_update_index_consistency_new_slot() {
+        cleanup("test_update_index_new_slot");
+        let mut executor = create_test_executor("test_update_index_new_slot");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("data", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("short".to_string())],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // Update to larger value — forces new slot
+        executor
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("data".to_string(), Value::Text("x".repeat(200)))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // index lookup should find row at new location
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values()[1] {
+                    Value::Text(data) => assert_eq!(data, &"x".repeat(200)),
+                    _ => panic!("Expected Text"),
+                }
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        // old slot should not appear as a duplicate
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_update_index_new_slot");
     }
 }
