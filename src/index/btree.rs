@@ -1192,17 +1192,14 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_range_scan_invalid_op_returns_error() {
+    fn test_range_scan_invalid_op() {
         let name = "test_range_scan_invalid_op";
         cleanup(name);
-
         let (mut btree, mut pm) = setup_tree(name, 5);
-
+        cleanup(name); // cleanup before panic
         btree
             .range_scan(None, None, &BinaryOperator::Equals, &mut pm)
             .unwrap();
-
-        cleanup(name);
     }
 
     #[test]
