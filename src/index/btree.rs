@@ -324,6 +324,12 @@ impl BPlusTree {
 
     // this checks cache for node first
     // otherwise read from disk and cache it
+    //
+    // TODO: Buffer pool — the node cache grows unbounded within a session.
+    // Lazy loading prevents loading nodes that are never accessed, but over
+    // a long session with many queries touching different parts of the tree,
+    // the cache accumulates all visited nodes with no eviction.
+    // eviction policy needs to be implemented
     fn load_node(&mut self, page_id: PageId, pm: &mut PageManager) -> io::Result<&Node> {
         if !self.cache.contains_key(&page_id) {
             // read node from disk
