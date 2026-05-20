@@ -4,13 +4,7 @@ use crate::{
     index::node::leaf::RowLocation,
     sql::{
         database::Database,
-        executor::{
-            ExecutionResult,
-            helpers::{
-                delete_indexes, get_table_first_page_and_cols, index_new_row, insert_row_into_page,
-                resolve_rows, validate_index_key_length, validate_value_type,
-            },
-        },
+        executor::{ExecutionResult, helpers},
     },
 };
 use std::{
@@ -34,7 +28,7 @@ pub fn execute_update(
     where_clause: Option<Expr>,
     metrics: &mut Option<QueryMetrics>,
 ) -> io::Result<ExecutionResult> {
-    let (first_page, columns) = get_table_first_page_and_cols(db, &table_name)?;
+    let (first_page, columns) = helpers::get_table_first_page_and_cols(db, &table_name)?;
 
     let columns = columns.to_vec();
 
@@ -71,7 +65,7 @@ pub fn execute_update(
 
         let column = &columns[col_index];
 
-        if !validate_value_type(value, column.data_type()) {
+        if !helpers::validate_value_type(value, column.data_type()) {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 format!(
@@ -83,10 +77,10 @@ pub fn execute_update(
             ));
         }
 
-        validate_index_key_length(value, column, &index_entries)?;
+        helpers::validate_index_key_length(value, column, &index_entries)?;
     }
 
-    let rows_and_locs = resolve_rows(
+    let rows_and_locs = helpers::resolve_rows(
         db,
         &table_name,
         first_page,
@@ -147,16 +141,21 @@ pub fn execute_update(
             }
 
             // delete old row index
-            delete_indexes(db, &index_entries, &old_value_and_col_pairs)?;
+            helpers::delete_indexes(db, &index_entries, &old_value_and_col_pairs)?;
             // index row
-            index_new_row(db, &index_entries, &new_value_and_col_pairs, loc)?;
+            helpers::index_new_row(db, &index_entries, &new_value_and_col_pairs, loc)?;
         } else {
             // insert updated row as new row
-            let (row_page_id, slot) =
-                insert_row_into_page(db, &table_name, last_page, &updated_row.values(), metrics)?;
+            let (row_page_id, slot) = helpers::insert_row_into_page(
+                db,
+                &table_name,
+                last_page,
+                &updated_row.values(),
+                metrics,
+            )?;
             // index new row
             let row_location = RowLocation::new(row_page_id, slot);
-            index_new_row(db, &index_entries, &new_value_and_col_pairs, row_location)?;
+            helpers::index_new_row(db, &index_entries, &new_value_and_col_pairs, row_location)?;
 
             // delete old row
             if !dirty_pages.contains_key(&loc.page_id()) {
@@ -186,7 +185,7 @@ pub fn execute_update(
     for row in &deleted_rows {
         let value_and_col_pairs: Vec<(&Value, &Column)> =
             row.values().iter().zip(columns.iter()).collect();
-        delete_indexes(db, &index_entries, &value_and_col_pairs)?;
+        helpers::delete_indexes(db, &index_entries, &value_and_col_pairs)?;
     }
 
     if let Some(m) = metrics {

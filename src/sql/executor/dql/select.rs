@@ -2,10 +2,7 @@ use crate::{
     benchmark::metrics::QueryMetrics,
     sql::{
         database::Database,
-        executor::{
-            ExecutionResult,
-            helpers::{get_table_first_page_and_cols, resolve_rows},
-        },
+        executor::{ExecutionResult, helpers},
     },
 };
 use std::io::{self, Error, ErrorKind};
@@ -22,12 +19,12 @@ pub fn execute_select(
     where_clause: Option<Expr>,
     metrics: &mut Option<QueryMetrics>,
 ) -> io::Result<ExecutionResult> {
-    let (first_page, columns) = get_table_first_page_and_cols(db, &table_name)?;
+    let (first_page, columns) = helpers::get_table_first_page_and_cols(db, &table_name)?;
 
     // Extract column names
     let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
-    let filtered_rows_and_loc = resolve_rows(
+    let filtered_rows_and_loc = helpers::resolve_rows(
         db,
         &table_name,
         first_page,

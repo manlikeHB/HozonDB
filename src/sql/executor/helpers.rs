@@ -22,7 +22,7 @@ use crate::{
     storage::page::{PAGE_SIZE, PageManager},
 };
 
-pub fn read_row_at_location(pm: &PageManager, location: RowLocation) -> io::Result<Row> {
+fn read_row_at_location(pm: &PageManager, location: RowLocation) -> io::Result<Row> {
     let page_data = pm.read_page(location.page_id())?;
     let (row_offset, row_length) = PageManager::read_slot(&page_data, location.slot());
     let (row, _) =
@@ -51,47 +51,6 @@ fn read_rows_from_page(
     }
 
     Ok(rows_and_slots)
-}
-
-// Read all rows from a table
-// which possible spans across multiple pages
-pub fn read_all_table_rows(
-    pm: &PageManager,
-    first_page: u32,
-    metrics: &mut Option<QueryMetrics>,
-) -> io::Result<Vec<Row>> {
-    let mut rows = Vec::new();
-    let mut cur_page = first_page;
-
-    loop {
-        // Read page data
-        let page_data = pm.read_page(cur_page)?;
-
-        // track page reads
-        if let Some(m) = metrics.as_mut() {
-            m.pages_read += 1;
-        }
-
-        let page_meta = PageManager::read_metadata_from_buffer(&page_data);
-
-        // Parse all rows from the page
-        let rows_and_slot = read_rows_from_page(&page_data, page_meta.slot_count)?;
-
-        // track rows scanned
-        if let Some(m) = metrics.as_mut() {
-            m.rows_scanned += rows_and_slot.len();
-        }
-        let mut new_rows = rows_and_slot.into_iter().map(|(row, _)| row).collect();
-        rows.append(&mut new_rows);
-
-        if let Some(next_page) = page_meta.next_page {
-            cur_page = next_page;
-        } else {
-            break;
-        }
-    }
-
-    Ok(rows)
 }
 
 fn scan_table_with_locations(

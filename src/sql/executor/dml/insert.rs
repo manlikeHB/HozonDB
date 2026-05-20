@@ -3,13 +3,7 @@ use crate::{
     index::{key::IndexKey, node::leaf::RowLocation},
     sql::{
         database::Database,
-        executor::{
-            ExecutionResult,
-            helpers::{
-                get_table_first_page_and_cols, index_new_row, insert_row_into_page,
-                validate_index_key_length, validate_value_type,
-            },
-        },
+        executor::{ExecutionResult, helpers},
     },
 };
 use std::io::{self, Error, ErrorKind};
@@ -22,7 +16,7 @@ pub fn execute_insert(
     values: Vec<Value>,
     metrics: &mut Option<QueryMetrics>,
 ) -> io::Result<ExecutionResult> {
-    let (_, columns) = get_table_first_page_and_cols(db, &table_name)?;
+    let (_, columns) = helpers::get_table_first_page_and_cols(db, &table_name)?;
     let columns = columns.to_vec();
 
     // Validate value count
@@ -43,7 +37,7 @@ pub fn execute_insert(
 
     // Validate data types
     for (value, column) in &value_and_col_pairs {
-        if !validate_value_type(value, column.data_type()) {
+        if !helpers::validate_value_type(value, column.data_type()) {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 format!(
@@ -55,7 +49,7 @@ pub fn execute_insert(
             ));
         }
 
-        validate_index_key_length(value, column, &index_entries)?;
+        helpers::validate_index_key_length(value, column, &index_entries)?;
     }
 
     // check for duplicate primary key
@@ -97,10 +91,11 @@ pub fn execute_insert(
     })?;
 
     // insert row
-    let (row_page_id, slot) = insert_row_into_page(db, &table_name, last_page, &values, metrics)?;
+    let (row_page_id, slot) =
+        helpers::insert_row_into_page(db, &table_name, last_page, &values, metrics)?;
     // Index new row if table was indexed
     let row_location = RowLocation::new(row_page_id, slot);
-    index_new_row(db, &index_entries, &value_and_col_pairs, row_location)?;
+    helpers::index_new_row(db, &index_entries, &value_and_col_pairs, row_location)?;
 
     if let Some(m) = metrics.as_mut() {
         m.rows_modified += 1;

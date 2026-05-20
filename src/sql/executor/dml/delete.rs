@@ -3,10 +3,7 @@ use crate::{
     constants::PageId,
     sql::{
         database::Database,
-        executor::{
-            ExecutionResult,
-            helpers::{delete_indexes, get_table_first_page_and_cols, resolve_rows},
-        },
+        executor::{ExecutionResult, helpers},
     },
 };
 use std::{collections::HashMap, io};
@@ -28,14 +25,14 @@ pub fn execute_delete(
     where_clause: Option<Expr>,
     metrics: &mut Option<QueryMetrics>,
 ) -> io::Result<ExecutionResult> {
-    let (first_page, columns) = get_table_first_page_and_cols(db, &table_name)?;
+    let (first_page, columns) = helpers::get_table_first_page_and_cols(db, &table_name)?;
     let columns = columns.to_vec();
 
     // Extract column names
     let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
     // get all rows with row location
-    let rows_and_loc = resolve_rows(
+    let rows_and_loc = helpers::resolve_rows(
         db,
         &table_name,
         first_page,
@@ -89,7 +86,7 @@ pub fn execute_delete(
     for row in &deleted_rows {
         let value_and_col_pairs: Vec<(&Value, &Column)> =
             row.values().iter().zip(columns.iter()).collect();
-        delete_indexes(db, &index_entries, &value_and_col_pairs)?;
+        helpers::delete_indexes(db, &index_entries, &value_and_col_pairs)?;
     }
 
     let num_rows = deleted_rows.len();
