@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 tonic = { workspace = true}
-prost = {workspace = true}
+tokio = { workspace = true }
+hozondb-core = { path = "../core" }
 
 [dev-dependencies]
 
 [build-dependencies]
-tonic-build = { workspace = true}
