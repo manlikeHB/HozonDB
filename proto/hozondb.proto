@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package hozondb;
+
+service HozonDBService {
+    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+}
+
+message ExecuteRequest {
+    string sql = 1;
+}
+
+message ExecuteResponse {
+    bool success = 1;
+    string message = 2;
+    repeated Row rows = 3; 
+    repeated string columns = 4;
+}
+
+message Row {
+    repeated Value values = 1;
+}
+
+message Value {
+    oneof kind {
+        int64 integer = 1;
+        string text = 2;
+        bool boolean = 3;
+        bool is_null = 4;
+    }
+}
