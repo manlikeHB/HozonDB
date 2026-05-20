@@ -1,7 +1,7 @@
 use crate::{
     benchmark::metrics::QueryMetrics,
     catalog::index::IndexEntry,
-    constants::PageId,
+    constants::{self, PageId},
     index::{key::IndexKey, node::leaf::RowLocation},
     sql::{
         database::Database,
@@ -446,4 +446,28 @@ pub fn read_row_with_cache(
         Row::from_bytes(&page_data[row_offset as usize..(row_offset + row_length) as usize])?;
 
     Ok(row)
+}
+
+pub fn validate_index_key_length(
+    value: &Value,
+    column: &Column,
+    index_entries: &[IndexEntry],
+) -> io::Result<()> {
+    if let Value::Text(s) = value {
+        let is_indexed = index_entries
+            .iter()
+            .any(|e| e.column_name() == column.name());
+
+        if is_indexed && s.len() > constants::MAX_TEXT_INDEX_KEY_BYTES {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "text value for indexed column '{}' exceeds {} byte limit",
+                    column.name(),
+                    constants::MAX_TEXT_INDEX_KEY_BYTES
+                ),
+            ));
+        }
+    }
+    Ok(())
 }

@@ -7,7 +7,7 @@ use crate::{
             ExecutionResult,
             helpers::{
                 get_table_first_page_and_cols, index_new_row, insert_row_into_page,
-                validate_value_type,
+                validate_index_key_length, validate_value_type,
             },
         },
     },
@@ -35,6 +35,12 @@ pub fn execute_insert(
 
     let value_and_col_pairs: Vec<(&Value, &Column)> = values.iter().zip(columns.iter()).collect();
 
+    // get table indexes
+    let index_entries = db
+        .get_indexes_for_table(&table_name)
+        .map(|entries| entries.to_vec())
+        .unwrap_or_default();
+
     // Validate data types
     for (value, column) in &value_and_col_pairs {
         if !validate_value_type(value, column.data_type()) {
@@ -48,13 +54,9 @@ pub fn execute_insert(
                 ),
             ));
         }
-    }
 
-    // get table indexes
-    let index_entries = db
-        .get_indexes_for_table(&table_name)
-        .map(|entries| entries.to_vec())
-        .unwrap_or_default();
+        validate_index_key_length(value, column, &index_entries)?;
+    }
 
     // check for duplicate primary key
     for entry in &index_entries {
@@ -114,6 +116,7 @@ mod tests {
     use super::*;
     use crate::{
         catalog::schema::DataType,
+        constants,
         sql::{
             executor::test_helpers::*,
             parser::{SelectColumns, Statement},
@@ -702,5 +705,75 @@ mod tests {
         }
 
         cleanup("test_duplicate_non_pk");
+    }
+
+    #[test]
+    fn test_insert_text_index_key_exceeds_max_bytes_rejected() {
+        cleanup("test_insert_text_key_too_long");
+        let mut executor = create_test_executor("test_insert_text_key_too_long");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("email", DataType::Text, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // exactly at the limit — should succeed
+        let valid_email = "a".repeat(constants::MAX_TEXT_INDEX_KEY_BYTES);
+        let result = executor.execute(
+            Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![
+                    Value::Text(valid_email.clone()),
+                    Value::Text("Alice".to_string()),
+                ],
+            },
+            &mut None,
+        );
+        assert!(
+            result.is_ok(),
+            "insert at exactly MAX_TEXT_INDEX_KEY_BYTES should succeed"
+        );
+
+        // one byte over the limit — should fail
+        let invalid_email = "a".repeat(constants::MAX_TEXT_INDEX_KEY_BYTES + 1);
+        let result = executor.execute(
+            Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Text(invalid_email), Value::Text("Bob".to_string())],
+            },
+            &mut None,
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+
+        // verify only the valid row was inserted
+        let select = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match select {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get_value(0), Some(&Value::Text(valid_email)));
+            }
+            _ => panic!("expected rows"),
+        }
+
+        cleanup("test_insert_text_key_too_long");
     }
 }

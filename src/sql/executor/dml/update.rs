@@ -8,7 +8,7 @@ use crate::{
             ExecutionResult,
             helpers::{
                 delete_indexes, get_table_first_page_and_cols, index_new_row, insert_row_into_page,
-                resolve_rows, validate_value_type,
+                resolve_rows, validate_index_key_length, validate_value_type,
             },
         },
     },
@@ -49,6 +49,11 @@ pub fn execute_update(
         )
     })?;
 
+    let index_entries = db
+        .get_indexes_for_table(&table_name)
+        .map(|e| e.to_vec())
+        .unwrap_or_default();
+
     // Validate assignments (column exists + type matches)
     for (col_name, value) in &assignments {
         let col_index = all_column_names
@@ -77,6 +82,8 @@ pub fn execute_update(
                 ),
             ));
         }
+
+        validate_index_key_length(value, column, &index_entries)?;
     }
 
     let rows_and_locs = resolve_rows(
@@ -94,11 +101,6 @@ pub fn execute_update(
             message: "0 rows updated.".to_string(),
         });
     }
-
-    let index_entries = db
-        .get_indexes_for_table(&table_name)
-        .map(|e| e.to_vec())
-        .unwrap_or_default();
 
     // Update rows based on WHERE clause
     let mut updated_count = 0;
@@ -206,6 +208,7 @@ mod tests {
     use super::*;
     use crate::{
         catalog::schema::DataType,
+        constants,
         sql::{
             executor::test_helpers::*,
             parser::{BinaryOperator, SelectColumns, Statement},
@@ -1287,5 +1290,79 @@ mod tests {
         }
 
         cleanup("test_update_index_new_slot");
+    }
+
+    #[test]
+    fn test_update_text_index_key_exceeds_max_bytes_rejected() {
+        cleanup("test_update_text_key_too_long");
+        let mut executor = create_test_executor("test_update_text_key_too_long");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("email", DataType::Text, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // insert a valid row
+        let valid_email = "alice@example.com".to_string();
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Text(valid_email.clone()),
+                        Value::Text("Alice".to_string()),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // update with a value that exceeds the limit — should fail
+        let invalid_email = "a".repeat(constants::MAX_TEXT_INDEX_KEY_BYTES + 1);
+        let result = executor.execute(
+            Statement::Update {
+                table_name: "users".to_string(),
+                assignments: vec![("email".to_string(), Value::Text(invalid_email))],
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("email".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Text(valid_email.clone()))),
+                }),
+            },
+            &mut None,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+
+        // verify original row is unchanged
+        let select = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match select {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get_value(0), Some(&Value::Text(valid_email)));
+            }
+            _ => panic!("expected rows"),
+        }
+
+        cleanup("test_update_text_key_too_long");
     }
 }
