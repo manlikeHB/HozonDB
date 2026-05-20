@@ -3,5 +3,13 @@
 version = 4
 
 [[package]]
-name = "hozondb"
+name = "hozondb-client"
+version = "0.1.0"
+
+[[package]]
+name = "hozondb-core"
+version = "0.1.0"
+
+[[package]]
+name = "hozondb-server"
 version = "0.1.0"

@@ -1,8 +1,7 @@
-[package]
-name = "hozondb"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-
-[dev-dependencies]
+[workspace]
+members = [
+    "core",
+    "server",
+    "client",
+]
+resolver = "2"
