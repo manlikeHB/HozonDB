@@ -80,3 +80,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hozondb_core::{
+        proto::execute_response, sql::database::Database, storage::page::PageManager,
+    };
+    use std::fs;
+
+    fn cleanup(name: &str) {
+        let _ = fs::remove_file(format!("{}.hdb", name));
+        let _ = fs::remove_file(format!("{}.hdb.lock", name));
+    }
+
+    fn create_test_service(name: &str) -> HozonDbServer {
+        let pm = PageManager::new(&format!("{}.hdb", name)).unwrap();
+        let db = Database::new(pm).unwrap();
+        let executor = Executor::new(db);
+        HozonDbServer::new(Arc::new(Mutex::new(executor)))
+    }
+
+    #[tokio::test]
+    async fn test_execute_create_table() {
+        cleanup("test_grpc_create");
+        let service = create_test_service("test_grpc_create");
+
+        let request = Request::new(ExecuteRequest {
+            sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);".to_string(),
+        });
+
+        let response = service.execute(request).await.unwrap().into_inner();
+
+        assert!(matches!(
+            response.kind,
+            Some(execute_response::Kind::Message(_))
+        ));
+
+        cleanup("test_grpc_create");
+    }
+
+    #[tokio::test]
+    async fn test_execute_insert_and_select() {
+        cleanup("test_grpc_insert_select");
+        let service = create_test_service("test_grpc_insert_select");
+
+        service
+            .execute(Request::new(ExecuteRequest {
+                sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        service
+            .execute(Request::new(ExecuteRequest {
+                sql: "INSERT INTO users VALUES (1, 'Alice');".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let response = service
+            .execute(Request::new(ExecuteRequest {
+                sql: "SELECT * FROM users;".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        match response.kind {
+            Some(execute_response::Kind::Rows(result_set)) => {
+                assert_eq!(result_set.rows.len(), 1);
+                assert_eq!(result_set.columns, vec!["id", "name"]);
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        cleanup("test_grpc_insert_select");
+    }
+
+    #[tokio::test]
+    async fn test_execute_invalid_sql_returns_error() {
+        cleanup("test_grpc_invalid");
+        let service = create_test_service("test_grpc_invalid");
+
+        let request = Request::new(ExecuteRequest {
+            sql: "SELECT FROM;".to_string(),
+        });
+
+        let result = service.execute(request).await;
+        assert!(result.is_err());
+
+        cleanup("test_grpc_invalid");
+    }
+}
