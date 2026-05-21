@@ -371,10 +371,7 @@ dependencies = [
 name = "hozondb-client"
 version = "0.1.0"
 dependencies = [
- "comfy-table",
  "hozondb-core",
- "rustyline",
- "tokio",
  "tonic",
 ]
 
@@ -394,6 +391,17 @@ dependencies = [
  "hozondb-core",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "hsql"
+version = "0.1.0"
+dependencies = [
+ "comfy-table",
+ "hozondb-client",
+ "hozondb-core",
+ "rustyline",
+ "tokio",
 ]
 
 [[package]]

@@ -1,0 +1,11 @@
+[package]
+name = "hsql"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hozondb-client = { path = "../client"}
+hozondb-core = { path = "../core" }
+rustyline = { workspace = true }
+comfy-table = { workspace = true }
+tokio = { workspace = true }

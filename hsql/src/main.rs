@@ -1,13 +1,14 @@
 use comfy_table::Table;
-use hozondb_core::proto::{
-    ExecuteRequest, execute_response, hozon_db_service_client::HozonDbServiceClient, value,
-};
+use hozondb_client::HozonDBClient;
+use hozondb_core::proto::{execute_response, value};
 use rustyline::error::ReadlineError;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = HozonDbServiceClient::connect("http://[::1]:50051").await?;
-
+    let addr = std::env::args()
+        .nth(1)
+        .ok_or("Usage: hsql -- <server address>")?;
+    let mut client = HozonDBClient::connect(&addr).await?;
     let mut rl = rustyline::DefaultEditor::new()?;
 
     loop {
@@ -22,18 +23,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if sql == ".exit" {
+                    println!("Exiting HozonDB. Goodbye!");
                     break;
                 }
 
-                let request = tonic::Request::new(ExecuteRequest {
-                    sql: sql.to_string(),
-                });
-
-                match client.execute(request).await {
+                match client.execute(sql).await {
                     Ok(response) => {
-                        let res = response.into_inner();
-
-                        if let Some(kind) = res.kind {
+                        if let Some(kind) = response.kind {
                             match kind {
                                 execute_response::Kind::Message(m) => {
                                     println!("{m}");
