@@ -19,6 +19,11 @@ jobs:
       # Cache ~/.cargo and target/
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Build
         run: cargo build --verbose
 
