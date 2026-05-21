@@ -3,7 +3,8 @@ members = [
     "core",
     "server",
     "client", 
-    "hsql",
+    "hsql", 
+    "tests",
 ]
 resolver = "2"
 

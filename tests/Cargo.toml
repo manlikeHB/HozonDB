@@ -1,0 +1,11 @@
+[package]
+name = "hozondb-tests"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+hozondb-core = { path = "../core" }
+hozondb-client = { path = "../client" }
+hozondb-server = { path = "../server" }
+tokio = { workspace = true }
+tonic = { workspace = true }

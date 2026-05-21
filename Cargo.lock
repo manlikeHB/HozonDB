@@ -394,6 +394,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hozondb-tests"
+version = "0.1.0"
+dependencies = [
+ "hozondb-client",
+ "hozondb-core",
+ "hozondb-server",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "hsql"
 version = "0.1.0"
 dependencies = [
