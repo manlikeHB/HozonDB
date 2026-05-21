@@ -14,6 +14,36 @@ Rather than relying on existing database libraries, HozonDB explicitly implement
 
 ---
 
+## Prerequisites
+
+- Rust (latest stable)
+- `protoc` — Protocol Buffers compiler
+
+On Debian/Ubuntu:
+```bash
+sudo apt-get install protobuf-compiler
+```
+
+On macOS:
+```bash
+brew install protobuf
+```
+
+---
+
+## Workspace Structure
+
+```
+hozondb/
+├── core/       # database engine (library) — storage, executor, parser, proto types
+├── server/     # gRPC server binary
+├── client/     # gRPC client library
+├── hsql/       # interactive CLI (connects to server over gRPC)
+└── tests/      # integration tests
+```
+
+---
+
 ## Capabilities
 
 - Page-based persistent storage with file-level locking
@@ -26,6 +56,8 @@ Rather than relying on existing database libraries, HozonDB explicitly implement
 - Multi-page tables with automatic page allocation
 - System catalog for schema and index persistence across restarts
 - Benchmark suite with before/after index metrics
+- **gRPC client-server interface** — server exposes SQL execution over gRPC
+- **`hsql` CLI** — readline-powered interactive shell that connects to the server over gRPC
 
 ---
 
@@ -33,7 +65,11 @@ Rather than relying on existing database libraries, HozonDB explicitly implement
 
 ```
 ┌──────────────────────────────────────────┐
-│               REPL / CLI                 │  rustyline-based interactive shell
+│             hsql (CLI client)            │  rustyline-based interactive shell
+└────────────────────┬─────────────────────┘
+                     │ gRPC
+┌────────────────────▼─────────────────────┐
+│            gRPC Server                   │  tonic + tokio async transport
 └────────────────────┬─────────────────────┘
                      │
 ┌────────────────────▼─────────────────────┐
@@ -124,24 +160,31 @@ Point lookups on indexed columns: **59x fewer page reads** compared to full scan
 - Index-aware INSERT, UPDATE, DELETE
 - PRIMARY KEY uniqueness enforcement
 - Benchmark suite with index metrics
+- gRPC client-server interface
+- `hsql` interactive CLI over gRPC
 
 **Planned:**
 - `CREATE INDEX` — explicit index creation on any column
+- Server-side streaming for SELECT results
 - Write-ahead log (WAL) for crash recovery
 - `BEGIN` / `COMMIT` / `ROLLBACK` transaction support
-- gRPC interface for client-server access
 - Distributed replication (Raft consensus)
 
 ---
 
 ## Quick Start
 
+**Start the server:**
 ```bash
-cargo run
+cargo run -p hozondb-server -- mydb
+```
+
+**Connect with the CLI:**
+```bash
+cargo run -p hsql -- http://[::1]:50051
 ```
 
 ```sql
-hozondb> .open mydb.hdb
 hozondb> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
 hozondb> INSERT INTO users VALUES (1, 'Alice');
 hozondb> INSERT INTO users VALUES (2, 'Bob');
@@ -153,6 +196,5 @@ hozondb> .exit
 ```
 
 ```bash
-cargo test        # run all tests
-cargo run -- .benchmark 10000  # run benchmark with 10,000 rows
+cargo test --workspace   # run all tests
 ```
