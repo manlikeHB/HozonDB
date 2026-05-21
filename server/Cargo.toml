@@ -8,6 +8,7 @@ tonic = { workspace = true}
 hozondb-core = { path = "../core"}
 tokio = { workspace = true }
 
+
 [dev-dependencies]
 
 [build-dependencies]

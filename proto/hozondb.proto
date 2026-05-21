@@ -11,10 +11,15 @@ message ExecuteRequest {
 }
 
 message ExecuteResponse {
-    bool success = 1;
-    string message = 2;
-    repeated Row rows = 3; 
-    repeated string columns = 4;
+    oneof kind {
+        string message = 1;
+        ResultSet rows = 2;
+    }
+}
+
+message ResultSet {
+    repeated Row rows = 1;
+    repeated string columns = 2;
 }
 
 message Row {
@@ -23,7 +28,7 @@ message Row {
 
 message Value {
     oneof kind {
-        int64 integer = 1;
+        int32 integer = 1;
         string text = 2;
         bool boolean = 3;
         bool is_null = 4;
