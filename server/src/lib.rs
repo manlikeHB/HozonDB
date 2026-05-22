@@ -43,35 +43,52 @@ impl HozonDbServer {
 impl HozonDbService for HozonDbServer {
     type QueryStream = Pin<Box<dyn Stream<Item = Result<QueryResponse, Status>> + Send>>;
 
+    #[tracing::instrument(skip(self, request), fields(sql = %request.get_ref().sql))]
     async fn execute(
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
+        let start = std::time::Instant::now();
         let sql = request.into_inner().sql;
+        tracing::info!("Executing statement");
 
-        let res = match self.execute_sql(&sql).await? {
-            ExecutionResult::Success { message } => ExecuteResponse {
+        let res = match self.execute_sql(&sql).await {
+            Ok(ExecutionResult::Success { message }) => ExecuteResponse {
                 kind: Some(execute_response::Kind::Message(message)),
             },
+            Err(e) => {
+                tracing::error!(error = %e, "Statement execution failed");
+                return Err(Status::from(e));
+            }
             _ => {
+                tracing::warn!("Query command sent to execute RPC");
                 return Err(Status::invalid_argument(
                     "Query commands should be handled with `query`",
                 ));
             }
         };
 
+        tracing::info!(duration_ms = %start.elapsed().as_millis(), "Statement completed");
         Ok(Response::new(res))
     }
 
+    #[tracing::instrument(skip(self, request), fields(sql = %request.get_ref().sql))]
     async fn query(
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
+        let start = std::time::Instant::now();
         let sql = request.into_inner().sql;
+        tracing::info!("Executing query");
 
-        let (columns, rows) = match self.execute_sql(&sql).await? {
-            ExecutionResult::Rows { columns, rows } => (columns, rows),
+        let (columns, rows) = match self.execute_sql(&sql).await {
+            Ok(ExecutionResult::Rows { columns, rows }) => (columns, rows),
+            Err(e) => {
+                tracing::error!(error = %e, "Query execution failed");
+                return Err(Status::from(e));
+            }
             _ => {
+                tracing::warn!("Modification command sent to query RPC");
                 return Err(Status::invalid_argument(
                     "Modification commands should be handled with `execute`",
                 ));
@@ -88,6 +105,7 @@ impl HozonDbService for HozonDbServer {
         };
 
         query_response.push(Ok(headers));
+        let rows_len = rows.len();
 
         for row in rows {
             let row_res = QueryResponse {
@@ -96,6 +114,7 @@ impl HozonDbService for HozonDbServer {
             query_response.push(Ok(row_res));
         }
 
+        tracing::info!(duration_ms = %start.elapsed().as_millis(), rows = rows_len, "Query completed");
         Ok(Response::new(Box::pin(tokio_stream::iter(query_response))))
     }
 }
@@ -109,7 +128,7 @@ pub async fn start_server(
     let executor = Executor::new(db);
     let service = HozonDbServer::new(Arc::new(Mutex::new(executor)));
 
-    println!("HozonDB server listening on {}", addr);
+    tracing::info!("HozonDB server listening on {}", addr);
 
     tokio::select! {
         result = Server::builder()
@@ -118,7 +137,7 @@ pub async fn start_server(
                 result?;
             }
         _ = tokio::signal::ctrl_c() => {
-            println!("\nShutting down server...");
+            tracing::info!("Shutting down server...");
         }
     }
 

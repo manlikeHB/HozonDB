@@ -8,7 +8,8 @@ tonic = { workspace = true}
 hozondb-core = { path = "../core"}
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 
