@@ -1,7 +1,8 @@
 use hozondb_client::HozonDBClient;
-use hozondb_core::proto::execute_response;
+use hozondb_core::proto::{execute_response, query_response};
 use hozondb_server::start_server;
 use std::{fs, net::SocketAddr};
+use tokio_stream::StreamExt;
 
 fn cleanup(name: &str) {
     let _ = fs::remove_file(format!("{}.hdb", name));
@@ -55,15 +56,23 @@ async fn test_full_round_trip() {
         .await
         .unwrap();
 
-    // SELECT
-    let res = client.execute("SELECT * FROM users;").await.unwrap();
-    match res.kind {
-        Some(execute_response::Kind::Rows(result_set)) => {
-            assert_eq!(result_set.rows.len(), 2);
-            assert_eq!(result_set.columns, vec!["id", "name"]);
+    // SELECT - first message is headers
+    let mut stream = client.query("SELECT * FROM users;").await.unwrap();
+
+    let first = stream.next().await.unwrap().unwrap();
+    match first.payload {
+        Some(query_response::Payload::Headers(h)) => {
+            assert_eq!(h.columns, vec!["id", "name"]);
         }
-        _ => panic!("Expected Rows"),
+        _ => panic!("Expected Headers"),
     }
+
+    // collect remaining rows
+    let mut row_count = 0;
+    while let Some(Ok(_)) = stream.next().await {
+        row_count += 1;
+    }
+    assert_eq!(row_count, 2);
 
     cleanup("test_integration");
 }

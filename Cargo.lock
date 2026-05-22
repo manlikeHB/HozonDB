@@ -390,6 +390,7 @@ version = "0.1.0"
 dependencies = [
  "hozondb-core",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -401,6 +402,7 @@ dependencies = [
  "hozondb-core",
  "hozondb-server",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 

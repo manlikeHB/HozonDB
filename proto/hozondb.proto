@@ -4,6 +4,7 @@ package hozondb;
 
 service HozonDBService {
     rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+    rpc Query(QueryRequest) returns (stream QueryResponse);
 }
 
 message ExecuteRequest {
@@ -33,4 +34,19 @@ message Value {
         bool boolean = 3;
         bool is_null = 4;
     }
+}
+
+message QueryRequest {
+    string sql = 1;
+}
+
+message QueryResponse {
+    oneof payload {
+        Headers headers = 1;
+        Row row = 2;
+    }
+}
+
+message Headers {
+    repeated string columns = 1;
 }

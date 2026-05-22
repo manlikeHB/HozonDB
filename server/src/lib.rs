@@ -1,8 +1,13 @@
+use hozondb_core::proto::query_response::Payload;
+use std::io;
+use std::pin::Pin;
 use std::{net::SocketAddr, sync::Arc};
+use tokio_stream::Stream;
 
+use hozondb_core::proto::{Headers, QueryRequest, QueryResponse};
 use hozondb_core::{
     proto::{
-        ExecuteRequest, ExecuteResponse, ResultSet, execute_response,
+        ExecuteRequest, ExecuteResponse, execute_response,
         hozon_db_service_server::{HozonDbService, HozonDbServiceServer},
     },
     sql::{
@@ -25,32 +30,73 @@ impl HozonDbServer {
     pub fn new(executor: Arc<Mutex<Executor>>) -> Self {
         HozonDbServer { executor }
     }
+
+    async fn execute_sql(&self, sql: &str) -> Result<ExecutionResult, io::Error> {
+        let tokens = tokenizer::tokenize(&sql)?;
+        let statement = parser::Parser::new(tokens).parse()?;
+
+        self.executor.lock().await.execute(statement, &mut None)
+    }
 }
 
 #[tonic::async_trait]
 impl HozonDbService for HozonDbServer {
+    type QueryStream = Pin<Box<dyn Stream<Item = Result<QueryResponse, Status>> + Send>>;
+
     async fn execute(
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
         let sql = request.into_inner().sql;
 
-        let tokens = tokenizer::tokenize(&sql)?;
-        let statement = parser::Parser::new(tokens).parse()?;
-
-        let res = match self.executor.lock().await.execute(statement, &mut None)? {
+        let res = match self.execute_sql(&sql).await? {
             ExecutionResult::Success { message } => ExecuteResponse {
                 kind: Some(execute_response::Kind::Message(message)),
             },
-            ExecutionResult::Rows { columns, rows } => ExecuteResponse {
-                kind: Some(execute_response::Kind::Rows(ResultSet {
-                    rows: rows.into_iter().map(|r| From::from(r)).collect(),
-                    columns,
-                })),
-            },
+            _ => {
+                return Err(Status::invalid_argument(
+                    "Query commands should be handled with `query`",
+                ));
+            }
         };
 
         Ok(Response::new(res))
+    }
+
+    async fn query(
+        &self,
+        request: Request<QueryRequest>,
+    ) -> Result<Response<Self::QueryStream>, Status> {
+        let sql = request.into_inner().sql;
+
+        let (columns, rows) = match self.execute_sql(&sql).await? {
+            ExecutionResult::Rows { columns, rows } => (columns, rows),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "Modification commands should be handled with `execute`",
+                ));
+            }
+        };
+
+        // TODO: This buffers all rows into memory before streaming.
+        // True streaming requires the executor to yield rows incrementally (page by page).
+        // See the TODO in execute_select for the required executor changes.
+        let mut query_response = Vec::new();
+
+        let headers = QueryResponse {
+            payload: Some(Payload::Headers(Headers { columns })),
+        };
+
+        query_response.push(Ok(headers));
+
+        for row in rows {
+            let row_res = QueryResponse {
+                payload: Some(Payload::Row(row.into())),
+            };
+            query_response.push(Ok(row_res));
+        }
+
+        Ok(Response::new(Box::pin(tokio_stream::iter(query_response))))
     }
 }
 
@@ -86,6 +132,7 @@ mod tests {
         proto::execute_response, sql::database::Database, storage::page::PageManager,
     };
     use std::fs;
+    use tokio_stream::StreamExt;
 
     fn cleanup(name: &str) {
         let _ = fs::remove_file(format!("{}.hdb", name));
@@ -137,20 +184,30 @@ mod tests {
             .await
             .unwrap();
 
-        let response = service
-            .execute(Request::new(ExecuteRequest {
+        let mut stream = service
+            .query(Request::new(QueryRequest {
                 sql: "SELECT * FROM users;".to_string(),
             }))
             .await
             .unwrap()
             .into_inner();
 
-        match response.kind {
-            Some(execute_response::Kind::Rows(result_set)) => {
-                assert_eq!(result_set.rows.len(), 1);
-                assert_eq!(result_set.columns, vec!["id", "name"]);
+        // first message should be headers
+        let first = stream.next().await.unwrap().unwrap();
+        match first.payload {
+            Some(Payload::Headers(h)) => {
+                assert_eq!(h.columns, vec!["id", "name"]);
             }
-            _ => panic!("Expected Rows"),
+            _ => panic!("Expected Headers"),
+        }
+
+        // second message should be the row
+        let second = stream.next().await.unwrap().unwrap();
+        match second.payload {
+            Some(Payload::Row(r)) => {
+                assert_eq!(r.values.len(), 2);
+            }
+            _ => panic!("Expected Row"),
         }
 
         cleanup("test_grpc_insert_select");
@@ -161,11 +218,11 @@ mod tests {
         cleanup("test_grpc_invalid");
         let service = create_test_service("test_grpc_invalid");
 
-        let request = Request::new(ExecuteRequest {
+        let request = Request::new(QueryRequest {
             sql: "SELECT FROM;".to_string(),
         });
 
-        let result = service.execute(request).await;
+        let result = service.query(request).await;
         assert!(result.is_err());
 
         cleanup("test_grpc_invalid");

@@ -1,8 +1,9 @@
 use hozondb_core::proto::{
-    ExecuteRequest, ExecuteResponse, hozon_db_service_client::HozonDbServiceClient,
+    ExecuteRequest, ExecuteResponse, QueryRequest, QueryResponse,
+    hozon_db_service_client::HozonDbServiceClient,
 };
 use tonic::{
-    Status,
+    Status, Streaming,
     transport::{self, Channel},
 };
 
@@ -23,5 +24,13 @@ impl HozonDBClient {
         });
 
         Ok(self.client.execute(request).await?.into_inner())
+    }
+
+    pub async fn query(&mut self, sql: &str) -> Result<Streaming<QueryResponse>, Status> {
+        let request = tonic::Request::new(QueryRequest {
+            sql: sql.to_string(),
+        });
+
+        Ok(self.client.query(request).await?.into_inner())
     }
 }

@@ -1,6 +1,6 @@
 use comfy_table::Table;
 use hozondb_client::HozonDBClient;
-use hozondb_core::proto::{execute_response, value};
+use hozondb_core::proto::{execute_response, query_response::Payload, value};
 use rustyline::error::ReadlineError;
 
 #[tokio::main]
@@ -27,39 +27,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
 
-                match client.execute(sql).await {
-                    Ok(response) => {
-                        if let Some(kind) = response.kind {
-                            match kind {
-                                execute_response::Kind::Message(m) => {
-                                    println!("{m}");
+                let sql_lower = sql.to_lowercase();
+                if sql_lower.starts_with("select") {
+                    match client.query(sql).await {
+                        Ok(mut stream) => {
+                            let mut table = Table::new();
+
+                            loop {
+                                match stream.message().await? {
+                                    Some(res) => match res.payload {
+                                        Some(p) => build_table(p, &mut table),
+                                        None => continue,
+                                    },
+                                    None => break,
                                 }
-                                execute_response::Kind::Rows(result_set) => {
-                                    let mut table = Table::new();
+                            }
 
-                                    table.set_header(result_set.columns);
-
-                                    for row in &result_set.rows {
-                                        let cells: Vec<String> = row
-                                            .values
-                                            .iter()
-                                            .map(|v| match &v.kind {
-                                                Some(value::Kind::Integer(i)) => i.to_string(),
-                                                Some(value::Kind::Text(t)) => t.clone(),
-                                                Some(value::Kind::Boolean(b)) => b.to_string(),
-                                                Some(value::Kind::IsNull(_)) => "NULL".to_string(),
-                                                None => "NULL".to_string(),
-                                            })
-                                            .collect();
-                                        table.add_row(cells);
+                            println!("{table}");
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e.message())
+                        }
+                    }
+                } else {
+                    match client.execute(sql).await {
+                        Ok(response) => {
+                            if let Some(kind) = response.kind {
+                                match kind {
+                                    execute_response::Kind::Message(m) => {
+                                        println!("{m}");
                                     }
-
-                                    println!("{table}");
+                                    _ => eprintln!("Error: Expected a message response"),
                                 }
                             }
                         }
+                        Err(e) => {
+                            eprintln!("Error: {}", e.message())
+                        }
                     }
-                    Err(e) => eprintln!("Error: {}", e.message()),
                 }
             }
             Err(ReadlineError::Interrupted) => break,
@@ -72,4 +77,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn build_table(payload: Payload, table: &mut Table) {
+    match payload {
+        Payload::Headers(h) => {
+            table.set_header(h.columns);
+        }
+        Payload::Row(r) => {
+            let cells: Vec<String> = r
+                .values
+                .iter()
+                .map(|v| match &v.kind {
+                    Some(value::Kind::Integer(i)) => i.to_string(),
+                    Some(value::Kind::Text(t)) => t.clone(),
+                    Some(value::Kind::Boolean(b)) => b.to_string(),
+                    Some(value::Kind::IsNull(_)) => "NULL".to_string(),
+                    None => "NULL".to_string(),
+                })
+                .collect();
+            table.add_row(cells);
+        }
+    }
 }

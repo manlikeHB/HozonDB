@@ -12,6 +12,12 @@ use crate::{
     sql::parser::{Expr, SelectColumns},
 };
 
+// TODO: Stream rows incrementally instead of collecting into Vec<Row>.
+// Currently all rows are buffered in memory before returning, which means
+// server-side gRPC streaming sends everything at once under the hood.
+// Fix: change ExecutionResult::Rows to yield rows page-by-page, likely
+// via a channel (tokio::sync::mpsc) or an async iterator, so the server
+// can stream rows to the client as pages are read from disk.
 pub fn execute_select(
     db: &mut Database,
     table_name: String,
