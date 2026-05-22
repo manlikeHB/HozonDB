@@ -1,3 +1,9 @@
+//! hsql — interactive CLI for HozonDB.
+//!
+//! Connects to a running HozonDB server over gRPC.
+//! Usage: hsql <server_address>
+//! Example: hsql http://[::1]:50051
+
 use comfy_table::Table;
 use hozondb_client::HozonDBClient;
 use hozondb_core::proto::{execute_response, query_response::Payload, value};

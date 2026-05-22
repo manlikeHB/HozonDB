@@ -22,6 +22,10 @@ use hozondb_core::{
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status, transport::Server};
 
+/// gRPC service implementation for HozonDB.
+///
+/// Wraps the query executor behind a mutex for safe concurrent access.
+/// All queries are serialized — one executes at a time.
 pub struct HozonDbServer {
     executor: Arc<Mutex<Executor>>,
 }
@@ -119,6 +123,11 @@ impl HozonDbService for HozonDbServer {
     }
 }
 
+/// Starts the HozonDB gRPC server on the given address.
+///
+/// Opens the database file at `{db_name}.hdb`, initializes the executor,
+/// and listens for incoming connections. Shuts down gracefully on Ctrl+C,
+/// ensuring the database lock file is released.
 pub async fn start_server(
     addr: SocketAddr,
     db_name: &str,
