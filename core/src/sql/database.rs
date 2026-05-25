@@ -23,7 +23,8 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(mut page_manager: PageManager) -> io::Result<Self> {
+    pub fn new(db_name: &str) -> io::Result<Self> {
+        let mut page_manager = PageManager::new(db_name)?;
         let table_catalog = TableCatalog::new(&mut page_manager)?;
         let index_catalog = IndexCatalog::new(&mut page_manager)?;
         let mut indexes = HashMap::new();

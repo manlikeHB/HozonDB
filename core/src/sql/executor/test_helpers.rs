@@ -1,7 +1,4 @@
-use crate::{
-    sql::{database::Database, executor::Executor},
-    storage::page::PageManager,
-};
+use crate::sql::{database::Database, executor::Executor};
 
 use std::fs;
 
@@ -11,7 +8,6 @@ pub fn cleanup(basename: &str) {
 }
 
 pub fn create_test_executor(db_name: &str) -> Executor {
-    let pm = PageManager::new(&format!("{}.hdb", db_name)).unwrap();
-    let db = Database::new(pm).unwrap();
+    let db = Database::new(db_name).unwrap();
     Executor::new(db)
 }

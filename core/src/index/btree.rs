@@ -496,7 +496,7 @@ mod tests {
     }
 
     fn setup_tree(name: &str, count: i32) -> (BPlusTree, PageManager) {
-        let mut pm = PageManager::new(&format!("{}.hdb", name)).unwrap();
+        let mut pm = PageManager::new(name).unwrap();
         let mut btree = BPlusTree::new(4, &mut pm).unwrap();
 
         for i in 1..=count {
@@ -516,7 +516,7 @@ mod tests {
     fn test_insert_before_split() {
         cleanup("test_insert_before_split");
 
-        let mut pm = PageManager::new("test_insert_before_split.hdb").unwrap();
+        let mut pm = PageManager::new("test_insert_before_split").unwrap();
         let mut btree = BPlusTree::new(3, &mut pm).unwrap();
         let rows = get_rows(btree.order);
         let keys = get_integer_keys(btree.order);
@@ -546,7 +546,7 @@ mod tests {
     fn test_insert_till_leaf_split() {
         cleanup("test_insert_till_leaf_split");
 
-        let mut pm = PageManager::new("test_insert_till_leaf_split.hdb").unwrap();
+        let mut pm = PageManager::new("test_insert_till_leaf_split").unwrap();
         let mut btree = BPlusTree::new(3, &mut pm).unwrap();
         let rows = get_rows(btree.order);
         let keys = get_integer_keys(btree.order);
@@ -577,7 +577,7 @@ mod tests {
     fn test_insert_till_internal_node_split() {
         cleanup("test_insert_till_internal_node_split");
 
-        let mut pm = PageManager::new("test_insert_till_internal_node_split.hdb").unwrap();
+        let mut pm = PageManager::new("test_insert_till_internal_node_split").unwrap();
         let mut btree = BPlusTree::new(3, &mut pm).unwrap();
         let rows = get_rows(btree.order);
         let keys = get_integer_keys(9);
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn test_search_empty_tree() {
         cleanup("test_search_empty_tree");
-        let mut pm = PageManager::new("test_search_empty_tree.hdb").unwrap();
+        let mut pm = PageManager::new("test_search_empty_tree").unwrap();
         let mut btree = BPlusTree::new(3, &mut pm).unwrap();
 
         let res = btree.search(&IndexKey::Integer(5), &mut pm).unwrap();
@@ -641,7 +641,7 @@ mod tests {
     fn test_search_tree_with_leaf_nodes() {
         cleanup("test_search_tree_with_leaf_nodes");
 
-        let mut pm = PageManager::new("test_search_tree_with_leaf_nodes.hdb").unwrap();
+        let mut pm = PageManager::new("test_search_tree_with_leaf_nodes").unwrap();
         let mut btree = BPlusTree::new(3, &mut pm).unwrap();
 
         let row_1_page_id = 100;
@@ -674,7 +674,7 @@ mod tests {
     fn test_search_tree_with_internal_nodes() {
         cleanup("test_search_tree_with_internal_nodes");
 
-        let mut pm = PageManager::new("test_search_tree_with_internal_nodes.hdb").unwrap();
+        let mut pm = PageManager::new("test_search_tree_with_internal_nodes").unwrap();
         let mut btree = BPlusTree::new(3, &mut pm).unwrap();
 
         let rows = get_rows(15);
@@ -714,7 +714,7 @@ mod tests {
     fn test_delete_key() {
         cleanup("test_delete_key");
 
-        let mut pm = PageManager::new("test_delete_key.hdb").unwrap();
+        let mut pm = PageManager::new("test_delete_key").unwrap();
         let mut btree = BPlusTree::new(3, &mut pm).unwrap();
 
         let rows = get_rows(15);
@@ -757,7 +757,7 @@ mod tests {
     fn test_load_node_and_write_node() {
         cleanup("test_load_node");
 
-        let mut pm = PageManager::new("test_load_node.hdb").unwrap();
+        let mut pm = PageManager::new("test_load_node").unwrap();
         let mut btree = BPlusTree::new(3, &mut pm).unwrap();
         let node = Node::Leaf(LeafNode::new());
         let key = IndexKey::Integer(5);
@@ -794,7 +794,7 @@ mod tests {
         let mut _root_page_id = 0;
 
         {
-            let mut pm = PageManager::new("test_load_b_plus_tree.hdb").unwrap();
+            let mut pm = PageManager::new("test_load_b_plus_tree").unwrap();
             let mut btree = BPlusTree::new(order, &mut pm).unwrap();
 
             // insert into btree so the next page (1) get assigned
@@ -804,7 +804,7 @@ mod tests {
         }
 
         {
-            let mut pm = PageManager::new("test_load_b_plus_tree.hdb").unwrap();
+            let mut pm = PageManager::new("test_load_b_plus_tree").unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0); // should be empty
 
@@ -826,8 +826,7 @@ mod tests {
         let mut _root_page_id = 0;
 
         {
-            let mut pm =
-                PageManager::new("test_load_b_plus_tree_internal_node_integer.hdb").unwrap();
+            let mut pm = PageManager::new("test_load_b_plus_tree_internal_node_integer").unwrap();
             let mut btree = BPlusTree::new(order, &mut pm).unwrap();
 
             let keys = get_integer_keys(15);
@@ -848,8 +847,7 @@ mod tests {
         }
 
         {
-            let mut pm =
-                PageManager::new("test_load_b_plus_tree_internal_node_integer.hdb").unwrap();
+            let mut pm = PageManager::new("test_load_b_plus_tree_internal_node_integer").unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0); // should be empty
 
@@ -871,7 +869,7 @@ mod tests {
         let mut _root_page_id = 0;
 
         {
-            let mut pm = PageManager::new("test_load_b_plus_tree_internal_node_text.hdb").unwrap();
+            let mut pm = PageManager::new("test_load_b_plus_tree_internal_node_text").unwrap();
             let mut btree = BPlusTree::new(order, &mut pm).unwrap();
 
             let rows = get_rows(15);
@@ -897,7 +895,7 @@ mod tests {
         }
 
         {
-            let mut pm = PageManager::new("test_load_b_plus_tree_internal_node_text.hdb").unwrap();
+            let mut pm = PageManager::new("test_load_b_plus_tree_internal_node_text").unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0); // should be empty
 
@@ -921,7 +919,7 @@ mod tests {
         let mut _root_page_id = 0;
 
         {
-            let mut pm = PageManager::new("test_delete_persistence_round_trip.hdb").unwrap();
+            let mut pm = PageManager::new("test_delete_persistence_round_trip").unwrap();
             let mut btree = BPlusTree::new(order, &mut pm).unwrap();
 
             btree.insert(key_1.clone(), row_1, &mut pm).unwrap();
@@ -948,7 +946,7 @@ mod tests {
         }
 
         {
-            let mut pm = PageManager::new("test_delete_persistence_round_trip.hdb").unwrap();
+            let mut pm = PageManager::new("test_delete_persistence_round_trip").unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
 
             // verify key_1 is still deleted
@@ -976,7 +974,7 @@ mod tests {
         let rows = get_rows(order + 1);
 
         {
-            let mut pm = PageManager::new("test_create_new_root_persistence.hdb").unwrap();
+            let mut pm = PageManager::new("test_create_new_root_persistence").unwrap();
             let mut btree = BPlusTree::new(order, &mut pm).unwrap();
 
             for (key, row) in keys.iter().zip(rows.iter()) {
@@ -994,7 +992,7 @@ mod tests {
         }
 
         {
-            let mut pm = PageManager::new("test_create_new_root_persistence.hdb").unwrap();
+            let mut pm = PageManager::new("test_create_new_root_persistence").unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0);
 
@@ -1035,7 +1033,7 @@ mod tests {
         let mut _prev_root: Option<PageId> = None;
 
         {
-            let mut pm = PageManager::new("test_root_changes_multiple_times.hdb").unwrap();
+            let mut pm = PageManager::new("test_root_changes_multiple_times").unwrap();
             let mut btree = BPlusTree::new(order, &mut pm).unwrap();
 
             for (key, row) in keys.iter().zip(rows.iter()) {
@@ -1059,7 +1057,7 @@ mod tests {
         }
 
         {
-            let mut pm = PageManager::new("test_root_changes_multiple_times.hdb").unwrap();
+            let mut pm = PageManager::new("test_root_changes_multiple_times").unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0);
 
@@ -1229,7 +1227,7 @@ mod tests {
         cleanup(name);
 
         // order 3 with 15 keys guarantees multiple leaf nodes
-        let mut pm = PageManager::new(&format!("{}.hdb", name)).unwrap();
+        let mut pm = PageManager::new(name).unwrap();
         let mut btree = BPlusTree::new(3, &mut pm).unwrap();
 
         for i in 1..=15 {

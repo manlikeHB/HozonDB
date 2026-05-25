@@ -36,13 +36,14 @@ pub struct PageMetadata {
 }
 
 impl PageManager {
-    pub fn new(path: &str) -> io::Result<Self> {
+    pub fn new(db_name: &str) -> io::Result<Self> {
+        let path = format!("{db_name}.hdb");
         let lock_path = PathBuf::from(format!("{}.lock", path));
 
         // try to acquire lock
         Self::acquire_lock(Path::new(&lock_path))?;
 
-        if Path::new(path).exists() {
+        if Path::new(&path).exists() {
             let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 
             // Go to start of file
@@ -429,27 +430,24 @@ mod tests {
 
     #[test]
     fn test_page_manager_new() {
-        let _ = fs::remove_file("test.db");
-        let _ = fs::remove_file("test.db.lock");
+        cleanup("test");
 
-        let pm = PageManager::new("test.db");
+        let pm = PageManager::new("test");
         assert!(pm.is_ok());
         assert_eq!(pm.unwrap().num_pages(), 1);
 
-        let pm2 = PageManager::new("test.db");
+        let pm2 = PageManager::new("test");
         assert!(pm2.is_ok());
         assert_eq!(pm2.unwrap().num_pages(), 1);
 
-        let _ = fs::remove_file("test.db");
-        let _ = fs::remove_file("test.db.lock");
+        cleanup("test");
     }
 
     #[test]
     fn test_allocate_page() {
-        let _ = fs::remove_file("test_alloc.db");
-        let _ = fs::remove_file("test_alloc.db.lock");
+        cleanup("test_alloc");
 
-        let mut pm = PageManager::new("test_alloc.db").unwrap();
+        let mut pm = PageManager::new("test_alloc").unwrap();
         assert_eq!(pm.num_pages(), 1);
 
         let page_id = pm.allocate_page().unwrap();
@@ -461,23 +459,21 @@ mod tests {
         assert_eq!(pm.num_pages(), 3);
 
         drop(pm);
-        let pm = PageManager::new("test_alloc.db").unwrap();
+        let pm = PageManager::new("test_alloc").unwrap();
         assert_eq!(pm.num_pages(), 3);
 
-        let _ = fs::remove_file("test_alloc.db");
-        let _ = fs::remove_file("test_alloc.db.lock");
+        cleanup("test_alloc");
     }
 
     #[test]
     fn test_concurrent_access_prevention() {
-        let _ = fs::remove_file("test_lock.db");
-        let _ = fs::remove_file("test_lock.db.lock");
+        cleanup("test_lock");
 
         // First connection acquires lock
-        let _pm1 = PageManager::new("test_lock.db").unwrap();
+        let _pm1 = PageManager::new("test_lock").unwrap();
 
         // Second connection should fail
-        let pm2 = PageManager::new("test_lock.db");
+        let pm2 = PageManager::new("test_lock");
         assert!(pm2.is_err());
         assert_eq!(pm2.unwrap_err().kind(), io::ErrorKind::WouldBlock);
 
@@ -485,19 +481,17 @@ mod tests {
         drop(_pm1);
 
         // Now we should be able to open again
-        let pm3 = PageManager::new("test_lock.db");
+        let pm3 = PageManager::new("test_lock");
         assert!(pm3.is_ok());
 
-        let _ = fs::remove_file("test_lock.db");
-        let _ = fs::remove_file("test_lock.db.lock");
+        cleanup("test_lock");
     }
 
     #[test]
     fn test_write_and_read_page() {
-        let _ = fs::remove_file("test_rw.db");
-        let _ = fs::remove_file("test_rw.db.lock");
+        cleanup("test_rw");
 
-        let mut pm = PageManager::new("test_rw.db").unwrap();
+        let mut pm = PageManager::new("test_rw").unwrap();
 
         // Allocate a page
         let page_id = pm.allocate_page().unwrap();
@@ -516,16 +510,14 @@ mod tests {
         // Check that rest is zeros (padding)
         assert!(read_data[data.len()..].iter().all(|&b| b == 0));
 
-        let _ = fs::remove_file("test_rw.db");
-        let _ = fs::remove_file("test_rw.db.lock");
+        cleanup("test_rw");
     }
 
     #[test]
     fn test_write_full_page() {
-        let _ = fs::remove_file("test_full.db");
-        let _ = fs::remove_file("test_full.db.lock");
+        cleanup("test_full");
 
-        let mut pm = PageManager::new("test_full.db").unwrap();
+        let mut pm = PageManager::new("test_full").unwrap();
         let page_id = pm.allocate_page().unwrap();
 
         // Write exactly PAGE_SIZE bytes
@@ -536,31 +528,27 @@ mod tests {
         let read_data = pm.read_page(page_id).unwrap();
         assert_eq!(read_data, data);
 
-        let _ = fs::remove_file("test_full.db");
-        let _ = fs::remove_file("test_full.db.lock");
+        cleanup("test_full");
     }
 
     #[test]
     fn test_write_invalid_page() {
-        let _ = fs::remove_file("test_invalid.db");
-        let _ = fs::remove_file("test_invalid.db.lock");
+        cleanup("test_invalid");
 
-        let mut pm = PageManager::new("test_invalid.db").unwrap();
+        let mut pm = PageManager::new("test_invalid").unwrap();
 
         // Try to write to non-existent page
         let result = pm.write_page(999, b"data");
         assert!(result.is_err());
 
-        let _ = fs::remove_file("test_invalid.db");
-        let _ = fs::remove_file("test_invalid.db.lock");
+        cleanup("test_invalid");
     }
 
     #[test]
     fn test_write_oversized_data() {
-        let _ = fs::remove_file("test_oversize.db");
-        let _ = fs::remove_file("test_oversize.db.lock");
+        cleanup("test_oversize");
 
-        let mut pm = PageManager::new("test_oversize.db").unwrap();
+        let mut pm = PageManager::new("test_oversize").unwrap();
         let page_id = pm.allocate_page().unwrap();
 
         // Try to write more than PAGE_SIZE
@@ -568,16 +556,14 @@ mod tests {
         let result = pm.write_page(page_id, &data);
         assert!(result.is_err());
 
-        let _ = fs::remove_file("test_oversize.db");
-        let _ = fs::remove_file("test_oversize.db.lock");
+        cleanup("test_oversize");
     }
 
     #[test]
     fn test_page_metadata_initialization() {
-        let _ = fs::remove_file("test_metadata_init.db");
-        let _ = fs::remove_file("test_metadata_init.db.lock");
+        cleanup("test_metadata_init");
 
-        let mut pm = PageManager::new("test_metadata_init.db").unwrap();
+        let mut pm = PageManager::new("test_metadata_init").unwrap();
 
         let page_id_1 = pm.allocate_page().unwrap(); // page id 1 is for table catalog
         assert_eq!(page_id_1, 1);
@@ -596,16 +582,14 @@ mod tests {
         assert_eq!(metadata.free_space_end, PAGE_SIZE as u16);
         assert_eq!(metadata.next_page, None);
 
-        let _ = fs::remove_file("test_metadata_init.db");
-        let _ = fs::remove_file("test_metadata_init.db.lock");
+        cleanup("test_metadata_init");
     }
 
     #[test]
     fn test_page_metadata_update() {
-        let _ = fs::remove_file("test_metadata_update.db");
-        let _ = fs::remove_file("test_metadata_update.db.lock");
+        cleanup("test_metadata_update");
 
-        let mut pm = PageManager::new("test_metadata_update.db").unwrap();
+        let mut pm = PageManager::new("test_metadata_update").unwrap();
         let page_id = pm.allocate_page().unwrap();
 
         // Update metadata
@@ -624,17 +608,15 @@ mod tests {
         assert_eq!(read_metadata.free_space_start, 100);
         assert_eq!(read_metadata.free_space_end, 500);
 
-        let _ = fs::remove_file("test_metadata_update.db");
-        let _ = fs::remove_file("test_metadata_update.db.lock");
+        cleanup("test_metadata_update");
     }
 
     #[test]
     fn test_page_metadata_persistence() {
-        let _ = fs::remove_file("test_metadata_persist.db");
-        let _ = fs::remove_file("test_metadata_persist.db.lock");
+        cleanup("test_metadata_persist");
 
         {
-            let mut pm = PageManager::new("test_metadata_persist.db").unwrap();
+            let mut pm = PageManager::new("test_metadata_persist").unwrap();
             let page_id = pm.allocate_page().unwrap();
 
             // Update metadata
@@ -649,7 +631,7 @@ mod tests {
 
         // Reopen database
         {
-            let pm = PageManager::new("test_metadata_persist.db").unwrap();
+            let pm = PageManager::new("test_metadata_persist").unwrap();
             let metadata = pm.read_page_metadata(1).unwrap();
 
             // Metadata should persist
@@ -658,16 +640,14 @@ mod tests {
             assert_eq!(metadata.free_space_end, 500);
         }
 
-        let _ = fs::remove_file("test_metadata_persist.db");
-        let _ = fs::remove_file("test_metadata_persist.db.lock");
+        cleanup("test_metadata_persist");
     }
 
     #[test]
     fn test_multiple_pages_have_separate_metadata() {
-        let _ = fs::remove_file("test_multi_meta.db");
-        let _ = fs::remove_file("test_multi_meta.db.lock");
+        cleanup("test_multi_meta");
 
-        let mut pm = PageManager::new("test_multi_meta.db").unwrap();
+        let mut pm = PageManager::new("test_multi_meta").unwrap();
 
         // Allocate two pages
         let page1 = pm.allocate_page().unwrap();
@@ -702,55 +682,15 @@ mod tests {
         assert_eq!(read_meta1.free_space_end, 500);
         assert_eq!(read_meta2.free_space_end, 2983);
 
-        let _ = fs::remove_file("test_multi_meta.db");
-        let _ = fs::remove_file("test_multi_meta.db.lock");
+        cleanup("test_multi_meta");
     }
-
-    // #[test]
-    // fn test_page_metadata_does_not_affect_data_area() {
-    //     let _ = fs::remove_file("test_meta_data.db");
-    //     let _ = fs::remove_file("test_meta_data.db.lock");
-
-    //     let mut pm = PageManager::new("test_meta_data.db").unwrap();
-    //     let page_id = pm.allocate_page().unwrap();
-
-    //     // Write some data to the page (in data area)
-    //     let mut page_data = pm.read_page(page_id).unwrap();
-    //     let test_data = b"Hello, World!";
-    //     page_data[SLOT_DIRECTORY_START..SLOT_DIRECTORY_START + test_data.len()].copy_from_slice(test_data);
-    //     pm.write_page(page_id, &page_data).unwrap();
-
-    //     // Update metadata
-    //     let metadata = PageMetadata {
-    //         is_full: false,
-    //         last_offset: SLOT_DIRECTORY_START + test_data.len(),
-    //         num_rows: 1,
-    //         next_page: None,
-    //     };
-    //     pm.update_page_metadata(page_id, &metadata).unwrap();
-
-    //     // Read page and verify data is intact
-    //     let page_data = pm.read_page(page_id).unwrap();
-    //     assert_eq!(
-    //         &page_data[SLOT_DIRECTORY_START..SLOT_DIRECTORY_START + test_data.len()],
-    //         test_data
-    //     );
-
-    //     // Verify metadata is correct
-    //     let meta = pm.read_page_metadata(page_id).unwrap();
-    //     assert_eq!(meta.num_rows, 1);
-    //     assert_eq!(meta.last_offset, SLOT_DIRECTORY_START + test_data.len());
-
-    //     let _ = fs::remove_file("test_meta_data.db");
-    //     let _ = fs::remove_file("test_meta_data.db.lock");
-    // }
 
     #[test]
     fn test_header_with_free_list() {
         cleanup("test_header_free");
 
         // Create new database
-        let pm = PageManager::new("test_header_free.hdb").unwrap();
+        let pm = PageManager::new("test_header_free").unwrap();
 
         // Verify initial state
         assert_eq!(pm.num_pages(), 1);
@@ -759,7 +699,7 @@ mod tests {
         drop(pm);
 
         // Reopen and verify header persisted
-        let pm = PageManager::new("test_header_free.hdb").unwrap();
+        let pm = PageManager::new("test_header_free").unwrap();
         assert_eq!(pm.num_pages(), 1);
         assert_eq!(pm.first_free_page, None);
 
@@ -769,7 +709,7 @@ mod tests {
     #[test]
     fn test_free_page_adds_to_list() {
         cleanup("test_free_add");
-        let mut pm = PageManager::new("test_free_add.hdb").unwrap();
+        let mut pm = PageManager::new("test_free_add").unwrap();
 
         // Allocate a page
         let page1 = pm.allocate_page().unwrap();
@@ -786,7 +726,7 @@ mod tests {
     #[test]
     fn test_allocate_reuses_freed_page() {
         cleanup("test_reuse");
-        let mut pm = PageManager::new("test_reuse.hdb").unwrap();
+        let mut pm = PageManager::new("test_reuse").unwrap();
 
         // Allocate 3 pages
         let page1 = pm.allocate_page().unwrap();
@@ -814,7 +754,7 @@ mod tests {
     #[test]
     fn test_free_list_lifo_order() {
         cleanup("test_lifo");
-        let mut pm = PageManager::new("test_lifo.hdb").unwrap();
+        let mut pm = PageManager::new("test_lifo").unwrap();
 
         // Allocate 3 pages
         let page1 = pm.allocate_page().unwrap();
@@ -851,7 +791,7 @@ mod tests {
 
         // Session 1: Create free list
         {
-            let mut pm = PageManager::new("test_free_persist.hdb").unwrap();
+            let mut pm = PageManager::new("test_free_persist").unwrap();
 
             let _ = pm.allocate_page().unwrap();
             let page2 = pm.allocate_page().unwrap();
@@ -865,7 +805,7 @@ mod tests {
 
         // Session 2: Verify free list persisted
         {
-            let mut pm = PageManager::new("test_free_persist.hdb").unwrap();
+            let mut pm = PageManager::new("test_free_persist").unwrap();
 
             // Free list should still be: 3 → 2 → NULL
             assert_eq!(pm.first_free_page, Some(3));
@@ -884,7 +824,7 @@ mod tests {
     #[test]
     fn test_allocate_when_free_list_empty() {
         cleanup("test_empty_free");
-        let mut pm = PageManager::new("test_empty_free.hdb").unwrap();
+        let mut pm = PageManager::new("test_empty_free").unwrap();
 
         // Free list is empty initially
         assert_eq!(pm.first_free_page, None);
@@ -900,7 +840,7 @@ mod tests {
     #[test]
     fn test_multiple_free_and_allocate_cycles() {
         cleanup("test_cycles");
-        let mut pm = PageManager::new("test_cycles.hdb").unwrap();
+        let mut pm = PageManager::new("test_cycles").unwrap();
 
         // Allocate 5 pages
         for _ in 0..5 {
@@ -946,7 +886,7 @@ mod tests {
     #[test]
     fn test_free_same_page_twice() {
         cleanup("test_double_free");
-        let mut pm = PageManager::new("test_double_free.hdb").unwrap();
+        let mut pm = PageManager::new("test_double_free").unwrap();
 
         let page1 = pm.allocate_page().unwrap();
 
@@ -972,7 +912,7 @@ mod tests {
     #[test]
     fn test_write_header_updates_num_pages() {
         cleanup("test_header_update");
-        let mut pm = PageManager::new("test_header_update.hdb").unwrap();
+        let mut pm = PageManager::new("test_header_update").unwrap();
 
         // Allocate page (increases num_pages)
         pm.allocate_page().unwrap();
@@ -980,7 +920,7 @@ mod tests {
 
         // Manually verify header on disk
         drop(pm);
-        let pm = PageManager::new("test_header_update.hdb").unwrap();
+        let pm = PageManager::new("test_header_update").unwrap();
         assert_eq!(pm.num_pages(), 2); // Should persist
 
         cleanup("test_header_update");
@@ -989,7 +929,7 @@ mod tests {
     #[test]
     fn test_write_header_updates_first_free() {
         cleanup("test_header_first_free");
-        let mut pm = PageManager::new("test_header_first_free.hdb").unwrap();
+        let mut pm = PageManager::new("test_header_first_free").unwrap();
 
         let page1 = pm.allocate_page().unwrap();
         pm.free_page(page1).unwrap();
@@ -998,7 +938,7 @@ mod tests {
 
         // Verify persistence
         drop(pm);
-        let pm = PageManager::new("test_header_first_free.hdb").unwrap();
+        let pm = PageManager::new("test_header_first_free").unwrap();
         assert_eq!(pm.first_free_page, Some(1));
 
         cleanup("test_header_first_free");
@@ -1007,7 +947,7 @@ mod tests {
     #[test]
     fn test_free_list_chain_integrity() {
         cleanup("test_chain");
-        let mut pm = PageManager::new("test_chain.hdb").unwrap();
+        let mut pm = PageManager::new("test_chain").unwrap();
 
         // Allocate 5 pages
         for _ in 0..5 {
@@ -1037,7 +977,7 @@ mod tests {
     #[test]
     fn test_allocate_all_freed_pages() {
         cleanup("test_allocate_all");
-        let mut pm = PageManager::new("test_allocate_all.hdb").unwrap();
+        let mut pm = PageManager::new("test_allocate_all").unwrap();
 
         // Allocate 10 pages
         for _ in 0..10 {
@@ -1067,7 +1007,7 @@ mod tests {
     #[test]
     fn test_write_and_read_slot() {
         cleanup("test_write_and_read_slot");
-        let mut pm = PageManager::new("test_write_and_read_slot.hdb").unwrap();
+        let mut pm = PageManager::new("test_write_and_read_slot").unwrap();
 
         // allocate new page
         let page_id = pm.allocate_page().unwrap();
@@ -1096,7 +1036,7 @@ mod tests {
     #[test]
     fn test_multiple_slots_independent() {
         cleanup("test_multiple_slots_independent");
-        let mut pm = PageManager::new("test_multiple_slots_independent.hdb").unwrap();
+        let mut pm = PageManager::new("test_multiple_slots_independent").unwrap();
 
         let page_id = pm.allocate_page().unwrap();
         let mut page_data = pm.read_page(page_id).unwrap();
@@ -1118,7 +1058,7 @@ mod tests {
     #[test]
     fn test_mark_slot_dead() {
         cleanup("test_mark_slot_dead");
-        let mut pm = PageManager::new("test_mark_slot_dead.hdb").unwrap();
+        let mut pm = PageManager::new("test_mark_slot_dead").unwrap();
 
         let page_id = pm.allocate_page().unwrap();
         let mut page_data = pm.read_page(page_id).unwrap();

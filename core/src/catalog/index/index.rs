@@ -178,7 +178,7 @@ mod tests {
     }
 
     fn setup(basename: &str) -> (IndexCatalog, PageManager) {
-        let mut pm = PageManager::new(&format!("{}.hdb", basename)).unwrap();
+        let mut pm = PageManager::new(basename).unwrap();
         let _ = TableCatalog::new(&mut pm).unwrap();
         let ic = IndexCatalog::new(&mut pm).unwrap();
         (ic, pm)

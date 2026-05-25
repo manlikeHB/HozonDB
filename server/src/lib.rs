@@ -16,7 +16,6 @@ use hozondb_core::{
         parser,
         tokenizer::{self},
     },
-    storage::page::PageManager,
 };
 
 use tokio::sync::Mutex;
@@ -132,8 +131,7 @@ pub async fn start_server(
     addr: SocketAddr,
     db_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let page_manager = PageManager::new(&format!("{db_name}.hdb"))?;
-    let db = Database::new(page_manager)?;
+    let db = Database::new(db_name)?;
     let executor = Executor::new(db);
     let service = HozonDbServer::new(Arc::new(Mutex::new(executor)));
 
@@ -156,9 +154,7 @@ pub async fn start_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hozondb_core::{
-        proto::execute_response, sql::database::Database, storage::page::PageManager,
-    };
+    use hozondb_core::{proto::execute_response, sql::database::Database};
     use std::fs;
     use tokio_stream::StreamExt;
 
@@ -168,8 +164,7 @@ mod tests {
     }
 
     fn create_test_service(name: &str) -> HozonDbServer {
-        let pm = PageManager::new(&format!("{}.hdb", name)).unwrap();
-        let db = Database::new(pm).unwrap();
+        let db = Database::new(name).unwrap();
         let executor = Executor::new(db);
         HozonDbServer::new(Arc::new(Mutex::new(executor)))
     }
