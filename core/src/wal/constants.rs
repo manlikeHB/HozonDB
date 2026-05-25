@@ -1,0 +1,1 @@
+pub const MAGIC_NUMBER: u32 = 0x4857414C; // HWAL

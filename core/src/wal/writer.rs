@@ -2,10 +2,8 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::{fs::File, path::Path};
 
 use crate::constants::PageId;
-use crate::wal::record::WalRecord;
-use crate::wal::record_type::WalRecordType;
+use crate::wal::{constants::MAGIC_NUMBER, record::WalRecord, record_type::WalRecordType};
 
-const MAGIC_NUMBER: u32 = 0x4857414C; // HWAL
 const WAL_METADATA_SIZE: usize = 12; // magic: u32 (4 bytes) + checkpoint: u64 (8 bytes)
 pub const WAL_RECORD_START: usize = WAL_METADATA_SIZE;
 const WAL_CHECKPOINT_OFFSET: usize = 4;

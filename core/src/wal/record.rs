@@ -235,6 +235,30 @@ impl WalRecord {
     pub fn lsn(&self) -> u64 {
         self.lsn
     }
+
+    pub fn record_type(&self) -> WalRecordType {
+        self.record_type
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub fn slot(&self) -> u16 {
+        self.slot
+    }
+
+    pub fn new_data(&self) -> &[u8] {
+        &self.new_data
+    }
+
+    pub fn old_data(&self) -> &[u8] {
+        &self.old_data
+    }
 }
 
 #[cfg(test)]
