@@ -17,9 +17,10 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    pub fn new(path: &str) -> io::Result<Self> {
+    pub fn new(db_name: &str) -> io::Result<Self> {
+        let path = format!("{db_name}.wal");
         // open .wal file
-        if Path::new(path).exists() {
+        if Path::new(&path).exists() {
             let mut file = File::options()
                 .read(true)
                 .write(true)
@@ -183,7 +184,7 @@ mod tests {
     fn test_open_new_wal_writer() {
         let _ = fs::remove_file("mydb.wal");
 
-        let wal = WalWriter::new("mydb.wal").unwrap();
+        let wal = WalWriter::new("mydb").unwrap();
 
         assert_eq!(wal.lsn, 1);
         assert_eq!(wal.checkpoint, WAL_RECORD_START as u64);
@@ -194,7 +195,7 @@ mod tests {
     #[test]
     fn test_append_single_record() {
         let _ = fs::remove_file("test_append.wal");
-        let mut wal = WalWriter::new("test_append.wal").unwrap();
+        let mut wal = WalWriter::new("test_append").unwrap();
         let lsn = wal
             .append(WalRecordType::Insert, "users", 1, 0, b"data", &[])
             .unwrap();
@@ -207,14 +208,14 @@ mod tests {
     fn test_lsn_derived_from_existing_file() {
         let _ = fs::remove_file("test_lsn.wal");
         {
-            let mut wal = WalWriter::new("test_lsn.wal").unwrap();
+            let mut wal = WalWriter::new("test_lsn").unwrap();
             wal.append(WalRecordType::Insert, "users", 1, 0, b"data", &[])
                 .unwrap();
             wal.append(WalRecordType::Insert, "users", 1, 1, b"data", &[])
                 .unwrap();
         }
         // reopen — should derive lsn = 3
-        let wal = WalWriter::new("test_lsn.wal").unwrap();
+        let wal = WalWriter::new("test_lsn").unwrap();
         assert_eq!(wal.lsn, 3);
         let _ = fs::remove_file("test_lsn.wal");
     }
@@ -222,10 +223,10 @@ mod tests {
     #[test]
     fn test_checkpoint_persists() {
         let _ = fs::remove_file("test_checkpoint.wal");
-        let wal = WalWriter::new("test_checkpoint.wal").unwrap();
+        let wal = WalWriter::new("test_checkpoint").unwrap();
         assert_eq!(wal.checkpoint, WAL_RECORD_START as u64);
         drop(wal);
-        let wal = WalWriter::new("test_checkpoint.wal").unwrap();
+        let wal = WalWriter::new("test_checkpoint").unwrap();
         assert_eq!(wal.checkpoint, WAL_RECORD_START as u64);
         let _ = fs::remove_file("test_checkpoint.wal");
     }
@@ -233,14 +234,14 @@ mod tests {
     #[test]
     fn test_checkpoint_updates_header() {
         let _ = fs::remove_file("test_cp.wal");
-        let mut wal = WalWriter::new("test_cp.wal").unwrap();
+        let mut wal = WalWriter::new("test_cp").unwrap();
         wal.append(WalRecordType::Insert, "users", 1, 0, b"data", &[])
             .unwrap();
         let cp = wal.checkpoint().unwrap(); // checkpoint
         assert!(cp > WAL_RECORD_START as u64);
         assert_eq!(wal.checkpoint, cp);
         // reopen and verify header
-        let wal2 = WalWriter::new("test_cp.wal").unwrap();
+        let wal2 = WalWriter::new("test_cp").unwrap();
         assert_eq!(wal2.checkpoint, cp);
         let _ = fs::remove_file("test_cp.wal");
     }
@@ -250,7 +251,7 @@ mod tests {
         let _ = fs::remove_file("test_persist.wal");
 
         {
-            let mut wal = WalWriter::new("test_persist.wal").unwrap();
+            let mut wal = WalWriter::new("test_persist").unwrap();
             let lsn = wal
                 .append(WalRecordType::Insert, "users", 1, 0, b"alice", &[])
                 .unwrap();
@@ -273,7 +274,7 @@ mod tests {
 
         {
             // reopen — simulates restart
-            let mut wal = WalWriter::new("test_persist.wal").unwrap();
+            let mut wal = WalWriter::new("test_persist").unwrap();
 
             // LSN should continue from where we left off
             assert_eq!(wal.lsn, 4);
@@ -294,7 +295,7 @@ mod tests {
         }
 
         {
-            let wal = WalWriter::new("test_persist.wal").unwrap();
+            let wal = WalWriter::new("test_persist").unwrap();
 
             // verify checkpoint persist
             assert!(wal.checkpoint > WAL_RECORD_START as u64);
