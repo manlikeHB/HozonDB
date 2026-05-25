@@ -113,7 +113,8 @@ impl PageManager {
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(0))?; // go to start
         file.write_all(&headers)?;
-        file.sync_all()?;
+        //TODO: sync_all is being removed since the WAL holds all logs and
+        // flushing to disk will only be happening at checkpoints
 
         Ok(())
     }
@@ -267,7 +268,8 @@ impl PageManager {
             let mut file = self.file.lock().unwrap();
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(&buffer)?;
-            file.sync_all()?;
+            //TODO: sync_all is being removed since the WAL holds all logs and
+            // flushing to disk will only be happening at checkpoints
         };
 
         Ok(())

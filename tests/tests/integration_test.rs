@@ -7,6 +7,7 @@ use tokio_stream::StreamExt;
 fn cleanup(name: &str) {
     let _ = fs::remove_file(format!("{}.hdb", name));
     let _ = fs::remove_file(format!("{}.hdb.lock", name));
+    let _ = fs::remove_file(format!("{}.wal", name));
 }
 
 async fn spawn_test_server(db_name: &str) -> SocketAddr {

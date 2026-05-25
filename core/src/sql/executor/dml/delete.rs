@@ -5,6 +5,7 @@ use crate::{
         database::Database,
         executor::{ExecutionResult, helpers},
     },
+    wal::record_type::WalRecordType,
 };
 use std::{collections::HashMap, io};
 
@@ -57,6 +58,17 @@ pub fn execute_delete(
             let page_data = db.read_page(loc.page_id())?;
             dirty_pages.insert(loc.page_id(), page_data);
         }
+
+        // TODO: WAL record is logged after page write — violates write-ahead guarantee.
+        // This will be fixed when the buffer pool is implemented.
+        db.wal_append(
+            WalRecordType::Delete,
+            &table_name,
+            loc.page_id(),
+            loc.slot(),
+            &[],
+            &row.to_bytes(), // old_data = the row being deleted
+        )?;
 
         if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
             PageManager::mark_slot_dead(page_data, loc.slot());

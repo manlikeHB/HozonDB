@@ -13,6 +13,7 @@ use crate::{
     index::{btree::BPlusTree, key::IndexKey, node::leaf::RowLocation},
     sql::parser::BinaryOperator,
     storage::page::{PageManager, PageMetadata},
+    wal::{record_type::WalRecordType, writer::WalWriter},
 };
 
 pub struct Database {
@@ -20,6 +21,7 @@ pub struct Database {
     table_catalog: TableCatalog,
     index_catalog: IndexCatalog,
     indexes: HashMap<String, BPlusTree>, // index name -> B+ tree
+    wal_writer: WalWriter,
 }
 
 impl Database {
@@ -28,6 +30,7 @@ impl Database {
         let table_catalog = TableCatalog::new(&mut page_manager)?;
         let index_catalog = IndexCatalog::new(&mut page_manager)?;
         let mut indexes = HashMap::new();
+        let wal_writer = WalWriter::new(db_name)?;
 
         // load b+ tree for all indexes
         for entry in index_catalog.all_indexes() {
@@ -41,6 +44,7 @@ impl Database {
             table_catalog,
             index_catalog,
             indexes,
+            wal_writer,
         })
     }
 
@@ -249,5 +253,19 @@ impl Database {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
 
         btree.range_scan(start, end, op, page_manager)
+    }
+
+    // Wal Writer
+    pub fn wal_append(
+        &mut self,
+        record_type: WalRecordType,
+        table_name: &str,
+        page_id: PageId,
+        slot: u16,
+        new_data: &[u8],
+        old_data: &[u8],
+    ) -> io::Result<u64> {
+        self.wal_writer
+            .append(record_type, table_name, page_id, slot, new_data, old_data)
     }
 }

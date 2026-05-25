@@ -161,6 +161,7 @@ mod tests {
     fn cleanup(name: &str) {
         let _ = fs::remove_file(format!("{}.hdb", name));
         let _ = fs::remove_file(format!("{}.hdb.lock", name));
+        let _ = fs::remove_file(format!("{}.wal", name));
     }
 
     fn create_test_service(name: &str) -> HozonDbServer {

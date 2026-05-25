@@ -6,6 +6,7 @@ use crate::{
         database::Database,
         executor::{ExecutionResult, helpers},
     },
+    wal::record_type::WalRecordType,
 };
 use std::{
     collections::HashMap,
@@ -123,6 +124,16 @@ pub fn execute_update(
 
         // if updated row fit previous space, write into old location else re-insert
         if new_bytes.len() <= old_bytes.len() {
+            // TODO:
+            db.wal_append(
+                WalRecordType::Update,
+                &table_name,
+                loc.page_id(),
+                loc.slot(),
+                &new_bytes,
+                &old_bytes,
+            )?;
+
             if !dirty_pages.contains_key(&loc.page_id()) {
                 let page_data = db.read_page(loc.page_id())?;
 
@@ -153,6 +164,18 @@ pub fn execute_update(
                 &updated_row.values(),
                 metrics,
             )?;
+
+            // TODO: WAL record is logged after page write — violates write-ahead guarantee.
+            // This will be fixed when the buffer pool is implemented
+            db.wal_append(
+                WalRecordType::Update,
+                &table_name,
+                row_page_id,
+                slot,
+                &new_bytes,
+                &old_bytes,
+            )?;
+
             // index new row
             let row_location = RowLocation::new(row_page_id, slot);
             helpers::index_new_row(db, &index_entries, &new_value_and_col_pairs, row_location)?;
