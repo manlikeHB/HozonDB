@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub const PAGE_SIZE: usize = 4096;
-pub const HEADER_SIZE: usize = 12;
-pub const MAGIC_NUMBER: u32 = 0x484F5A4E; // 
+const HEADER_SIZE: usize = 12;
+const MAGIC_NUMBER: u32 = 0x484F5A4E; // HOZN
 
-pub const PAGE_METADATA_SIZE: usize = 10;
+const PAGE_METADATA_SIZE: usize = 10;
 pub const SLOT_DIRECTORY_START: usize = PAGE_METADATA_SIZE;
 
 const NULL_PAGE: u32 = 0xFFFFFFFF; // Sentinel value for Option::None
