@@ -116,7 +116,7 @@ impl WalWriter {
         }
     }
 
-    pub fn append(
+    pub fn append_slotted(
         &mut self,
         record_type: WalRecordType,
         table_name: &str,
@@ -130,7 +130,7 @@ impl WalWriter {
         self.lsn += 1;
 
         // create new record
-        let record = WalRecord::new(
+        let record = WalRecord::new_slotted(
             lsn,
             record_type,
             table_name,
@@ -139,6 +139,42 @@ impl WalWriter {
             new_data,
             old_data,
         );
+
+        self.append(&record)?;
+        Ok(lsn)
+    }
+
+    pub fn append_raw(
+        &mut self,
+        record_type: WalRecordType,
+        page_id: PageId,
+        new_data: &[u8],
+        old_data: &[u8],
+    ) -> io::Result<u64> {
+        // read current lsn and increment
+        let lsn = self.lsn;
+        self.lsn += 1;
+
+        // create new record
+        let record = WalRecord::new_raw(lsn, record_type, page_id, new_data, old_data);
+
+        self.append(&record)?;
+        Ok(lsn)
+    }
+
+    fn append_checkpoint(&mut self) -> io::Result<u64> {
+        // read current lsn and increment
+        let lsn = self.lsn;
+        self.lsn += 1;
+
+        // create new record
+        let record = WalRecord::new_checkpoint(lsn);
+
+        self.append(&record)?;
+        Ok(lsn)
+    }
+
+    fn append(&mut self, record: &WalRecord) -> io::Result<()> {
         let record_byte = record.to_bytes();
 
         // append new record (record len + record)
@@ -148,8 +184,7 @@ impl WalWriter {
 
         self.file.write_all(&record_data)?;
         self.file.sync_all()?;
-
-        Ok(lsn)
+        Ok(())
     }
 
     pub fn checkpoint(&mut self) -> io::Result<u64> {
@@ -157,7 +192,7 @@ impl WalWriter {
         let checkpoint = self.file.seek(SeekFrom::End(0))?;
 
         // append checkpoint record
-        self.append(WalRecordType::Checkpoint, "", 0, 0, &[], &[])?;
+        self.append_checkpoint()?;
 
         // update file header
         self.file
@@ -195,7 +230,7 @@ mod tests {
         let _ = fs::remove_file("test_append.wal");
         let mut wal = WalWriter::new("test_append").unwrap();
         let lsn = wal
-            .append(WalRecordType::Insert, "users", 1, 0, b"data", &[])
+            .append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[])
             .unwrap();
         assert_eq!(lsn, 1);
         assert_eq!(wal.lsn, 2);
@@ -207,9 +242,9 @@ mod tests {
         let _ = fs::remove_file("test_lsn.wal");
         {
             let mut wal = WalWriter::new("test_lsn").unwrap();
-            wal.append(WalRecordType::Insert, "users", 1, 0, b"data", &[])
+            wal.append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[])
                 .unwrap();
-            wal.append(WalRecordType::Insert, "users", 1, 1, b"data", &[])
+            wal.append_slotted(WalRecordType::Insert, "users", 1, 1, b"data", &[])
                 .unwrap();
         }
         // reopen — should derive lsn = 3
@@ -233,7 +268,7 @@ mod tests {
     fn test_checkpoint_updates_header() {
         let _ = fs::remove_file("test_cp.wal");
         let mut wal = WalWriter::new("test_cp").unwrap();
-        wal.append(WalRecordType::Insert, "users", 1, 0, b"data", &[])
+        wal.append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[])
             .unwrap();
         let cp = wal.checkpoint().unwrap(); // checkpoint
         assert!(cp > WAL_RECORD_START as u64);
@@ -251,17 +286,17 @@ mod tests {
         {
             let mut wal = WalWriter::new("test_persist").unwrap();
             let lsn = wal
-                .append(WalRecordType::Insert, "users", 1, 0, b"alice", &[])
+                .append_slotted(WalRecordType::Insert, "users", 1, 0, b"alice", &[])
                 .unwrap();
             assert_eq!(lsn, 1);
 
             let lsn = wal
-                .append(WalRecordType::Insert, "users", 1, 1, b"bob", &[])
+                .append_slotted(WalRecordType::Insert, "users", 1, 1, b"bob", &[])
                 .unwrap();
             assert_eq!(lsn, 2);
 
             let lsn = wal
-                .append(WalRecordType::Update, "users", 1, 0, b"alice2", b"alice")
+                .append_slotted(WalRecordType::Update, "users", 1, 0, b"alice2", b"alice")
                 .unwrap();
             assert_eq!(lsn, 3);
 
@@ -282,7 +317,7 @@ mod tests {
 
             // should still be able to append
             let lsn = wal
-                .append(WalRecordType::Delete, "users", 1, 1, &[], b"bob")
+                .append_slotted(WalRecordType::Delete, "users", 1, 1, &[], b"bob")
                 .unwrap();
             assert_eq!(lsn, 4);
 
