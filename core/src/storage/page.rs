@@ -1,6 +1,6 @@
-use crate::constants::PageId;
+use crate::constants::{OFFSET_RAW_PAGE_START, PageId};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -11,7 +11,7 @@ const MAGIC_NUMBER: u32 = 0x484F5A4E; // HOZN
 const PAGE_METADATA_SIZE: usize = 18;
 pub const SLOT_DIRECTORY_START: usize = PAGE_METADATA_SIZE;
 
-const NULL_PAGE: u32 = 0xFFFFFFFF; // Sentinel value for Option::None
+pub const NULL_PAGE: u32 = 0xFFFFFFFF; // Sentinel value for Option::None
 
 // Metadata offsets slotted page
 const OFFSET_SLOT_COUNT: usize = 0;
@@ -20,15 +20,19 @@ const OFFSET_FREE_SPACE_END: usize = 4;
 const OFFSET_NEXT_PAGE: usize = 6;
 const OFFSET_LSN: usize = 10;
 
-// Metadata offsets raw page (non-slotted)
-const OFFSET_RAW_PAGE_START: usize = 8;
-
 #[derive(Debug)]
 pub struct PageManager {
     file: Mutex<File>,
     lock_path: PathBuf,
     num_pages: u32,
     first_free_page: Option<PageId>,
+}
+
+#[derive(Debug)]
+pub enum PageType {
+    Slotted,
+    Raw,
+    Free,
 }
 
 #[derive(Debug, Clone)]
@@ -43,11 +47,103 @@ pub enum PageMetadata {
     Raw {
         lsn: u64,
     },
+    Free {
+        next_page: Option<u32>,
+        lsn: u64,
+    },
 }
 
-pub enum PageType {
-    Slotted,
-    Raw,
+impl PageMetadata {
+    pub fn set_lsn(&mut self, new_lsn: u64) {
+        match self {
+            Self::Raw { lsn } | Self::Slotted { lsn, .. } | Self::Free { lsn, .. } => {
+                *lsn = new_lsn
+            }
+        }
+    }
+
+    pub fn update_slot_count(&mut self) {
+        match self {
+            Self::Slotted { slot_count, .. } => *slot_count += 1,
+            _ => {}
+        }
+    }
+
+    pub fn update_free_space_start(&mut self) {
+        match self {
+            Self::Slotted {
+                free_space_start, ..
+            } => *free_space_start += 4,
+            _ => {}
+        }
+    }
+
+    pub fn update_free_space_end(&mut self, row_len: usize) {
+        match self {
+            Self::Slotted { free_space_end, .. } => *free_space_end -= row_len as u16,
+            _ => {}
+        }
+    }
+
+    pub fn set_next_page(&mut self, page_id: PageId) {
+        match self {
+            Self::Slotted { next_page, .. } | Self::Free { next_page, .. } => {
+                *next_page = Some(page_id)
+            }
+            _ => {}
+        }
+    }
+
+    pub fn lsn(&self) -> u64 {
+        match self {
+            Self::Raw { lsn } => *lsn,
+            Self::Slotted { lsn, .. } => *lsn,
+            Self::Free { lsn, .. } => *lsn,
+        }
+    }
+
+    pub fn slot_count(&self) -> io::Result<u16> {
+        match self {
+            Self::Slotted { slot_count, .. } => Ok(*slot_count),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Only Slotted page metadata contain slot count",
+            )),
+        }
+    }
+
+    pub fn free_space_start(&self) -> io::Result<u16> {
+        match self {
+            Self::Slotted {
+                free_space_start, ..
+            } => Ok(*free_space_start),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Only Slotted page metadata contain free space start",
+            )),
+        }
+    }
+
+    pub fn free_space_end(&self) -> io::Result<u16> {
+        match self {
+            Self::Slotted { free_space_end, .. } => Ok(*free_space_end),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Only Slotted page metadata contain free space end",
+            )),
+        }
+    }
+
+    pub fn next_page(&self) -> io::Result<Option<u32>> {
+        match self {
+            Self::Slotted { next_page, .. } => Ok(*next_page),
+            Self::Free { next_page, .. } => Ok(*next_page),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Raw page metadata does not contain next page",
+            )),
+        }
+    }
 }
 
 impl PageManager {
@@ -128,40 +224,15 @@ impl PageManager {
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(0))?; // go to start
         file.write_all(&headers)?;
-        //TODO: sync_all is being removed since the WAL holds all logs and
-        // flushing to disk will only be happening at checkpoints
+        file.sync_all()?;
 
         Ok(())
-    }
-
-    /// Write next_free pointer to a free page
-    fn write_free_page(&mut self, page_id: PageId, next_free: Option<PageId>) -> io::Result<()> {
-        let mut page_buffer = [0u8; PAGE_SIZE];
-        page_buffer[0..4].copy_from_slice(&next_free.unwrap_or(NULL_PAGE).to_le_bytes());
-        self.write_page(page_id, &page_buffer)?;
-        Ok(())
-    }
-
-    /// Read next_free pointer from a free page
-    fn read_next_free(&self, page_id: PageId) -> io::Result<Option<PageId>> {
-        let page_data = self.read_page(page_id)?;
-        let next_page =
-            u32::from_le_bytes([page_data[0], page_data[1], page_data[2], page_data[3]]);
-        if next_page == NULL_PAGE {
-            Ok(None)
-        } else {
-            Ok(Some(next_page))
-        }
     }
 
     /// Add a page to the free list
-    // TODO: move logic to use buffer pool rather than direct disk read?
-    pub fn free_page(&mut self, page_id: PageId) -> io::Result<()> {
-        // get current head of free pages list and make it the next page
-        self.write_free_page(page_id, self.first_free_page)?;
-
+    pub fn set_first_free_page(&mut self, next_free: Option<PageId>) -> io::Result<()> {
         // update head to new free page
-        self.first_free_page = Some(page_id);
+        self.first_free_page = next_free;
         self.write_header()?; // update header
         Ok(())
     }
@@ -206,36 +277,6 @@ impl PageManager {
     /// Note: Page 0 is reserved for database header and created in new().
     /// This method allocates pages starting from page 1 with initialized metadata.
     pub fn allocate_page(&mut self, page_type: PageType) -> io::Result<PageId> {
-        // check if there are free pages
-        if let Some(free_page_id) = self.first_free_page {
-            let next_free = self.read_next_free(free_page_id)?;
-            // update next free page in header
-            self.first_free_page = next_free;
-            self.write_header()?;
-
-            // Update page metadata to default since it's being re-allocated as a new page
-            match page_type {
-                PageType::Raw => {
-                    let page_meta = PageMetadata::Raw { lsn: 0 };
-
-                    self.update_page_metadata(free_page_id, &page_meta)?;
-                }
-                PageType::Slotted => {
-                    let page_meta = PageMetadata::Slotted {
-                        slot_count: 0,
-                        free_space_start: SLOT_DIRECTORY_START as u16,
-                        free_space_end: PAGE_SIZE as u16,
-                        next_page: None,
-                        lsn: 0,
-                    };
-
-                    self.update_page_metadata(free_page_id, &page_meta)?;
-                }
-            }
-
-            return Ok(free_page_id);
-        }
-
         // No free pages - extend database
         let page_id: PageId = self.num_pages;
         self.num_pages += 1;
@@ -254,10 +295,10 @@ impl PageManager {
         let mut page_data = [0u8; PAGE_SIZE];
 
         // page 0 = headers, page 1 = tables catalog, page 2 = index catalog
-        if self.num_pages > 1 && self.num_pages < 3 {
+        if page_id > 0 && page_id < 3 {
             // Create raw page buffer with metadata
             Self::init_page_metadata_buffer(&mut page_data, PageType::Raw);
-        } else if self.num_pages > 3 {
+        } else if page_id >= 3 {
             // Create page buffer with metadata
             Self::init_page_metadata_buffer(&mut page_data, page_type);
         }
@@ -330,7 +371,7 @@ impl PageManager {
         self.num_pages
     }
 
-    fn init_page_metadata_buffer(page_data: &mut [u8; PAGE_SIZE], page_type: PageType) {
+    pub fn init_page_metadata_buffer(page_data: &mut [u8; PAGE_SIZE], page_type: PageType) {
         match page_type {
             PageType::Raw => {
                 page_data[..OFFSET_RAW_PAGE_START].copy_from_slice(&0u64.to_le_bytes());
@@ -344,6 +385,11 @@ impl PageManager {
                     .copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
                 page_data[OFFSET_NEXT_PAGE..OFFSET_NEXT_PAGE + 4]
                     .copy_from_slice(&NULL_PAGE.to_le_bytes());
+                page_data[OFFSET_LSN..OFFSET_LSN + 8].copy_from_slice(&0u64.to_le_bytes());
+            }
+            PageType::Free => {
+                page_data[0..4].copy_from_slice(&NULL_PAGE.to_le_bytes());
+                page_data[4..12].copy_from_slice(&0u64.to_le_bytes());
             }
         }
     }
@@ -377,14 +423,14 @@ impl PageManager {
         match page_type {
             PageType::Raw => {
                 let lsn = u64::from_le_bytes([
-                    page_data[OFFSET_LSN],
-                    page_data[OFFSET_LSN + 1],
-                    page_data[OFFSET_LSN + 2],
-                    page_data[OFFSET_LSN + 3],
-                    page_data[OFFSET_LSN + 4],
-                    page_data[OFFSET_LSN + 5],
-                    page_data[OFFSET_LSN + 6],
-                    page_data[OFFSET_LSN + 7],
+                    page_data[0],
+                    page_data[1],
+                    page_data[2],
+                    page_data[3],
+                    page_data[4],
+                    page_data[5],
+                    page_data[6],
+                    page_data[7],
                 ]);
 
                 PageMetadata::Raw { lsn }
@@ -435,13 +481,37 @@ impl PageManager {
                     lsn,
                 }
             }
+            PageType::Free => {
+                let next_page =
+                    u32::from_le_bytes([page_data[0], page_data[1], page_data[2], page_data[3]]);
+
+                let lsn = u64::from_le_bytes([
+                    page_data[4],
+                    page_data[5],
+                    page_data[6],
+                    page_data[7],
+                    page_data[8],
+                    page_data[9],
+                    page_data[10],
+                    page_data[11],
+                ]);
+
+                PageMetadata::Free {
+                    next_page: if next_page == NULL_PAGE {
+                        None
+                    } else {
+                        Some(next_page)
+                    },
+                    lsn,
+                }
+            }
         }
     }
 
     pub fn update_metadata_in_buffer(page_data: &mut [u8; PAGE_SIZE], metadata: &PageMetadata) {
         match metadata {
             PageMetadata::Raw { lsn } => {
-                page_data[OFFSET_LSN..OFFSET_LSN + 8].copy_from_slice(&lsn.to_le_bytes());
+                page_data[0..8].copy_from_slice(&lsn.to_le_bytes());
             }
             PageMetadata::Slotted {
                 slot_count,
@@ -460,6 +530,11 @@ impl PageManager {
                 page_data[OFFSET_NEXT_PAGE..OFFSET_NEXT_PAGE + 4]
                     .copy_from_slice(&next_page.to_le_bytes());
                 page_data[OFFSET_LSN..OFFSET_LSN + 8].copy_from_slice(&lsn.to_le_bytes());
+            }
+            PageMetadata::Free { next_page, lsn } => {
+                let next_page = next_page.unwrap_or(NULL_PAGE);
+                page_data[0..4].copy_from_slice(&next_page.to_le_bytes());
+                page_data[4..12].copy_from_slice(&lsn.to_le_bytes());
             }
         }
     }
@@ -683,7 +758,7 @@ mod tests {
                 assert_eq!(next_page, None);
                 assert_eq!(lsn, 0);
             }
-            PageMetadata::Raw { .. } => panic!("Expected a slotted page metadata"),
+            _ => panic!("Expected a slotted page metadata"),
         }
 
         cleanup("test_metadata_init");
@@ -723,7 +798,7 @@ mod tests {
                 assert_eq!(free_space_end, 500);
                 assert_eq!(lsn, 45);
             }
-            PageMetadata::Raw { .. } => panic!("Expected a slotted page metadata"),
+            _ => panic!("Expected a slotted page metadata"),
         }
 
         cleanup("test_metadata_update");
@@ -768,7 +843,7 @@ mod tests {
                     assert_eq!(free_space_end, 500);
                     assert_eq!(lsn, 78);
                 }
-                PageMetadata::Raw { .. } => panic!("Expected a slotted page metadata"),
+                _ => panic!("Expected a slotted page metadata"),
             }
         }
 
@@ -813,7 +888,7 @@ mod tests {
         // Read back and verify they're independent
         let read_meta1 = pm.read_page_metadata(page1, PageType::Slotted).unwrap();
         let read_meta2 = pm.read_page_metadata(page2, PageType::Slotted).unwrap();
-        let read_meta3 = pm.read_page_metadata(page2, PageType::Raw).unwrap();
+        let read_meta3 = pm.read_page_metadata(page3, PageType::Raw).unwrap();
 
         match read_meta1 {
             PageMetadata::Slotted {
@@ -829,7 +904,7 @@ mod tests {
                 assert_eq!(free_space_end, 500);
                 assert_eq!(lsn, 98);
             }
-            PageMetadata::Raw { .. } => panic!("Expected a slotted page metadata"),
+            _ => panic!("Expected a slotted page metadata"),
         }
 
         match read_meta2 {
@@ -846,12 +921,12 @@ mod tests {
                 assert_eq!(free_space_end, 2983);
                 assert_eq!(lsn, 65);
             }
-            PageMetadata::Raw { .. } => panic!("Expected a slotted page metadata"),
+            _ => panic!("Expected a slotted page metadata"),
         }
 
         match read_meta3 {
-            PageMetadata::Slotted { .. } => panic!("Expected a Raw page metadata"),
             PageMetadata::Raw { lsn } => assert_eq!(lsn, 3984),
+            _ => panic!("Expected a Raw page metadata"),
         }
 
         cleanup("test_multi_meta");
@@ -879,121 +954,6 @@ mod tests {
     }
 
     #[test]
-    fn test_free_page_adds_to_list() {
-        cleanup("test_free_add");
-        let mut pm = PageManager::new("test_free_add").unwrap();
-
-        // Allocate a page
-        let page1 = pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(page1, 1);
-        assert_eq!(pm.first_free_page, None);
-
-        // Free the page
-        pm.free_page(page1).unwrap();
-        assert_eq!(pm.first_free_page, Some(1));
-
-        cleanup("test_free_add");
-    }
-
-    #[test]
-    fn test_allocate_reuses_freed_page() {
-        cleanup("test_reuse");
-        let mut pm = PageManager::new("test_reuse").unwrap();
-
-        // Allocate 3 pages
-        let page1 = pm.allocate_page(PageType::Slotted).unwrap();
-        let page2 = pm.allocate_page(PageType::Slotted).unwrap();
-        let page3 = pm.allocate_page(PageType::Slotted).unwrap();
-
-        assert_eq!(page1, 1);
-        assert_eq!(page2, 2);
-        assert_eq!(page3, 3);
-        assert_eq!(pm.num_pages(), 4); // 0, 1, 2, 3
-
-        // Free page 2
-        pm.free_page(page2).unwrap();
-        assert_eq!(pm.first_free_page, Some(2));
-
-        // Next allocation should reuse page 2
-        let page4 = pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(page4, 2);
-        assert_eq!(pm.first_free_page, None);
-        assert_eq!(pm.num_pages(), 4); // Didn't grow
-
-        cleanup("test_reuse");
-    }
-
-    #[test]
-    fn test_free_list_lifo_order() {
-        cleanup("test_lifo");
-        let mut pm = PageManager::new("test_lifo").unwrap();
-
-        // Allocate 3 pages
-        let page1 = pm.allocate_page(PageType::Slotted).unwrap();
-        let page2 = pm.allocate_page(PageType::Slotted).unwrap();
-        let page3 = pm.allocate_page(PageType::Slotted).unwrap();
-
-        // Free in order: 1, 2, 3
-        pm.free_page(page1).unwrap();
-        pm.free_page(page2).unwrap();
-        pm.free_page(page3).unwrap();
-
-        // Free list: 3 → 2 → 1 → NULL (LIFO)
-        assert_eq!(pm.first_free_page, Some(3));
-
-        // Allocate should return in LIFO order: 3, 2, 1
-        let realloc1 = pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(realloc1, 3);
-
-        let realloc2 = pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(realloc2, 2);
-
-        let realloc3 = pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(realloc3, 1);
-
-        // List should be empty now
-        assert_eq!(pm.first_free_page, None);
-
-        cleanup("test_lifo");
-    }
-
-    #[test]
-    fn test_free_list_persistence() {
-        cleanup("test_free_persist");
-
-        // Session 1: Create free list
-        {
-            let mut pm = PageManager::new("test_free_persist").unwrap();
-
-            let _ = pm.allocate_page(PageType::Slotted).unwrap();
-            let page2 = pm.allocate_page(PageType::Slotted).unwrap();
-            let page3 = pm.allocate_page(PageType::Slotted).unwrap();
-
-            pm.free_page(page2).unwrap();
-            pm.free_page(page3).unwrap();
-
-            assert_eq!(pm.first_free_page, Some(3));
-        } // Close database
-
-        // Session 2: Verify free list persisted
-        {
-            let mut pm = PageManager::new("test_free_persist").unwrap();
-
-            // Free list should still be: 3 → 2 → NULL
-            assert_eq!(pm.first_free_page, Some(3));
-
-            // Allocate should reuse page 3
-            let page = pm.allocate_page(PageType::Slotted).unwrap();
-            assert_eq!(page, 3);
-
-            // Now first_free should be 2
-            assert_eq!(pm.first_free_page, Some(2));
-        }
-
-        cleanup("test_free_persist");
-    }
-
-    #[test]
     fn test_allocate_when_free_list_empty() {
         cleanup("test_empty_free");
         let mut pm = PageManager::new("test_empty_free").unwrap();
@@ -1007,78 +967,6 @@ mod tests {
         assert_eq!(pm.num_pages(), 2);
 
         cleanup("test_empty_free");
-    }
-
-    #[test]
-    fn test_multiple_free_and_allocate_cycles() {
-        cleanup("test_cycles");
-        let mut pm = PageManager::new("test_cycles").unwrap();
-
-        // Allocate 5 pages
-        for _ in 0..5 {
-            pm.allocate_page(PageType::Slotted).unwrap();
-        }
-        assert_eq!(pm.num_pages(), 6); // 0, 1, 2, 3, 4, 5
-
-        // Free pages 2, 3, 4
-        pm.free_page(2).unwrap();
-        pm.free_page(3).unwrap();
-        pm.free_page(4).unwrap();
-
-        // Allocate 2 pages (should reuse 4, 3)
-        let p1 = pm.allocate_page(PageType::Slotted).unwrap();
-        let p2 = pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(p1, 4);
-        assert_eq!(p2, 3);
-
-        // Free list: 2 → NULL
-        assert_eq!(pm.first_free_page, Some(2));
-
-        // Free page 5
-        pm.free_page(5).unwrap();
-
-        // Free list: 5 → 2 → NULL
-        assert_eq!(pm.first_free_page, Some(5));
-
-        // Allocate 3 pages (should reuse 5, 2, then extend to 6)
-        let p3 = pm.allocate_page(PageType::Slotted).unwrap();
-        let p4 = pm.allocate_page(PageType::Slotted).unwrap();
-        let p5 = pm.allocate_page(PageType::Slotted).unwrap();
-
-        assert_eq!(p3, 5);
-        assert_eq!(p4, 2);
-        assert_eq!(p5, 6); // Extended
-
-        assert_eq!(pm.first_free_page, None);
-        assert_eq!(pm.num_pages(), 7);
-
-        cleanup("test_cycles");
-    }
-
-    #[test]
-    fn test_free_same_page_twice() {
-        cleanup("test_double_free");
-        let mut pm = PageManager::new("test_double_free").unwrap();
-
-        let page1 = pm.allocate_page(PageType::Slotted).unwrap();
-
-        // Free page 1
-        pm.free_page(page1).unwrap();
-        assert_eq!(pm.first_free_page, Some(1));
-
-        // Free page 1 again (should still work, creates duplicate in list)
-        // Note: In production, you'd prevent this, but for now it's allowed
-        pm.free_page(page1).unwrap();
-        assert_eq!(pm.first_free_page, Some(1));
-
-        // This creates a cycle: 1 → 1 → 1 → ...
-        // Allocate will return page 1 twice (bug, but that's expected for now)
-        let p1 = pm.allocate_page(PageType::Slotted).unwrap();
-        let p2 = pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(p1, 1);
-        assert_eq!(p2, 1); // Same page!
-
-        cleanup("test_double_free");
     }
 
     #[test]
@@ -1096,84 +984,6 @@ mod tests {
         assert_eq!(pm.num_pages(), 2); // Should persist
 
         cleanup("test_header_update");
-    }
-
-    #[test]
-    fn test_write_header_updates_first_free() {
-        cleanup("test_header_first_free");
-        let mut pm = PageManager::new("test_header_first_free").unwrap();
-
-        let page1 = pm.allocate_page(PageType::Slotted).unwrap();
-        pm.free_page(page1).unwrap();
-
-        assert_eq!(pm.first_free_page, Some(1));
-
-        // Verify persistence
-        drop(pm);
-        let pm = PageManager::new("test_header_first_free").unwrap();
-        assert_eq!(pm.first_free_page, Some(1));
-
-        cleanup("test_header_first_free");
-    }
-
-    #[test]
-    fn test_free_list_chain_integrity() {
-        cleanup("test_chain");
-        let mut pm = PageManager::new("test_chain").unwrap();
-
-        // Allocate 5 pages
-        for _ in 0..5 {
-            pm.allocate_page(PageType::Slotted).unwrap();
-        }
-
-        // Free pages to create chain: 5 → 3 → 1 → NULL
-        pm.free_page(1).unwrap();
-        pm.free_page(3).unwrap();
-        pm.free_page(5).unwrap();
-
-        // Manually verify chain by reading pages
-        assert_eq!(pm.first_free_page, Some(5));
-
-        let next1 = pm.read_next_free(5).unwrap();
-        assert_eq!(next1, Some(3));
-
-        let next2 = pm.read_next_free(3).unwrap();
-        assert_eq!(next2, Some(1));
-
-        let next3 = pm.read_next_free(1).unwrap();
-        assert_eq!(next3, None);
-
-        cleanup("test_chain");
-    }
-
-    #[test]
-    fn test_allocate_all_freed_pages() {
-        cleanup("test_allocate_all");
-        let mut pm = PageManager::new("test_allocate_all").unwrap();
-
-        // Allocate 10 pages
-        for _ in 0..10 {
-            pm.allocate_page(PageType::Slotted).unwrap();
-        }
-
-        // Free all (except page 0)
-        for i in 1..=10 {
-            pm.free_page(i).unwrap();
-        }
-
-        // Allocate all back
-        for _ in 0..10 {
-            pm.allocate_page(PageType::Slotted).unwrap();
-        }
-
-        // Free list should be empty
-        assert_eq!(pm.first_free_page, None);
-
-        // Next allocation should extend
-        let new_page = pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(new_page, 11);
-
-        cleanup("test_allocate_all");
     }
 
     #[test]
