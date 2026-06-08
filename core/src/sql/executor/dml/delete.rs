@@ -1,18 +1,18 @@
 use crate::{
     benchmark::metrics::QueryMetrics,
-    constants::PageId,
     sql::{
         database::Database,
         executor::{ExecutionResult, helpers},
     },
+    storage::page::PageType,
     wal::record_type::WalRecordType,
 };
-use std::{collections::HashMap, io};
+use std::io;
 
 use crate::{
     catalog::{row::Value, schema::Column},
     sql::parser::Expr,
-    storage::page::{PAGE_SIZE, PageManager},
+    storage::page::PageManager,
 };
 
 // TODO: dead slots are never reclaimed within a page. A compaction pass is
@@ -32,7 +32,7 @@ pub fn execute_delete(
     // Extract column names
     let all_column_names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
 
-    // get all rows with row location
+    // get all affected rows with row location
     let rows_and_loc = helpers::resolve_rows(
         db,
         &table_name,
@@ -51,17 +51,11 @@ pub fn execute_delete(
 
     // filter rows based on the where clause
     let mut deleted_rows = Vec::new();
-    let mut dirty_pages: HashMap<PageId, [u8; PAGE_SIZE]> = HashMap::new();
+    // let (wal_writer, buffer_pool) = db.get_wal_and_buffer_pool();
 
     for (row, loc) in rows_and_loc {
-        if !dirty_pages.contains_key(&loc.page_id()) {
-            let page_data = db.read_page(loc.page_id())?;
-            dirty_pages.insert(loc.page_id(), page_data);
-        }
-
-        // TODO: WAL record is logged after page write — violates write-ahead guarantee.
-        // This will be fixed when the buffer pool is implemented.
-        db.wal_append(
+        // log delete record
+        let lsn = db.wal_append_slotted(
             WalRecordType::Delete,
             &table_name,
             loc.page_id(),
@@ -70,24 +64,22 @@ pub fn execute_delete(
             &row.to_bytes(), // old_data = the row being deleted
         )?;
 
-        if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
-            PageManager::mark_slot_dead(page_data, loc.slot());
-        }
+        // mark slot dead
+        let page_data = db.get_page_mut(loc.page_id())?;
+        PageManager::mark_slot_dead(page_data, loc.slot());
+
+        // update page meta lsn
+        let mut page_meta = PageManager::read_metadata_from_buffer(page_data, PageType::Slotted);
+        page_meta.set_lsn(lsn);
+        PageManager::update_metadata_in_buffer(page_data, &page_meta);
+
+        // mark page dirty
+        db.mark_dirty(loc.page_id(), lsn);
+
         deleted_rows.push(row);
     }
 
-    // TODO: index deletion happens after pages are written to disk.
-    // If index deletion fails mid-way, rows are dead on disk but index entries
-    // still exist — leaving the database in an inconsistent state.
-    // WAL (Write-Ahead Logging) solves this by logging intent before any write,
-    // enabling recovery to a consistent state on crash.
-    for (page_id, page_data) in &dirty_pages {
-        db.write_page(*page_id, page_data)?;
-
-        if let Some(metrics) = metrics {
-            metrics.pages_written += 1;
-        }
-    }
+    // TODO: track number of pages that were written to for metrics
 
     // delete indexed keys
     let index_entries = db
@@ -95,10 +87,12 @@ pub fn execute_delete(
         .map(|e| e.to_vec())
         .unwrap_or_default();
 
-    for row in &deleted_rows {
-        let value_and_col_pairs: Vec<(&Value, &Column)> =
-            row.values().iter().zip(columns.iter()).collect();
-        helpers::delete_indexes(db, &index_entries, &value_and_col_pairs)?;
+    if index_entries.len() > 0 {
+        for row in &deleted_rows {
+            let value_and_col_pairs: Vec<(&Value, &Column)> =
+                row.values().iter().zip(columns.iter()).collect();
+            helpers::delete_indexes(db, &index_entries, &value_and_col_pairs)?;
+        }
     }
 
     let num_rows = deleted_rows.len();
@@ -591,6 +585,8 @@ mod test {
                     &mut None,
                 )
                 .unwrap();
+
+            executor.database.checkpoint().unwrap();
         }
 
         // Verify deletion persisted

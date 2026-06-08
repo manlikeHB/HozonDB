@@ -1,12 +1,10 @@
 use crate::{
     benchmark::metrics::QueryMetrics,
-    catalog::row::Row,
     index::{key::IndexKey, node::leaf::RowLocation},
     sql::{
         database::Database,
         executor::{ExecutionResult, helpers},
     },
-    wal::record_type::WalRecordType,
 };
 use std::io::{self, Error, ErrorKind};
 
@@ -96,18 +94,6 @@ pub fn execute_insert(
     let (row_page_id, slot) =
         helpers::insert_row_into_page(db, &table_name, last_page, &values, metrics)?;
 
-    // TODO: WAL record is logged after page write — violates write-ahead guarantee.
-    // This will be fixed when the buffer pool is implemented, at which point page
-    // writes will be deferred and WAL will be logged before any page is flushed.
-    db.wal_append(
-        WalRecordType::Insert,
-        &table_name,
-        row_page_id,
-        slot,
-        &Row::to_bytes_from_values(&values),
-        &[],
-    )?;
-
     // Index new row if table was indexed
     let row_location = RowLocation::new(row_page_id, slot);
     helpers::index_new_row(db, &index_entries, &value_and_col_pairs, row_location)?;
@@ -131,7 +117,7 @@ mod tests {
             executor::test_helpers::*,
             parser::{SelectColumns, Statement},
         },
-        storage::page::PageManager,
+        storage::page::{PageManager, PageType},
     };
 
     #[test]
@@ -450,12 +436,16 @@ mod tests {
             page_count += 1;
 
             let page_data = executor.database.read_page(current_page).unwrap();
-            let page_meta = PageManager::read_metadata_from_buffer(&page_data);
+            let page_meta = PageManager::read_metadata_from_buffer(&page_data, PageType::Slotted);
 
             // Each page should have rows
-            assert!(page_meta.slot_count > 0, "Page {} has 0 rows", current_page);
+            assert!(
+                page_meta.slot_count().unwrap() > 0,
+                "Page {} has 0 rows",
+                current_page
+            );
 
-            match page_meta.next_page {
+            match page_meta.next_page().unwrap() {
                 Some(next) => {
                     current_page = next;
                 }
@@ -508,6 +498,8 @@ mod tests {
                     )
                     .unwrap();
             }
+
+            executor.database.checkpoint().unwrap();
         } // Drop executor, close database
 
         // Session 2: Reopen and verify all rows present

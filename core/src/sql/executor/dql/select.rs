@@ -108,7 +108,7 @@ mod tests {
             executor::test_helpers::*,
             parser::{BinaryOperator, SelectColumns, Statement},
         },
-        storage::page::{PAGE_SIZE, SLOT_DIRECTORY_START},
+        storage::page::{PAGE_SIZE, PageType, SLOT_DIRECTORY_START},
     };
 
     #[test]
@@ -412,10 +412,16 @@ mod tests {
         let first_page = executor.database.get_table("users").unwrap().first_page();
 
         // Check initial metadata
-        let metadata = executor.database.read_page_metadata(first_page).unwrap();
-        assert_eq!(metadata.slot_count, 0);
-        assert_eq!(metadata.free_space_start as usize, SLOT_DIRECTORY_START);
-        assert_eq!(metadata.free_space_end as usize, PAGE_SIZE);
+        let metadata = executor
+            .database
+            .read_page_metadata(first_page, PageType::Slotted)
+            .unwrap();
+        assert_eq!(metadata.slot_count().unwrap(), 0);
+        assert_eq!(
+            metadata.free_space_start().unwrap() as usize,
+            SLOT_DIRECTORY_START
+        );
+        assert_eq!(metadata.free_space_end().unwrap() as usize, PAGE_SIZE);
 
         // Insert row
         executor
@@ -429,10 +435,16 @@ mod tests {
             .unwrap();
 
         // Check metadata updated
-        let metadata = executor.database.read_page_metadata(first_page).unwrap();
-        assert_eq!(metadata.slot_count, 1);
-        assert_ne!(metadata.free_space_start as usize, SLOT_DIRECTORY_START);
-        assert_ne!(metadata.free_space_end as usize, PAGE_SIZE);
+        let metadata = executor
+            .database
+            .read_page_metadata(first_page, PageType::Slotted)
+            .unwrap();
+        assert_eq!(metadata.slot_count().unwrap(), 1);
+        assert_ne!(
+            metadata.free_space_start().unwrap() as usize,
+            SLOT_DIRECTORY_START
+        );
+        assert_ne!(metadata.free_space_end().unwrap() as usize, PAGE_SIZE);
 
         cleanup("test_exec_metadata");
     }

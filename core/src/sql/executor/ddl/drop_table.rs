@@ -1,28 +1,14 @@
-use crate::sql::{
-    database::Database,
-    executor::{
-        ExecutionResult,
-        helpers::{collect_page_chain, get_table_first_page_and_cols},
-    },
-};
+use crate::sql::{database::Database, executor::ExecutionResult};
 use std::io;
 
+// TODO: drop_table does not free B+ tree index pages — only the index
+// catalog entry is removed. Index pages are orphaned on disk until
+// the free list reclaims them.
+// Fix: implement BPlusTree::all_page_ids() that traverses the full
+// tree and returns every node's page ID, then call
+// buffer_pool.free_page() for each in drop_table.
 pub fn execute_drop_table(db: &mut Database, table_name: String) -> io::Result<ExecutionResult> {
-    let (first_page, _) = get_table_first_page_and_cols(db, &table_name)?;
-
-    let page_chain = collect_page_chain(db.pm(), first_page)?;
-
     db.drop_table(&table_name)?;
-
-    for page in page_chain {
-        db.free_page(page)?;
-    }
-
-    // TODO: drop_table does not free B+ tree index pages — only the index
-    // catalog entry is removed. Index pages are orphaned on disk until
-    // compaction. Fixing this requires BPlusTree to expose a full page
-    // traversal method.
-    db.drop_table_indexes(&table_name)?;
 
     Ok(ExecutionResult::Success {
         message: format!("{} table successfully dropped", table_name),
@@ -260,6 +246,8 @@ mod test {
                     &mut None,
                 )
                 .unwrap();
+
+            executor.database.checkpoint().unwrap();
         }
 
         // Verify drop persisted in second session

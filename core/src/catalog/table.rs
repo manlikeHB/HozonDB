@@ -1,6 +1,9 @@
 use crate::catalog::schema::Schema;
 use crate::constants::{self, PageId};
-use crate::storage::page::{PAGE_SIZE, PageManager};
+use crate::storage::buffer_pool::BufferPool;
+use crate::storage::page::PAGE_SIZE;
+use crate::wal::record_type::WalRecordType;
+use crate::wal::writer::WalWriter;
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 pub struct TableMetadata {
@@ -32,16 +35,19 @@ pub struct TableCatalog {
 }
 
 impl TableCatalog {
-    pub fn new(page_manager: &mut PageManager) -> io::Result<Self> {
+    pub fn new(buffer_pool: &mut BufferPool) -> io::Result<Self> {
         // If this is a new database (only page 0 exists), allocate page 1 for catalog
-        if page_manager.num_pages() == 1 {
-            page_manager.allocate_page()?;
+        if buffer_pool.total_num_of_db_pages() == 1 {
+            buffer_pool.allocate_raw_page()?;
         }
 
-        let catalog_data = page_manager.read_page(constants::TABLE_CATALOG_PAGE_ID)?;
+        let catalog_data = buffer_pool.read_page(constants::TABLE_CATALOG_PAGE_ID)?;
 
         // check if catalog is empty
-        if catalog_data.iter().all(|&b| b == 0) {
+        if catalog_data[constants::OFFSET_RAW_PAGE_START..]
+            .iter()
+            .all(|&b| b == 0)
+        {
             // empty catalog - new db
             return Ok(TableCatalog {
                 tables: HashMap::new(),
@@ -49,7 +55,7 @@ impl TableCatalog {
         }
 
         // parse catalog data
-        let mut offset = 0;
+        let mut offset = constants::OFFSET_RAW_PAGE_START;
 
         if catalog_data.len() < 4 {
             return Err(Error::new(
@@ -118,13 +124,16 @@ impl TableCatalog {
         Ok(TableCatalog { tables })
     }
 
+    // TODO: catalog is limited to a single 4KB page. Needs multi-page catalog
+    // support with a page chain, similar to how table data pages are chained.
     pub fn create_table(
         &mut self,
         schema: Schema,
-        page_manager: &mut PageManager,
+        buffer_pool: &mut BufferPool,
+        wal_writer: &mut WalWriter,
     ) -> io::Result<()> {
-        // allocate first page for table data
-        let first_page = page_manager.allocate_page()?;
+        // allocate page for table data
+        let first_page = buffer_pool.allocate_slotted_page()?;
 
         let table_name = schema.table_name().to_string();
         let table_metadata = TableMetadata {
@@ -135,24 +144,33 @@ impl TableCatalog {
 
         self.tables.insert(table_name, table_metadata);
 
+        let table_catalog = self.to_bytes();
+
+        let old_data = buffer_pool.read_page(first_page)?;
+
+        let mut new_data = old_data.clone();
+        new_data[constants::OFFSET_RAW_PAGE_START
+            ..constants::OFFSET_RAW_PAGE_START + table_catalog.len()]
+            .copy_from_slice(&table_catalog);
+        new_data[constants::OFFSET_RAW_PAGE_START + table_catalog.len()..].fill(0);
+
+        // log to WAL
+        let lsn =
+            wal_writer.append_raw(WalRecordType::CreateTable, first_page, &new_data, old_data)?;
+
         // save catalog
-        self.save(page_manager)?;
+        self.save(buffer_pool, &new_data, lsn)?;
 
         Ok(())
     }
 
-    pub fn save(&mut self, page_manager: &mut PageManager) -> io::Result<()> {
-        let bytes = self.to_bytes();
-
-        // TODO: catalog is limited to a single 4KB page. Needs multi-page catalog
-        // support with a page chain, similar to how table data pages are chained.
-        if bytes.len() > PAGE_SIZE {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "catalog exceeds page size limit",
-            ));
-        }
-        page_manager.write_page(constants::TABLE_CATALOG_PAGE_ID, &bytes)?;
+    pub fn save(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        new_data: &[u8; PAGE_SIZE],
+        lsn: u64,
+    ) -> io::Result<()> {
+        buffer_pool.write_raw_page(constants::TABLE_CATALOG_PAGE_ID, new_data, lsn)?;
         Ok(())
     }
 
@@ -184,10 +202,33 @@ impl TableCatalog {
         self.tables.keys().cloned().collect()
     }
 
-    pub fn drop_table(&mut self, name: &str, page_manager: &mut PageManager) -> io::Result<()> {
+    pub fn drop_table(
+        &mut self,
+        name: &str,
+        buffer_pool: &mut BufferPool,
+        wal_writer: &mut WalWriter,
+    ) -> io::Result<()> {
         match self.tables.remove(name) {
             Some(_) => {
-                self.save(page_manager)?;
+                let table_catalog = self.to_bytes();
+
+                let old_data = buffer_pool.read_page(constants::TABLE_CATALOG_PAGE_ID)?;
+
+                let mut new_data = old_data.clone();
+                new_data[constants::OFFSET_RAW_PAGE_START
+                    ..constants::OFFSET_RAW_PAGE_START + table_catalog.len()]
+                    .copy_from_slice(&table_catalog);
+                new_data[constants::OFFSET_RAW_PAGE_START + table_catalog.len()..].fill(0);
+
+                // log to WAL
+                let lsn = wal_writer.append_raw(
+                    WalRecordType::DropTable,
+                    constants::TABLE_CATALOG_PAGE_ID,
+                    &new_data,
+                    old_data,
+                )?;
+
+                self.save(buffer_pool, &new_data, lsn)?;
                 return Ok(());
             }
             None => {
@@ -203,13 +244,32 @@ impl TableCatalog {
         &mut self,
         table_name: &str,
         page_id: PageId,
-        page_manager: &mut PageManager,
+        buffer_pool: &mut BufferPool,
+        wal_writer: &mut WalWriter,
     ) -> io::Result<()> {
         if let Some(meta) = self.tables.get_mut(table_name) {
             meta.update_last_page(page_id);
         }
 
-        self.save(page_manager)?;
+        let table_catalog = self.to_bytes();
+
+        let old_data = buffer_pool.read_page(constants::TABLE_CATALOG_PAGE_ID)?;
+
+        let mut new_data = old_data.clone();
+        new_data[constants::OFFSET_RAW_PAGE_START
+            ..constants::OFFSET_RAW_PAGE_START + table_catalog.len()]
+            .copy_from_slice(&table_catalog);
+        new_data[constants::OFFSET_RAW_PAGE_START + table_catalog.len()..].fill(0);
+
+        // log to WAL
+        let lsn = wal_writer.append_raw(
+            WalRecordType::DropTable,
+            constants::TABLE_CATALOG_PAGE_ID,
+            &new_data,
+            old_data,
+        )?;
+
+        self.save(buffer_pool, &new_data, lsn)?;
         Ok(())
     }
 
@@ -221,20 +281,31 @@ impl TableCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::{Column, DataType, Schema};
+    use crate::{
+        catalog::schema::{Column, DataType, Schema},
+        storage::page::PageManager,
+    };
     use std::fs;
 
     fn cleanup(basename: &str) {
         let _ = fs::remove_file(format!("{}.hdb", basename));
         let _ = fs::remove_file(format!("{}.hdb.lock", basename));
+        let _ = fs::remove_file(format!("{}.wal", basename));
+    }
+
+    fn setup(db_name: &str) -> (TableCatalog, BufferPool, WalWriter) {
+        let pm = PageManager::new(db_name).unwrap();
+        let mut buffer_pool = BufferPool::new(pm, 5);
+        let wal_writer = WalWriter::new(db_name).unwrap();
+        let catalog = TableCatalog::new(&mut buffer_pool).unwrap();
+        (catalog, buffer_pool, wal_writer)
     }
 
     #[test]
     fn test_new_catalog_empty() {
         cleanup("test_new_catalog");
 
-        let mut pm = PageManager::new("test_new_catalog").unwrap();
-        let catalog = TableCatalog::new(&mut pm).unwrap();
+        let (catalog, _, _) = setup("test_new_catalog");
 
         assert_eq!(catalog.tables.len(), 0);
 
@@ -245,8 +316,7 @@ mod tests {
     fn test_create_single_table() {
         cleanup("test_single");
 
-        let mut pm = PageManager::new("test_single").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_single");
 
         let schema = Schema::new(
             "users",
@@ -257,12 +327,12 @@ mod tests {
         )
         .unwrap();
 
-        catalog.create_table(schema, &mut pm).unwrap();
+        tc.create_table(schema, &mut bp, &mut ww).unwrap();
 
-        assert_eq!(catalog.tables.len(), 1);
-        assert!(catalog.tables.contains_key("users"));
+        assert_eq!(tc.tables.len(), 1);
+        assert!(tc.tables.contains_key("users"));
         // check fist page and last page is same for new table
-        let table_meta = catalog.tables.get("users").unwrap();
+        let table_meta = tc.tables.get("users").unwrap();
         assert_eq!(table_meta.first_page(), table_meta.last_page());
 
         cleanup("test_single");
@@ -272,13 +342,12 @@ mod tests {
     fn test_create_multiple_tables() {
         cleanup("test_multiple");
 
-        let mut pm = PageManager::new("test_multiple").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_multiple");
 
         // Create first table
         let users_schema =
             Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap();
-        catalog.create_table(users_schema, &mut pm).unwrap();
+        tc.create_table(users_schema, &mut bp, &mut ww).unwrap();
 
         // Create second table
         let orders_schema = Schema::new(
@@ -289,11 +358,11 @@ mod tests {
             ],
         )
         .unwrap();
-        catalog.create_table(orders_schema, &mut pm).unwrap();
+        tc.create_table(orders_schema, &mut bp, &mut ww).unwrap();
 
-        assert_eq!(catalog.tables.len(), 2);
-        assert!(catalog.tables.contains_key("users"));
-        assert!(catalog.tables.contains_key("orders"));
+        assert_eq!(tc.tables.len(), 2);
+        assert!(tc.tables.contains_key("users"));
+        assert!(tc.tables.contains_key("orders"));
 
         cleanup("test_multiple");
     }
@@ -304,8 +373,7 @@ mod tests {
 
         // Create catalog and add table
         {
-            let mut pm = PageManager::new("test_persist").unwrap();
-            let mut catalog = TableCatalog::new(&mut pm).unwrap();
+            let (mut tc, mut bp, mut ww) = setup("test_persist");
 
             let schema = Schema::new(
                 "users",
@@ -316,19 +384,19 @@ mod tests {
             )
             .unwrap();
 
-            catalog.create_table(schema, &mut pm).unwrap();
-            assert_eq!(catalog.tables.len(), 1);
+            tc.create_table(schema, &mut bp, &mut ww).unwrap();
+            assert_eq!(tc.tables.len(), 1);
+            bp.flush_dirty().unwrap();
         } // catalog dropped, file closed
 
         // Re-open and verify table still exists
         {
-            let mut pm = PageManager::new("test_persist").unwrap();
-            let catalog = TableCatalog::new(&mut pm).unwrap();
+            let (tc, _, _) = setup("test_persist");
 
-            assert_eq!(catalog.tables.len(), 1);
-            assert!(catalog.tables.contains_key("users"));
+            assert_eq!(tc.tables.len(), 1);
+            assert!(tc.tables.contains_key("users"));
 
-            let metadata = catalog.get_table("users").unwrap();
+            let metadata = tc.get_table("users").unwrap();
             assert_eq!(metadata.schema.table_name(), "users");
             assert_eq!(metadata.schema.columns().len(), 2);
         }
@@ -342,63 +410,62 @@ mod tests {
 
         // Create and save multiple tables
         {
-            let mut pm = PageManager::new("test_multi_persist").unwrap();
-            let mut catalog = TableCatalog::new(&mut pm).unwrap();
+            let (mut tc, mut bp, mut ww) = setup("test_multi_persist");
 
-            catalog
-                .create_table(
-                    Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
-                    &mut pm,
-                )
-                .unwrap();
+            tc.create_table(
+                Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
+                &mut bp,
+                &mut ww,
+            )
+            .unwrap();
 
-            catalog
-                .create_table(
-                    Schema::new(
-                        "orders",
-                        vec![
-                            Column::new("id", DataType::Integer, true),
-                            Column::new("user_id", DataType::Integer, false),
-                        ],
-                    )
-                    .unwrap(),
-                    &mut pm,
+            tc.create_table(
+                Schema::new(
+                    "orders",
+                    vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("user_id", DataType::Integer, false),
+                    ],
                 )
-                .unwrap();
+                .unwrap(),
+                &mut bp,
+                &mut ww,
+            )
+            .unwrap();
 
-            catalog
-                .create_table(
-                    Schema::new(
-                        "products",
-                        vec![
-                            Column::new("name", DataType::Text, false),
-                            Column::new("price", DataType::Integer, false),
-                        ],
-                    )
-                    .unwrap(),
-                    &mut pm,
+            tc.create_table(
+                Schema::new(
+                    "products",
+                    vec![
+                        Column::new("name", DataType::Text, false),
+                        Column::new("price", DataType::Integer, false),
+                    ],
                 )
-                .unwrap();
+                .unwrap(),
+                &mut bp,
+                &mut ww,
+            )
+            .unwrap();
+            bp.flush_dirty().unwrap();
         }
 
         // Reload and verify all tables
         {
-            let mut pm = PageManager::new("test_multi_persist").unwrap();
-            let catalog = TableCatalog::new(&mut pm).unwrap();
+            let (tc, _, _) = setup("test_multi_persist");
 
-            assert_eq!(catalog.tables.len(), 3);
-            assert!(catalog.tables.contains_key("users"));
-            assert!(catalog.tables.contains_key("orders"));
-            assert!(catalog.tables.contains_key("products"));
+            assert_eq!(tc.tables.len(), 3);
+            assert!(tc.tables.contains_key("users"));
+            assert!(tc.tables.contains_key("orders"));
+            assert!(tc.tables.contains_key("products"));
 
             // Verify schema details
-            let users = catalog.get_table("users").unwrap();
+            let users = tc.get_table("users").unwrap();
             assert_eq!(users.schema.columns().len(), 1);
 
-            let orders = catalog.get_table("orders").unwrap();
+            let orders = tc.get_table("orders").unwrap();
             assert_eq!(orders.schema.columns().len(), 2);
 
-            let products = catalog.get_table("products").unwrap();
+            let products = tc.get_table("products").unwrap();
             assert_eq!(products.schema.columns().len(), 2);
         }
 
@@ -409,31 +476,30 @@ mod tests {
     fn test_first_page_allocation() {
         cleanup("test_page_alloc");
 
-        let mut pm = PageManager::new("test_page_alloc").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_page_alloc");
 
-        let initial_pages = pm.num_pages();
+        let initial_pages = bp.total_num_of_db_pages();
 
         // Create first table
-        catalog
-            .create_table(
-                Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
-                &mut pm,
-            )
-            .unwrap();
+        tc.create_table(
+            Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
+            &mut bp,
+            &mut ww,
+        )
+        .unwrap();
 
-        let users_page = catalog.get_table("users").unwrap().first_page;
+        let users_page = tc.get_table("users").unwrap().first_page;
         assert_eq!(users_page, initial_pages); // Should allocate next available page
 
         // Create second table
-        catalog
-            .create_table(
-                Schema::new("orders", vec![Column::new("id", DataType::Integer, false)]).unwrap(),
-                &mut pm,
-            )
-            .unwrap();
+        tc.create_table(
+            Schema::new("orders", vec![Column::new("id", DataType::Integer, false)]).unwrap(),
+            &mut bp,
+            &mut ww,
+        )
+        .unwrap();
 
-        let orders_page = catalog.get_table("orders").unwrap().first_page;
+        let orders_page = tc.get_table("orders").unwrap().first_page;
         assert_eq!(orders_page, users_page + 1); // Should allocate next page
 
         cleanup("test_page_alloc");
@@ -443,8 +509,7 @@ mod tests {
     fn test_table_with_all_data_types() {
         cleanup("test_all_types");
 
-        let mut pm = PageManager::new("test_all_types").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_all_types");
 
         let schema = Schema::new(
             "test_table",
@@ -457,14 +522,15 @@ mod tests {
         )
         .unwrap();
 
-        catalog.create_table(schema, &mut pm).unwrap();
+        tc.create_table(schema, &mut bp, &mut ww).unwrap();
+        bp.flush_dirty().unwrap();
 
         // Reload and verify
-        drop(pm);
-        let mut pm = PageManager::new("test_all_types").unwrap();
-        let catalog = TableCatalog::new(&mut pm).unwrap();
+        drop(bp);
 
-        let metadata = catalog.get_table("test_table").unwrap();
+        let (tc, _, _) = setup("test_all_types");
+
+        let metadata = tc.get_table("test_table").unwrap();
         assert_eq!(metadata.schema.columns().len(), 4);
 
         cleanup("test_all_types");
@@ -474,14 +540,13 @@ mod tests {
     fn test_empty_table_name() {
         cleanup("test_empty_name");
 
-        let mut pm = PageManager::new("test_empty_name").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_empty_name");
 
         let schema = Schema::new("", vec![Column::new("id", DataType::Integer, true)]).unwrap();
 
         // Should still work (validation not implemented yet)
-        catalog.create_table(schema, &mut pm).unwrap();
-        assert!(catalog.tables.contains_key(""));
+        tc.create_table(schema, &mut bp, &mut ww).unwrap();
+        assert!(tc.tables.contains_key(""));
 
         cleanup("test_empty_name");
     }
@@ -490,8 +555,7 @@ mod tests {
     fn test_table_with_long_name() {
         cleanup("test_long_name");
 
-        let mut pm = PageManager::new("test_long_name").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_long_name");
 
         let long_name = "a".repeat(1000);
         let schema = Schema::new(
@@ -500,14 +564,15 @@ mod tests {
         )
         .unwrap();
 
-        catalog.create_table(schema, &mut pm).unwrap();
+        tc.create_table(schema, &mut bp, &mut ww).unwrap();
+        bp.flush_dirty().unwrap();
 
         // Reload and verify
-        drop(pm);
-        let mut pm = PageManager::new("test_long_name").unwrap();
-        let catalog = TableCatalog::new(&mut pm).unwrap();
+        drop(bp);
 
-        assert!(catalog.tables.contains_key(&long_name));
+        let (tc, _, _) = setup("test_long_name");
+
+        assert!(tc.tables.contains_key(&long_name));
 
         cleanup("test_long_name");
     }
@@ -516,14 +581,13 @@ mod tests {
     fn test_get_table_exists() {
         cleanup("test_get");
 
-        let mut pm = PageManager::new("test_get").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_get");
 
         let schema =
             Schema::new("users", vec![Column::new("id", DataType::Integer, false)]).unwrap();
-        catalog.create_table(schema, &mut pm).unwrap();
+        tc.create_table(schema, &mut bp, &mut ww).unwrap();
 
-        let result = catalog.get_table("users");
+        let result = tc.get_table("users");
         assert!(result.is_some());
         assert_eq!(result.unwrap().schema.table_name(), "users");
 
@@ -534,10 +598,9 @@ mod tests {
     fn test_get_table_not_exists() {
         cleanup("test_get_none");
 
-        let mut pm = PageManager::new("test_get_none").unwrap();
-        let catalog = TableCatalog::new(&mut pm).unwrap();
+        let (tc, _, _) = setup("test_get_none");
 
-        assert!(catalog.get_table("nonexistent").is_none());
+        assert!(tc.get_table("nonexistent").is_none());
 
         cleanup("test_get_none");
     }
@@ -546,20 +609,16 @@ mod tests {
     fn test_list_tables() {
         cleanup("test_list");
 
-        let mut pm = PageManager::new("test_list").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_list");
 
-        catalog
-            .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
+        tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
             .unwrap();
-        catalog
-            .create_table(Schema::new("orders", vec![]).unwrap(), &mut pm)
+        tc.create_table(Schema::new("orders", vec![]).unwrap(), &mut bp, &mut ww)
             .unwrap();
-        catalog
-            .create_table(Schema::new("products", vec![]).unwrap(), &mut pm)
+        tc.create_table(Schema::new("products", vec![]).unwrap(), &mut bp, &mut ww)
             .unwrap();
 
-        let tables = catalog.list_tables();
+        let tables = tc.list_tables();
         assert_eq!(tables.len(), 3);
         assert!(tables.contains(&"users".to_string()));
         assert!(tables.contains(&"orders".to_string()));
@@ -572,23 +631,20 @@ mod tests {
     fn test_drop_table() {
         cleanup("test_drop");
 
-        let mut pm = PageManager::new("test_drop").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_drop");
 
-        catalog
-            .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
+        tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
             .unwrap();
-        catalog
-            .create_table(Schema::new("orders", vec![]).unwrap(), &mut pm)
+        tc.create_table(Schema::new("orders", vec![]).unwrap(), &mut bp, &mut ww)
             .unwrap();
 
-        assert_eq!(catalog.tables.len(), 2);
+        assert_eq!(tc.tables.len(), 2);
 
-        catalog.drop_table("users", &mut pm).unwrap();
+        tc.drop_table("users", &mut bp, &mut ww).unwrap();
 
-        assert_eq!(catalog.tables.len(), 1);
-        assert!(catalog.get_table("users").is_none());
-        assert!(catalog.get_table("orders").is_some());
+        assert_eq!(tc.tables.len(), 1);
+        assert!(tc.get_table("users").is_none());
+        assert!(tc.get_table("orders").is_some());
 
         cleanup("test_drop");
     }
@@ -598,26 +654,23 @@ mod tests {
         cleanup("test_drop_persist");
 
         {
-            let mut pm = PageManager::new("test_drop_persist").unwrap();
-            let mut catalog = TableCatalog::new(&mut pm).unwrap();
+            let (mut tc, mut bp, mut ww) = setup("test_drop_persist");
 
-            catalog
-                .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
+            tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
                 .unwrap();
-            catalog
-                .create_table(Schema::new("orders", vec![]).unwrap(), &mut pm)
+            tc.create_table(Schema::new("orders", vec![]).unwrap(), &mut bp, &mut ww)
                 .unwrap();
-            catalog.drop_table("users", &mut pm).unwrap();
+            tc.drop_table("users", &mut bp, &mut ww).unwrap();
+            bp.flush_dirty().unwrap();
         }
 
         // Reload and verify drop persisted
         {
-            let mut pm = PageManager::new("test_drop_persist").unwrap();
-            let catalog = TableCatalog::new(&mut pm).unwrap();
+            let (tc, _, _) = setup("test_drop_persist");
 
-            assert_eq!(catalog.tables.len(), 1);
-            assert!(catalog.get_table("users").is_none());
-            assert!(catalog.get_table("orders").is_some());
+            assert_eq!(tc.tables.len(), 1);
+            assert!(tc.get_table("users").is_none());
+            assert!(tc.get_table("orders").is_some());
         }
 
         cleanup("test_drop_persist");
@@ -627,10 +680,9 @@ mod tests {
     fn test_drop_nonexistent_table() {
         cleanup("test_drop_none");
 
-        let mut pm = PageManager::new("test_drop_none").unwrap();
-        let mut catalog = TableCatalog::new(&mut pm).unwrap();
+        let (mut tc, mut bp, mut ww) = setup("test_drop_none");
 
-        let result = catalog.drop_table("nonexistent", &mut pm);
+        let result = tc.drop_table("nonexistent", &mut bp, &mut ww);
         assert!(result.is_err()); // Should return error
 
         cleanup("test_drop_none");
@@ -641,23 +693,21 @@ mod tests {
         cleanup("test_table_first_and_last_name_persists");
 
         {
-            let mut pm = PageManager::new("test_table_first_and_last_name_persists").unwrap();
-            let mut catalog = TableCatalog::new(&mut pm).unwrap();
+            let (mut tc, mut bp, mut ww) = setup("test_table_first_and_last_name_persists");
 
-            catalog
-                .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
+            tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
                 .unwrap();
 
-            let table_meta = catalog.tables.get("users").unwrap();
+            let table_meta = tc.tables.get("users").unwrap();
             assert_eq!(table_meta.first_page(), table_meta.last_page());
+            bp.flush_dirty().unwrap();
         }
 
         // Reload and verify drop persisted
         {
-            let mut pm = PageManager::new("test_table_first_and_last_name_persists").unwrap();
-            let catalog = TableCatalog::new(&mut pm).unwrap();
+            let (tc, _, _) = setup("test_table_first_and_last_name_persists");
 
-            let table_meta = catalog.tables.get("users").unwrap();
+            let table_meta = tc.tables.get("users").unwrap();
             assert_eq!(table_meta.first_page(), table_meta.last_page());
         }
 
@@ -670,29 +720,26 @@ mod tests {
         let new_last_page = 128;
 
         {
-            let mut pm = PageManager::new("test_update_table_last_page").unwrap();
-            let mut catalog = TableCatalog::new(&mut pm).unwrap();
+            let (mut tc, mut bp, mut ww) = setup("test_update_table_last_page");
 
-            catalog
-                .create_table(Schema::new("users", vec![]).unwrap(), &mut pm)
+            tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
                 .unwrap();
 
-            let table_meta = catalog.tables.get("users").unwrap();
+            let table_meta = tc.tables.get("users").unwrap();
             assert_eq!(table_meta.first_page(), table_meta.last_page());
 
             // update last page
-            catalog
-                .update_last_page("users", new_last_page, &mut pm)
+            tc.update_last_page("users", new_last_page, &mut bp, &mut ww)
                 .unwrap();
-            assert_eq!(catalog.get_last_page("users").unwrap(), new_last_page);
+            assert_eq!(tc.get_last_page("users").unwrap(), new_last_page);
+            bp.flush_dirty().unwrap();
         }
 
         // Reload and verify drop persisted
         {
-            let mut pm = PageManager::new("test_update_table_last_page").unwrap();
-            let catalog = TableCatalog::new(&mut pm).unwrap();
+            let (tc, _, _) = setup("test_update_table_last_page");
 
-            assert_eq!(catalog.get_last_page("users").unwrap(), new_last_page);
+            assert_eq!(tc.get_last_page("users").unwrap(), new_last_page);
         }
 
         cleanup("test_update_table_last_page");

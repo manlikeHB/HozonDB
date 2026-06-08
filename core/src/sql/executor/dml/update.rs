@@ -1,17 +1,14 @@
 use crate::{
     benchmark::metrics::QueryMetrics,
-    constants::PageId,
     index::node::leaf::RowLocation,
     sql::{
         database::Database,
         executor::{ExecutionResult, helpers},
     },
+    storage::page::PageType,
     wal::record_type::WalRecordType,
 };
-use std::{
-    collections::HashMap,
-    io::{self, Error, ErrorKind},
-};
+use std::io::{self, Error, ErrorKind};
 
 use crate::{
     catalog::{
@@ -19,7 +16,7 @@ use crate::{
         schema::Column,
     },
     sql::parser::Expr,
-    storage::page::{PAGE_SIZE, PageManager},
+    storage::page::PageManager,
 };
 
 pub fn execute_update(
@@ -99,7 +96,6 @@ pub fn execute_update(
 
     // Update rows based on WHERE clause
     let mut updated_count = 0;
-    let mut dirty_pages: HashMap<PageId, [u8; PAGE_SIZE]> = HashMap::new();
     let mut deleted_rows = Vec::new();
     for (row, loc) in rows_and_locs {
         let mut updated_values = row.values().clone();
@@ -124,8 +120,7 @@ pub fn execute_update(
 
         // if updated row fit previous space, write into old location else re-insert
         if new_bytes.len() <= old_bytes.len() {
-            // TODO:
-            db.wal_append(
+            let lsn = db.wal_append_slotted(
                 WalRecordType::Update,
                 &table_name,
                 loc.page_id(),
@@ -134,22 +129,23 @@ pub fn execute_update(
                 &old_bytes,
             )?;
 
-            if !dirty_pages.contains_key(&loc.page_id()) {
-                let page_data = db.read_page(loc.page_id())?;
+            let page_data = db.get_page_mut(loc.page_id())?;
+            let (row_offset, _) = PageManager::read_slot(page_data, loc.slot());
 
-                dirty_pages.insert(loc.page_id(), page_data);
-            }
+            // write new row
+            page_data[row_offset as usize..row_offset as usize + new_bytes.len()]
+                .copy_from_slice(&new_bytes);
+            // update slot
+            PageManager::write_slot(page_data, loc.slot(), row_offset, new_bytes.len() as u16);
 
-            if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
-                let (row_offset, _) = PageManager::read_slot(page_data, loc.slot());
+            // update page meta lsn
+            let mut page_meta =
+                PageManager::read_metadata_from_buffer(page_data, PageType::Slotted);
+            page_meta.set_lsn(lsn);
+            PageManager::update_metadata_in_buffer(page_data, &page_meta);
 
-                // write new row
-                page_data[row_offset as usize..row_offset as usize + new_bytes.len()]
-                    .copy_from_slice(&new_bytes);
-
-                // update slot to reflect new row length
-                PageManager::write_slot(page_data, loc.slot(), row_offset, new_bytes.len() as u16);
-            }
+            // mark page dirty
+            db.mark_dirty(loc.page_id(), lsn);
 
             // delete old row index
             helpers::delete_indexes(db, &index_entries, &old_value_and_col_pairs)?;
@@ -165,50 +161,49 @@ pub fn execute_update(
                 metrics,
             )?;
 
-            // TODO: WAL record is logged after page write — violates write-ahead guarantee.
-            // This will be fixed when the buffer pool is implemented
-            db.wal_append(
-                WalRecordType::Update,
-                &table_name,
-                row_page_id,
-                slot,
-                &new_bytes,
-                &old_bytes,
-            )?;
-
+            // TODO: should indexing newly inserted updated row come before deleting old row?
             // index new row
             let row_location = RowLocation::new(row_page_id, slot);
             helpers::index_new_row(db, &index_entries, &new_value_and_col_pairs, row_location)?;
 
             // delete old row
-            if !dirty_pages.contains_key(&loc.page_id()) {
-                let page_data = db.read_page(loc.page_id())?;
+            // log delete WAL record
+            let lsn = db.wal_append_slotted(
+                WalRecordType::Delete,
+                &table_name,
+                loc.page_id(),
+                loc.slot(),
+                &vec![],
+                &old_bytes,
+            )?;
 
-                dirty_pages.insert(loc.page_id(), page_data);
-            }
+            // mark slot dead
+            let page_data = db.get_page_mut(loc.page_id())?;
+            PageManager::mark_slot_dead(page_data, loc.slot());
 
-            if let Some(page_data) = dirty_pages.get_mut(&loc.page_id()) {
-                PageManager::mark_slot_dead(page_data, loc.slot());
-            }
+            // update page meta lsn
+            let mut page_meta =
+                PageManager::read_metadata_from_buffer(page_data, PageType::Slotted);
+            page_meta.set_lsn(lsn);
+            PageManager::update_metadata_in_buffer(page_data, &page_meta);
+
+            // mark page dirty
+            db.mark_dirty(loc.page_id(), lsn);
+
             // collect old row to be freed if indexed
             deleted_rows.push(row);
         }
     }
 
-    // write update pages to disk
-    for (page_id, page_data) in &dirty_pages {
-        db.write_page(*page_id, page_data)?;
-
-        if let Some(metrics) = metrics {
-            metrics.pages_written += 1;
-        }
-    }
+    // TODO: track pages written to for metrics
 
     // delete indexed keys for deleted rows
-    for row in &deleted_rows {
-        let value_and_col_pairs: Vec<(&Value, &Column)> =
-            row.values().iter().zip(columns.iter()).collect();
-        helpers::delete_indexes(db, &index_entries, &value_and_col_pairs)?;
+    if index_entries.len() > 0 {
+        for row in &deleted_rows {
+            let value_and_col_pairs: Vec<(&Value, &Column)> =
+                row.values().iter().zip(columns.iter()).collect();
+            helpers::delete_indexes(db, &index_entries, &value_and_col_pairs)?;
+        }
     }
 
     if let Some(m) = metrics {
@@ -885,6 +880,8 @@ mod tests {
                     &mut None,
                 )
                 .unwrap();
+
+            executor.database.checkpoint().unwrap();
         }
 
         // Verify update persisted

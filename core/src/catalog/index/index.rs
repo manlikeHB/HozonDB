@@ -6,7 +6,8 @@ use std::{
 use crate::{
     catalog::index::index_entry::IndexEntry,
     constants,
-    storage::page::{PAGE_SIZE, PageManager},
+    storage::{buffer_pool::BufferPool, page::PAGE_SIZE},
+    wal::{record_type::WalRecordType, writer::WalWriter},
 };
 
 pub struct IndexCatalog {
@@ -14,16 +15,19 @@ pub struct IndexCatalog {
 }
 
 impl IndexCatalog {
-    pub fn new(page_manager: &mut PageManager) -> io::Result<Self> {
+    pub fn new(buffer_pool: &mut BufferPool) -> io::Result<Self> {
         // If this is a new database (only page 0 and 1 exists), allocate page 2 for index catalog
-        if page_manager.num_pages() == 2 {
-            page_manager.allocate_page()?;
+        if buffer_pool.total_num_of_db_pages() == 2 {
+            buffer_pool.allocate_raw_page()?;
         }
 
-        let catalog_data = page_manager.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
+        let catalog_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
         // check if catalog is empty
-        if catalog_data.iter().all(|&b| b == 0) {
+        if catalog_data[constants::OFFSET_RAW_PAGE_START..]
+            .iter()
+            .all(|&b| b == 0)
+        {
             // empty catalog - new db
             return Ok(IndexCatalog {
                 indexes: HashMap::new(),
@@ -31,7 +35,7 @@ impl IndexCatalog {
         }
 
         // parse catalog data
-        let mut offset = 0;
+        let mut offset = constants::OFFSET_RAW_PAGE_START;
 
         if catalog_data.len() < 4 {
             return Err(Error::new(
@@ -70,11 +74,6 @@ impl IndexCatalog {
         // index count
         bytes.extend_from_slice(&(self.total_count() as u32).to_le_bytes());
 
-        /*
-        TODO-optimize;
-        - do something about the double loop
-        - maybe not re-allocate for each index
-         */
         for (_, indexes_vec) in self.indexes.iter() {
             for index in indexes_vec {
                 let index_byte = index.to_bytes();
@@ -88,30 +87,53 @@ impl IndexCatalog {
 
     pub fn add_index(
         &mut self,
-        page_manager: &mut PageManager,
+        buffer_pool: &mut BufferPool,
+        wal_writer: &mut WalWriter,
         entry: IndexEntry,
     ) -> io::Result<()> {
+        let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
+
         self.indexes
             .entry(entry.table_name().to_string())
             .or_default()
             .push(entry);
 
-        self.save(page_manager)?;
-        Ok(())
-    }
+        let catalog_bytes = self.to_bytes();
 
-    fn save(&mut self, page_manager: &mut PageManager) -> io::Result<()> {
-        let bytes = self.to_bytes();
         // TODO: catalog is limited to a single 4KB page. Needs multi-page catalog
         // support with a page chain, similar to how table data pages are chained.
-        if bytes.len() > PAGE_SIZE {
+        if catalog_bytes.len() > PAGE_SIZE - constants::OFFSET_RAW_PAGE_START {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "catalog exceeds page size limit",
             ));
         }
-        page_manager.write_page(constants::INDEX_CATALOG_PAGE_ID, &bytes)?;
+
+        // build full new page so old_data and new_data are the same unit
+        let mut new_page = old_data.clone();
+        new_page[constants::OFFSET_RAW_PAGE_START
+            ..constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()]
+            .copy_from_slice(&catalog_bytes);
+        new_page[constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()..].fill(0);
+
+        let lsn = wal_writer.append_raw(
+            WalRecordType::AddIndex,
+            constants::INDEX_CATALOG_PAGE_ID,
+            &new_page,
+            old_data,
+        )?;
+
+        self.save(buffer_pool, &new_page, lsn)?;
         Ok(())
+    }
+
+    fn save(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        new_data: &[u8; PAGE_SIZE],
+        lsn: u64,
+    ) -> io::Result<()> {
+        buffer_pool.write_raw_page(constants::INDEX_CATALOG_PAGE_ID, new_data, lsn)
     }
 
     pub fn get_indexes_for_table(&self, table_name: &str) -> Option<&Vec<IndexEntry>> {
@@ -134,8 +156,11 @@ impl IndexCatalog {
         &mut self,
         table_name: &str,
         index_name: &str,
-        page_manager: &mut PageManager,
+        buffer_pool: &mut BufferPool,
+        wal_writer: &mut WalWriter,
     ) -> io::Result<()> {
+        let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
+
         self.indexes
             .entry(table_name.to_string())
             .or_default()
@@ -143,7 +168,32 @@ impl IndexCatalog {
 
         self.indexes.retain(|_, v| !v.is_empty());
 
-        self.save(page_manager)?;
+        let catalog_bytes = self.to_bytes();
+
+        // TODO: catalog is limited to a single 4KB page. Needs multi-page catalog
+        // support with a page chain, similar to how table data pages are chained.
+        if catalog_bytes.len() > PAGE_SIZE - constants::OFFSET_RAW_PAGE_START {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "catalog exceeds page size limit",
+            ));
+        }
+
+        // build full new page so old_data and new_data are the same unit
+        let mut new_page = old_data.clone();
+        new_page[constants::OFFSET_RAW_PAGE_START
+            ..constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()]
+            .copy_from_slice(&catalog_bytes);
+        new_page[constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()..].fill(0);
+
+        let lsn = wal_writer.append_raw(
+            WalRecordType::RemoveIndex,
+            constants::INDEX_CATALOG_PAGE_ID,
+            &new_page,
+            old_data,
+        )?;
+
+        self.save(buffer_pool, &new_page, lsn)?;
         Ok(())
     }
 
@@ -154,10 +204,39 @@ impl IndexCatalog {
     pub fn remove_table_indexes(
         &mut self,
         table_name: &str,
-        page_manager: &mut PageManager,
+        buffer_pool: &mut BufferPool,
+        wal_writer: &mut WalWriter,
     ) -> io::Result<()> {
+        let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
+
         self.indexes.remove(table_name);
-        self.save(page_manager)?;
+
+        let catalog_bytes = self.to_bytes();
+
+        // TODO: catalog is limited to a single 4KB page. Needs multi-page catalog
+        // support with a page chain, similar to how table data pages are chained.
+        if catalog_bytes.len() > PAGE_SIZE - constants::OFFSET_RAW_PAGE_START {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "catalog exceeds page size limit",
+            ));
+        }
+
+        // build full new page so old_data and new_data are the same unit
+        let mut new_page = old_data.clone();
+        new_page[constants::OFFSET_RAW_PAGE_START
+            ..constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()]
+            .copy_from_slice(&catalog_bytes);
+        new_page[constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()..].fill(0);
+
+        let lsn = wal_writer.append_raw(
+            WalRecordType::RemoveIndex,
+            constants::INDEX_CATALOG_PAGE_ID,
+            &new_page,
+            old_data,
+        )?;
+
+        self.save(buffer_pool, &new_page, lsn)?;
         Ok(())
     }
 
@@ -169,26 +248,32 @@ impl IndexCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{index::index_entry::IndexColumnType, table::TableCatalog};
+    use crate::{
+        catalog::{index::index_entry::IndexColumnType, table::TableCatalog},
+        storage::page::PageManager,
+    };
     use std::fs;
 
     fn cleanup(basename: &str) {
         let _ = fs::remove_file(format!("{}.hdb", basename));
         let _ = fs::remove_file(format!("{}.hdb.lock", basename));
+        let _ = fs::remove_file(format!("{}.wal", basename));
     }
 
-    fn setup(basename: &str) -> (IndexCatalog, PageManager) {
-        let mut pm = PageManager::new(basename).unwrap();
-        let _ = TableCatalog::new(&mut pm).unwrap();
-        let ic = IndexCatalog::new(&mut pm).unwrap();
-        (ic, pm)
+    fn setup(basename: &str) -> (IndexCatalog, BufferPool, WalWriter) {
+        let pm = PageManager::new(basename).unwrap();
+        let wal_writer = WalWriter::new("test").unwrap();
+        let mut buffer_pool = BufferPool::new(pm, 5);
+        let _ = TableCatalog::new(&mut buffer_pool).unwrap();
+        let ic = IndexCatalog::new(&mut buffer_pool).unwrap();
+        (ic, buffer_pool, wal_writer)
     }
 
     #[test]
     fn test_new_index_catalog() {
         cleanup("test_new_index_catalog");
 
-        let (index_catalog, _) = setup("test_new_index_catalog");
+        let (index_catalog, _, _) = setup("test_new_index_catalog");
 
         assert!(index_catalog.indexes.is_empty());
         assert_eq!(index_catalog.indexes.values().count(), 0);
@@ -199,7 +284,7 @@ mod tests {
     fn test_add_index() {
         cleanup("test_add_index");
 
-        let (mut ic, mut pm) = setup("test_add_index");
+        let (mut ic, mut bp, mut ww) = setup("test_add_index");
 
         let index = IndexEntry::new(
             "idx_users_id",
@@ -209,7 +294,7 @@ mod tests {
             true,
             99,
         );
-        ic.add_index(&mut pm, index).unwrap();
+        ic.add_index(&mut bp, &mut ww, index).unwrap();
 
         let indexes = ic.get_indexes_for_table("users");
         assert!(indexes.is_some());
@@ -221,7 +306,7 @@ mod tests {
     fn test_add_index_multiple_tables() {
         cleanup("test_add_index_multiple_tables");
 
-        let (mut ic, mut pm) = setup("test_add_index_multiple_tables");
+        let (mut ic, mut bp, mut ww) = setup("test_add_index_multiple_tables");
 
         let users_index = IndexEntry::new(
             "idx_users_id",
@@ -239,8 +324,8 @@ mod tests {
             true,
             98,
         );
-        ic.add_index(&mut pm, users_index).unwrap();
-        ic.add_index(&mut pm, orders_index).unwrap();
+        ic.add_index(&mut bp, &mut ww, users_index).unwrap();
+        ic.add_index(&mut bp, &mut ww, orders_index).unwrap();
 
         let users_indexes = ic.get_indexes_for_table("users");
         let orders_indexes = ic.get_indexes_for_table("orders");
@@ -255,7 +340,7 @@ mod tests {
     fn test_get_primary_index() {
         cleanup("test_get_primary_index");
 
-        let (mut ic, mut pm) = setup("test_get_primary_index");
+        let (mut ic, mut bp, mut ww) = setup("test_get_primary_index");
 
         let index_1 = IndexEntry::new(
             "idx_users_id",
@@ -274,8 +359,8 @@ mod tests {
             99,
         );
 
-        ic.add_index(&mut pm, index_1).unwrap();
-        ic.add_index(&mut pm, index_2).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_1).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_2).unwrap();
 
         let primary = ic.get_primary_index("users");
         assert!(primary.is_some());
@@ -287,7 +372,7 @@ mod tests {
     fn test_get_primary_index_none() {
         cleanup("test_get_primary_index_none");
 
-        let (mut ic, mut pm): (IndexCatalog, PageManager) = setup("test_get_primary_index_none");
+        let (mut ic, mut bp, mut ww) = setup("test_get_primary_index_none");
 
         let index = IndexEntry::new(
             "idx_users_id",
@@ -298,7 +383,7 @@ mod tests {
             99,
         );
 
-        ic.add_index(&mut pm, index).unwrap();
+        ic.add_index(&mut bp, &mut ww, index).unwrap();
 
         assert!(ic.get_primary_index("users").is_none());
         cleanup("test_get_primary_index_none");
@@ -308,7 +393,7 @@ mod tests {
     fn test_remove_index() {
         cleanup("test_remove_index");
 
-        let (mut ic, mut pm) = setup("test_remove_index");
+        let (mut ic, mut bp, mut ww) = setup("test_remove_index");
 
         let index = IndexEntry::new(
             "idx_users_id",
@@ -319,8 +404,9 @@ mod tests {
             99,
         );
 
-        ic.add_index(&mut pm, index).unwrap();
-        ic.remove_index("users", "idx_users_id", &mut pm).unwrap();
+        ic.add_index(&mut bp, &mut ww, index).unwrap();
+        ic.remove_index("users", "idx_users_id", &mut bp, &mut ww)
+            .unwrap();
 
         let indexes = ic.get_indexes_for_table("users");
         assert!(indexes.is_none());
@@ -332,7 +418,7 @@ mod tests {
         cleanup("test_catalog_persist");
 
         {
-            let (mut ic, mut pm) = setup("test_catalog_persist");
+            let (mut ic, mut bp, mut ww) = setup("test_catalog_persist");
 
             let index_1 = IndexEntry::new(
                 "idx_users_id",
@@ -350,16 +436,17 @@ mod tests {
                 false,
                 98,
             );
-            ic.add_index(&mut pm, index_1).unwrap();
-            ic.add_index(&mut pm, index_2).unwrap();
+            ic.add_index(&mut bp, &mut ww, index_1).unwrap();
+            ic.add_index(&mut bp, &mut ww, index_2).unwrap();
 
             let indexes = ic.get_indexes_for_table("users");
             assert!(indexes.is_some());
             assert_eq!(indexes.unwrap().len(), 2);
+            bp.flush_dirty().unwrap();
         }
 
         {
-            let (ic, _) = setup("test_catalog_persist");
+            let (ic, _, _) = setup("test_catalog_persist");
 
             let indexes = ic.get_indexes_for_table("users");
             assert!(indexes.is_some());
@@ -372,7 +459,7 @@ mod tests {
     #[test]
     fn test_remove_table_indexes() {
         cleanup("test_remove_table");
-        let (mut ic, mut pm) = setup("test_remove_table");
+        let (mut ic, mut bp, mut ww) = setup("test_remove_table");
 
         let index_1 = IndexEntry::new(
             "idx_users_id",
@@ -391,10 +478,10 @@ mod tests {
             98,
         );
 
-        ic.add_index(&mut pm, index_1).unwrap();
-        ic.add_index(&mut pm, index_2).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_1).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_2).unwrap();
 
-        ic.remove_table_indexes("users", &mut pm).unwrap();
+        ic.remove_table_indexes("users", &mut bp, &mut ww).unwrap();
 
         let indexes = ic.get_indexes_for_table("users");
         assert!(indexes.is_none());
@@ -405,7 +492,7 @@ mod tests {
     #[test]
     fn test_all_indexes() {
         cleanup("test_all_indexes");
-        let (mut ic, mut pm) = setup("test_all_indexes");
+        let (mut ic, mut bp, mut ww) = setup("test_all_indexes");
 
         let index_1 = IndexEntry::new(
             "idx_users_id",
@@ -432,9 +519,9 @@ mod tests {
             97,
         );
 
-        ic.add_index(&mut pm, index_1).unwrap();
-        ic.add_index(&mut pm, index_2).unwrap();
-        ic.add_index(&mut pm, index_3).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_1).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_2).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_3).unwrap();
 
         assert_eq!(ic.total_count(), ic.all_indexes().len());
 
