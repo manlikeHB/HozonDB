@@ -113,11 +113,9 @@ mod tests {
     use crate::{
         catalog::schema::DataType,
         constants,
-        sql::{
-            executor::test_helpers::*,
-            parser::{SelectColumns, Statement},
-        },
+        sql::parser::{SelectColumns, Statement},
         storage::page::{PageManager, PageType},
+        test_helpers::*,
     };
 
     #[test]

@@ -588,12 +588,7 @@ impl Drop for PageManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-
-    fn cleanup(basename: &str) {
-        let _ = fs::remove_file(format!("{}.hdb", basename));
-        let _ = fs::remove_file(format!("{}.hdb.lock", basename));
-    }
+    use crate::test_helpers::*;
 
     #[test]
     fn test_page_manager_new() {

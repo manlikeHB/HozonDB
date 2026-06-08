@@ -284,14 +284,8 @@ mod tests {
     use crate::{
         catalog::schema::{Column, DataType, Schema},
         storage::page::PageManager,
+        test_helpers::*,
     };
-    use std::fs;
-
-    fn cleanup(basename: &str) {
-        let _ = fs::remove_file(format!("{}.hdb", basename));
-        let _ = fs::remove_file(format!("{}.hdb.lock", basename));
-        let _ = fs::remove_file(format!("{}.wal", basename));
-    }
 
     fn setup(db_name: &str) -> (TableCatalog, BufferPool, WalWriter) {
         let pm = PageManager::new(db_name).unwrap();

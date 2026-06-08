@@ -566,8 +566,7 @@ impl BPlusTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::page::PageManager;
-    use std::fs;
+    use crate::{storage::page::PageManager, test_helpers::*};
 
     fn get_rows(count: usize) -> Vec<RowLocation> {
         let mut rows = Vec::new();
@@ -581,12 +580,6 @@ mod tests {
 
     fn get_integer_keys(count: usize) -> Vec<IndexKey> {
         (1..=count).map(|i| IndexKey::Integer(i as i32)).collect()
-    }
-
-    fn cleanup(basename: &str) {
-        let _ = fs::remove_file(format!("{}.hdb", basename));
-        let _ = fs::remove_file(format!("{}.hdb.lock", basename));
-        let _ = fs::remove_file(format!("{}.wal", basename));
     }
 
     fn setup_tree(name: &str, count: i32) -> (BPlusTree, BufferPool, WalWriter) {

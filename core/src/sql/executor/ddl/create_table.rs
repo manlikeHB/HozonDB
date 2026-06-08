@@ -17,10 +17,7 @@ pub fn execute_create(
 
 #[cfg(test)]
 mod test {
-    use crate::{
-        catalog::schema::DataType,
-        sql::{executor::test_helpers::*, parser::Statement},
-    };
+    use crate::{catalog::schema::DataType, sql::parser::Statement, test_helpers::*};
 
     use super::*;
 

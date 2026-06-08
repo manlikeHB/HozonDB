@@ -23,10 +23,8 @@ mod test {
             row::Value,
             schema::{Column, DataType},
         },
-        sql::{
-            executor::test_helpers::*,
-            parser::{SelectColumns, Statement},
-        },
+        sql::parser::{SelectColumns, Statement},
+        test_helpers::*,
     };
 
     #[test]

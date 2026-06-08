@@ -226,10 +226,8 @@ mod tests {
     use crate::{
         catalog::schema::DataType,
         constants,
-        sql::{
-            executor::test_helpers::*,
-            parser::{BinaryOperator, SelectColumns, Statement},
-        },
+        sql::parser::{BinaryOperator, SelectColumns, Statement},
+        test_helpers::*,
     };
 
     #[test]

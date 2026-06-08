@@ -104,11 +104,9 @@ mod tests {
     use super::*;
     use crate::{
         catalog::schema::{Column, DataType},
-        sql::{
-            executor::test_helpers::*,
-            parser::{BinaryOperator, SelectColumns, Statement},
-        },
+        sql::parser::{BinaryOperator, SelectColumns, Statement},
         storage::page::{PAGE_SIZE, PageType, SLOT_DIRECTORY_START},
+        test_helpers::*,
     };
 
     #[test]

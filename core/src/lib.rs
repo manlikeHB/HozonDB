@@ -6,3 +6,6 @@ pub mod proto;
 pub mod sql;
 pub mod storage;
 pub mod wal;
+
+#[cfg(test)]
+pub mod test_helpers;

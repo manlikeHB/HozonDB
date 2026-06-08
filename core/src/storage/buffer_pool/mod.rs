@@ -262,15 +262,11 @@ impl BufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::page::{PageManager, PageType};
     use crate::wal::writer::WalWriter;
-    use std::fs;
-
-    fn cleanup(basename: &str) {
-        let _ = fs::remove_file(format!("{}.hdb", basename));
-        let _ = fs::remove_file(format!("{}.hdb.lock", basename));
-        let _ = fs::remove_file(format!("{}.wal", basename));
-    }
+    use crate::{
+        storage::page::{PageManager, PageType},
+        test_helpers::*,
+    };
 
     fn setup(basename: &str) -> (BufferPool, WalWriter) {
         let pm = PageManager::new(basename).unwrap();

@@ -4,9 +4,6 @@ pub mod dql; // Data Query
 pub mod evaluator;
 pub mod helpers;
 
-#[cfg(test)]
-pub mod test_helpers;
-
 pub use ddl::{create_table::execute_create, drop_table::execute_drop_table};
 pub use dml::{delete::execute_delete, insert::execute_insert, update::execute_update};
 pub use dql::select::execute_select;
