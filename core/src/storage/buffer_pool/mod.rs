@@ -36,7 +36,15 @@ impl BufferPool {
         Ok(self.frames[idx].data())
     }
 
-    pub fn allocate_page(&mut self, page_type: PageType) -> io::Result<PageId> {
+    pub fn allocate_slotted_page(&mut self) -> io::Result<PageId> {
+        self.allocate_page(PageType::Slotted)
+    }
+
+    pub fn allocate_raw_page(&mut self) -> io::Result<PageId> {
+        self.allocate_page(PageType::Raw)
+    }
+
+    fn allocate_page(&mut self, page_type: PageType) -> io::Result<PageId> {
         if let Some(free_page_id) = self.page_manager.first_free_page() {
             // read next free pointer from buffer pool frame
             let next_free = self.read_next_free(free_page_id)?;
