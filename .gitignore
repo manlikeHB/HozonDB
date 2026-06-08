@@ -4,5 +4,6 @@
 *.db
 *.hdb
 *.hdb.lock
+*.wal
 
 note.md
