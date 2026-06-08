@@ -502,4 +502,351 @@ mod tests {
 
         cleanup("test_allocate_all");
     }
+
+    #[test]
+    fn test_read_page_loads_into_frame() {
+        cleanup("test_bp_read_page");
+        let (mut bp, _) = setup("test_bp_read_page");
+
+        let page_id = bp.allocate_page(PageType::Slotted).unwrap();
+        bp.flush_dirty().unwrap(); // ensure page is on disk
+
+        // clear frames to force a disk read
+        bp.frames = vec![Frame::default(); 64];
+        bp.page_table.clear();
+
+        let data = bp.read_page(page_id).unwrap();
+        assert_eq!(data.len(), PAGE_SIZE);
+
+        // page should now be in page_table
+        assert!(bp.page_table.contains_key(&page_id));
+
+        cleanup("test_bp_read_page");
+    }
+
+    #[test]
+    fn test_read_page_cache_hit_no_disk_read() {
+        cleanup("test_bp_cache_hit");
+        let (mut bp, _) = setup("test_bp_cache_hit");
+
+        let page_id = bp.allocate_page(PageType::Slotted).unwrap();
+
+        // read twice — second should be a cache hit
+        bp.read_page(page_id).unwrap();
+        let frame_count_before = bp.page_table.len();
+
+        bp.read_page(page_id).unwrap();
+        let frame_count_after = bp.page_table.len();
+
+        // frame count unchanged — no new frame allocated
+        assert_eq!(frame_count_before, frame_count_after);
+
+        cleanup("test_bp_cache_hit");
+    }
+
+    #[test]
+    fn test_read_invalid_page_returns_err() {
+        cleanup("test_bp_invalid_read");
+        let (mut bp, _) = setup("test_bp_invalid_read");
+
+        let result = bp.read_page(999);
+        assert!(result.is_err());
+
+        cleanup("test_bp_invalid_read");
+    }
+
+    // --- get_page_mut and mark_dirty ---
+
+    #[test]
+    fn test_get_page_mut_and_mark_dirty() {
+        cleanup("test_bp_mut_dirty");
+        let (mut bp, _) = setup("test_bp_mut_dirty");
+
+        let page_id = bp.allocate_page(PageType::Slotted).unwrap();
+
+        {
+            let page = bp.get_page_mut(page_id).unwrap();
+            page[100] = 0xAB;
+        }
+
+        bp.mark_dirty(page_id, 5).unwrap();
+
+        let idx = bp.page_table[&page_id];
+        assert!(bp.frames[idx].dirty());
+        assert_eq!(bp.frames[idx].last_lsn(), 5);
+        assert_eq!(bp.frames[idx].data()[100], 0xAB);
+
+        cleanup("test_bp_mut_dirty");
+    }
+
+    #[test]
+    fn test_mark_dirty_unknown_page_returns_err() {
+        cleanup("test_bp_dirty_unknown");
+        let (mut bp, _) = setup("test_bp_dirty_unknown");
+
+        let result = bp.mark_dirty(999, 1);
+        assert!(result.is_err());
+
+        cleanup("test_bp_dirty_unknown");
+    }
+
+    // --- flush_dirty ---
+
+    #[test]
+    fn test_flush_dirty_writes_to_disk() {
+        cleanup("test_bp_flush");
+        let (mut bp, _) = setup("test_bp_flush");
+
+        let page_id = bp.allocate_page(PageType::Slotted).unwrap();
+
+        {
+            let page = bp.get_page_mut(page_id).unwrap();
+            page[200] = 0xFF;
+        }
+        bp.mark_dirty(page_id, 1).unwrap();
+
+        bp.flush_dirty().unwrap();
+
+        // verify frame is now clean
+        let idx = bp.page_table[&page_id];
+        assert!(!bp.frames[idx].dirty());
+
+        // verify data persisted — clear frames and re-read from disk
+        bp.frames = vec![Frame::default(); 64];
+        bp.page_table.clear();
+
+        let data = bp.read_page(page_id).unwrap();
+        assert_eq!(data[200], 0xFF);
+
+        cleanup("test_bp_flush");
+    }
+
+    #[test]
+    fn test_flush_dirty_skips_clean_frames() {
+        cleanup("test_bp_flush_clean");
+        let (mut bp, _) = setup("test_bp_flush_clean");
+
+        let page_id = bp.allocate_page(PageType::Slotted).unwrap();
+
+        // read page into frame but don't mark dirty
+        bp.read_page(page_id).unwrap();
+
+        let idx = bp.page_table[&page_id];
+        assert!(!bp.frames[idx].dirty());
+
+        // flush should not error and frame stays clean
+        bp.flush_dirty().unwrap();
+        assert!(!bp.frames[idx].dirty());
+
+        cleanup("test_bp_flush_clean");
+    }
+
+    #[test]
+    fn test_flush_dirty_persistence_across_restart() {
+        cleanup("test_bp_persist");
+
+        {
+            let (mut bp, _) = setup("test_bp_persist");
+            let page_id = bp.allocate_page(PageType::Slotted).unwrap();
+
+            {
+                let page = bp.get_page_mut(page_id).unwrap();
+                page[50] = 0xCD;
+            }
+            bp.mark_dirty(page_id, 1).unwrap();
+            bp.flush_dirty().unwrap();
+        }
+
+        {
+            let (mut bp, _) = setup("test_bp_persist");
+            let page_id = 1; // first allocated page
+            let data = bp.read_page(page_id).unwrap();
+            assert_eq!(data[50], 0xCD);
+        }
+
+        cleanup("test_bp_persist");
+    }
+
+    // --- write_raw_page ---
+
+    #[test]
+    fn test_write_raw_page_updates_frame_and_lsn() {
+        cleanup("test_bp_raw_write");
+        let (mut bp, _) = setup("test_bp_raw_write");
+
+        let page_id = bp.allocate_raw_page().unwrap();
+
+        let mut new_data = [0u8; PAGE_SIZE];
+        new_data[8] = 0x55; // after raw page metadata region
+
+        bp.write_raw_page(page_id, &new_data, 7).unwrap();
+
+        let idx = bp.page_table[&page_id];
+        assert!(bp.frames[idx].dirty());
+        assert_eq!(bp.frames[idx].last_lsn(), 7);
+        assert_eq!(bp.frames[idx].data()[8], 0x55);
+
+        cleanup("test_bp_raw_write");
+    }
+
+    #[test]
+    fn test_write_raw_page_stamps_lsn_in_metadata() {
+        cleanup("test_bp_raw_lsn");
+        let (mut bp, _) = setup("test_bp_raw_lsn");
+
+        let page_id = bp.allocate_raw_page().unwrap();
+        let new_data = [0u8; PAGE_SIZE];
+
+        bp.write_raw_page(page_id, &new_data, 99).unwrap();
+
+        let meta = bp.read_page_metadata(page_id, PageType::Raw).unwrap();
+        assert_eq!(meta.lsn(), 99);
+
+        cleanup("test_bp_raw_lsn");
+    }
+
+    // --- eviction ---
+
+    #[test]
+    fn test_eviction_when_pool_full() {
+        cleanup("test_bp_evict");
+        let pm = PageManager::new("test_bp_evict").unwrap();
+        let mut bp = BufferPool::new(pm, 3); // tiny pool — 3 frames
+
+        // allocate 4 pages — one more than pool capacity
+        let p1 = bp.allocate_page(PageType::Slotted).unwrap();
+        let p2 = bp.allocate_page(PageType::Slotted).unwrap();
+        let p3 = bp.allocate_page(PageType::Slotted).unwrap();
+        let p4 = bp.allocate_page(PageType::Slotted).unwrap();
+
+        bp.flush_dirty().unwrap(); // get clean frames
+
+        // clear frames to simulate cold start
+        bp.frames = vec![Frame::default(); 3];
+        bp.page_table.clear();
+
+        // load 3 pages — fills pool
+        bp.read_page(p1).unwrap();
+        bp.read_page(p2).unwrap();
+        bp.read_page(p3).unwrap();
+        assert_eq!(bp.page_table.len(), 3);
+
+        // reading p4 should trigger eviction
+        bp.read_page(p4).unwrap();
+        assert_eq!(bp.page_table.len(), 3); // still 3 frames
+        assert!(bp.page_table.contains_key(&p4)); // p4 loaded
+
+        cleanup("test_bp_evict");
+    }
+
+    #[test]
+    fn test_eviction_flushes_dirty_frame() {
+        cleanup("test_bp_evict_dirty");
+        let pm = PageManager::new("test_bp_evict_dirty").unwrap();
+        let mut bp = BufferPool::new(pm, 2); // 2 frames only
+
+        let p1 = bp.allocate_page(PageType::Slotted).unwrap();
+        let p2 = bp.allocate_page(PageType::Slotted).unwrap();
+        let p3 = bp.allocate_page(PageType::Slotted).unwrap();
+
+        bp.flush_dirty().unwrap();
+        bp.frames = vec![Frame::default(); 2];
+        bp.page_table.clear();
+
+        // load p1, mutate, mark dirty
+        {
+            let page = bp.get_page_mut(p1).unwrap();
+            page[10] = 0xBB;
+        }
+        bp.mark_dirty(p1, 1).unwrap();
+
+        // load p2
+        bp.read_page(p2).unwrap();
+
+        // loading p3 must evict — p1 or p2, whichever clock lands on
+        // either way no error means dirty frame was flushed correctly
+        bp.read_page(p3).unwrap();
+
+        // verify p1's mutation persisted if it was evicted
+        bp.frames = vec![Frame::default(); 2];
+        bp.page_table.clear();
+
+        let data = bp.read_page(p1).unwrap();
+        assert_eq!(data[10], 0xBB);
+
+        cleanup("test_bp_evict_dirty");
+    }
+
+    #[test]
+    fn test_eviction_clock_hand_advances() {
+        cleanup("test_bp_clock");
+        let pm = PageManager::new("test_bp_clock").unwrap();
+        let mut bp = BufferPool::new(pm, 2);
+
+        let p1 = bp.allocate_page(PageType::Slotted).unwrap();
+        let p2 = bp.allocate_page(PageType::Slotted).unwrap();
+        let p3 = bp.allocate_page(PageType::Slotted).unwrap();
+
+        bp.flush_dirty().unwrap();
+        bp.frames = vec![Frame::default(); 2];
+        bp.page_table.clear();
+
+        bp.read_page(p1).unwrap();
+        bp.read_page(p2).unwrap();
+
+        let hand_before = bp.clock_hand;
+
+        // clear referenced bits so eviction happens on first pass
+        bp.frames[0].clear_referenced();
+        bp.frames[1].clear_referenced();
+
+        bp.read_page(p3).unwrap();
+
+        // clock hand should have advanced
+        assert_ne!(bp.clock_hand, hand_before);
+
+        cleanup("test_bp_clock");
+    }
+
+    // --- page metadata ---
+
+    #[test]
+    fn test_read_and_update_page_metadata() {
+        cleanup("test_bp_meta");
+        let (mut bp, _) = setup("test_bp_meta");
+
+        let page_id = bp.allocate_slotted_page().unwrap();
+
+        let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
+        match &meta {
+            PageMetadata::Slotted { slot_count, .. } => assert_eq!(*slot_count, 0),
+            _ => panic!("expected slotted metadata"),
+        }
+
+        let updated = PageMetadata::Slotted {
+            slot_count: 3,
+            free_space_start: 90,
+            free_space_end: 3000,
+            next_page: None,
+            lsn: 0,
+        };
+        bp.update_page_metadata(page_id, &updated).unwrap();
+
+        let re_read = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
+        match re_read {
+            PageMetadata::Slotted {
+                slot_count,
+                free_space_start,
+                free_space_end,
+                ..
+            } => {
+                assert_eq!(slot_count, 3);
+                assert_eq!(free_space_start, 90);
+                assert_eq!(free_space_end, 3000);
+            }
+            _ => panic!("expected slotted metadata"),
+        }
+
+        cleanup("test_bp_meta");
+    }
 }

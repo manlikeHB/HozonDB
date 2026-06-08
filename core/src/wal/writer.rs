@@ -336,4 +336,104 @@ mod tests {
 
         let _ = fs::remove_file("test_persist.wal");
     }
+
+    #[test]
+    fn test_append_raw_record() {
+        let _ = fs::remove_file("test_append_raw.wal");
+        let mut wal = WalWriter::new("test_append_raw").unwrap();
+
+        let lsn = wal
+            .append_raw(
+                WalRecordType::CreateTable,
+                1,
+                b"new_page_data",
+                b"old_page_data",
+            )
+            .unwrap();
+
+        assert_eq!(lsn, 1);
+        assert_eq!(wal.lsn, 2);
+
+        let _ = fs::remove_file("test_append_raw.wal");
+    }
+
+    #[test]
+    fn test_lsn_increments_across_slotted_and_raw() {
+        let _ = fs::remove_file("test_lsn_mixed.wal");
+        let mut wal = WalWriter::new("test_lsn_mixed").unwrap();
+
+        let lsn1 = wal
+            .append_slotted(WalRecordType::Insert, "users", 1, 0, b"row", &[])
+            .unwrap();
+        let lsn2 = wal
+            .append_raw(WalRecordType::IndexNode, 2, b"node", b"old")
+            .unwrap();
+        let lsn3 = wal
+            .append_slotted(WalRecordType::Delete, "users", 1, 0, &[], b"row")
+            .unwrap();
+
+        assert_eq!(lsn1, 1);
+        assert_eq!(lsn2, 2);
+        assert_eq!(lsn3, 3);
+        assert_eq!(wal.lsn, 4);
+
+        let _ = fs::remove_file("test_lsn_mixed.wal");
+    }
+
+    #[test]
+    fn test_multiple_checkpoints() {
+        let _ = fs::remove_file("test_multi_cp.wal");
+        let mut wal = WalWriter::new("test_multi_cp").unwrap();
+
+        wal.append_slotted(WalRecordType::Insert, "t", 1, 0, b"a", &[])
+            .unwrap();
+        let cp1 = wal.checkpoint().unwrap();
+
+        wal.append_slotted(WalRecordType::Insert, "t", 1, 1, b"b", &[])
+            .unwrap();
+        let cp2 = wal.checkpoint().unwrap();
+
+        // second checkpoint should be ahead of first
+        assert!(cp2 > cp1);
+        assert_eq!(wal.checkpoint, cp2);
+
+        // reopen — should use latest checkpoint
+        drop(wal);
+        let wal = WalWriter::new("test_multi_cp").unwrap();
+        assert_eq!(wal.checkpoint, cp2);
+
+        let _ = fs::remove_file("test_multi_cp.wal");
+    }
+
+    #[test]
+    fn test_checkpoint_with_no_new_records() {
+        let _ = fs::remove_file("test_cp_empty.wal");
+        let mut wal = WalWriter::new("test_cp_empty").unwrap();
+
+        // checkpoint immediately with no records
+        let cp = wal.checkpoint().unwrap();
+        assert!(cp >= WAL_RECORD_START as u64);
+
+        let _ = fs::remove_file("test_cp_empty.wal");
+    }
+
+    #[test]
+    fn test_append_raw_persists_across_reopen() {
+        let _ = fs::remove_file("test_raw_persist.wal");
+
+        {
+            let mut wal = WalWriter::new("test_raw_persist").unwrap();
+            wal.append_raw(WalRecordType::IndexNode, 5, b"new", b"old")
+                .unwrap();
+            wal.append_raw(WalRecordType::CreateTable, 1, b"catalog", &[])
+                .unwrap();
+        }
+
+        {
+            let wal = WalWriter::new("test_raw_persist").unwrap();
+            assert_eq!(wal.lsn, 3); // 2 records written, next lsn = 3
+        }
+
+        let _ = fs::remove_file("test_raw_persist.wal");
+    }
 }

@@ -1054,4 +1054,244 @@ mod tests {
 
         cleanup("test_mark_slot_dead");
     }
+
+    // --- PageMetadata methods ---
+
+    #[test]
+    fn test_page_metadata_set_lsn() {
+        let mut meta = PageMetadata::Slotted {
+            slot_count: 0,
+            free_space_start: 18,
+            free_space_end: 4096,
+            next_page: None,
+            lsn: 0,
+        };
+        meta.set_lsn(42);
+        assert_eq!(meta.lsn(), 42);
+
+        let mut meta = PageMetadata::Raw { lsn: 0 };
+        meta.set_lsn(99);
+        assert_eq!(meta.lsn(), 99);
+
+        let mut meta = PageMetadata::Free {
+            next_page: None,
+            lsn: 0,
+        };
+        meta.set_lsn(7);
+        assert_eq!(meta.lsn(), 7);
+    }
+
+    #[test]
+    fn test_page_metadata_update_slot_count() {
+        let mut meta = PageMetadata::Slotted {
+            slot_count: 2,
+            free_space_start: 18,
+            free_space_end: 4096,
+            next_page: None,
+            lsn: 0,
+        };
+        meta.update_slot_count();
+        assert_eq!(meta.slot_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_page_metadata_update_free_space() {
+        let mut meta = PageMetadata::Slotted {
+            slot_count: 0,
+            free_space_start: 18,
+            free_space_end: 4096,
+            next_page: None,
+            lsn: 0,
+        };
+        meta.update_free_space_start();
+        assert_eq!(meta.free_space_start().unwrap(), 22); // +4 per slot entry
+
+        meta.update_free_space_end(50);
+        assert_eq!(meta.free_space_end().unwrap(), 4046);
+    }
+
+    #[test]
+    fn test_page_metadata_set_next_page() {
+        let mut meta = PageMetadata::Slotted {
+            slot_count: 0,
+            free_space_start: 18,
+            free_space_end: 4096,
+            next_page: None,
+            lsn: 0,
+        };
+        meta.set_next_page(5);
+        assert_eq!(meta.next_page().unwrap(), Some(5));
+
+        let mut meta = PageMetadata::Free {
+            next_page: None,
+            lsn: 0,
+        };
+        meta.set_next_page(3);
+        assert_eq!(meta.next_page().unwrap(), Some(3));
+    }
+
+    #[test]
+    fn test_page_metadata_accessor_errors() {
+        let raw = PageMetadata::Raw { lsn: 0 };
+        assert!(raw.slot_count().is_err());
+        assert!(raw.free_space_start().is_err());
+        assert!(raw.free_space_end().is_err());
+        assert!(raw.next_page().is_err());
+
+        let free = PageMetadata::Free {
+            next_page: None,
+            lsn: 0,
+        };
+        assert!(free.slot_count().is_err());
+        assert!(free.free_space_start().is_err());
+        assert!(free.free_space_end().is_err());
+    }
+
+    // --- init_page_metadata_buffer ---
+
+    #[test]
+    fn test_init_page_metadata_buffer_slotted() {
+        let mut page = [0u8; PAGE_SIZE];
+        PageManager::init_page_metadata_buffer(&mut page, PageType::Slotted);
+
+        let meta = PageManager::read_metadata_from_buffer(&page, PageType::Slotted);
+        match meta {
+            PageMetadata::Slotted {
+                slot_count,
+                free_space_start,
+                free_space_end,
+                next_page,
+                lsn,
+            } => {
+                assert_eq!(slot_count, 0);
+                assert_eq!(free_space_start, SLOT_DIRECTORY_START as u16);
+                assert_eq!(free_space_end, PAGE_SIZE as u16);
+                assert_eq!(next_page, None); // NULL_PAGE sentinel correctly read as None
+                assert_eq!(lsn, 0);
+            }
+            _ => panic!("expected slotted metadata"),
+        }
+    }
+
+    #[test]
+    fn test_init_page_metadata_buffer_raw() {
+        let mut page = [0u8; PAGE_SIZE];
+        PageManager::init_page_metadata_buffer(&mut page, PageType::Raw);
+
+        let meta = PageManager::read_metadata_from_buffer(&page, PageType::Raw);
+        match meta {
+            PageMetadata::Raw { lsn } => assert_eq!(lsn, 0),
+            _ => panic!("expected raw metadata"),
+        }
+    }
+
+    #[test]
+    fn test_init_page_metadata_buffer_free() {
+        let mut page = [0u8; PAGE_SIZE];
+        PageManager::init_page_metadata_buffer(&mut page, PageType::Free);
+
+        let meta = PageManager::read_metadata_from_buffer(&page, PageType::Free);
+        match meta {
+            PageMetadata::Free { next_page, lsn } => {
+                assert_eq!(next_page, None); // NULL_PAGE sentinel correctly read as None
+                assert_eq!(lsn, 0);
+            }
+            _ => panic!("expected free metadata"),
+        }
+    }
+
+    // --- Free page metadata round-trip ---
+
+    #[test]
+    fn test_free_page_metadata_round_trip() {
+        let mut page = [0u8; PAGE_SIZE];
+        let meta = PageMetadata::Free {
+            next_page: Some(7),
+            lsn: 123,
+        };
+        PageManager::update_metadata_in_buffer(&mut page, &meta);
+
+        let read_back = PageManager::read_metadata_from_buffer(&page, PageType::Free);
+        match read_back {
+            PageMetadata::Free { next_page, lsn } => {
+                assert_eq!(next_page, Some(7));
+                assert_eq!(lsn, 123);
+            }
+            _ => panic!("expected free metadata"),
+        }
+    }
+
+    #[test]
+    fn test_free_page_metadata_null_next_page() {
+        let mut page = [0u8; PAGE_SIZE];
+        let meta = PageMetadata::Free {
+            next_page: None,
+            lsn: 0,
+        };
+        PageManager::update_metadata_in_buffer(&mut page, &meta);
+
+        let read_back = PageManager::read_metadata_from_buffer(&page, PageType::Free);
+        match read_back {
+            PageMetadata::Free { next_page, .. } => assert_eq!(next_page, None),
+            _ => panic!("expected free metadata"),
+        }
+    }
+
+    // --- Raw page metadata ---
+
+    #[test]
+    fn test_raw_page_metadata_initialization() {
+        cleanup("test_raw_meta_init");
+        let mut pm = PageManager::new("test_raw_meta_init").unwrap();
+
+        let page_id = pm.allocate_page(PageType::Raw).unwrap();
+        let meta = pm.read_page_metadata(page_id, PageType::Raw).unwrap();
+
+        match meta {
+            PageMetadata::Raw { lsn } => assert_eq!(lsn, 0),
+            _ => panic!("expected raw metadata"),
+        }
+
+        cleanup("test_raw_meta_init");
+    }
+
+    #[test]
+    fn test_raw_page_metadata_update_and_persist() {
+        cleanup("test_raw_meta_persist");
+
+        {
+            let mut pm = PageManager::new("test_raw_meta_persist").unwrap();
+            let page_id = pm.allocate_page(PageType::Raw).unwrap();
+            eprintln!("{page_id}");
+            pm.update_page_metadata(page_id, &PageMetadata::Raw { lsn: 55 })
+                .unwrap();
+        }
+
+        {
+            let pm = PageManager::new("test_raw_meta_persist").unwrap();
+            let meta = pm.read_page_metadata(1, PageType::Raw).unwrap();
+            match meta {
+                PageMetadata::Raw { lsn } => assert_eq!(lsn, 55),
+                _ => panic!("expected raw metadata"),
+            }
+        }
+
+        cleanup("test_raw_meta_persist");
+    }
+
+    // --- NULL_PAGE sentinel ---
+
+    #[test]
+    fn test_null_page_sentinel_round_trips_as_none() {
+        let mut page = [0u8; PAGE_SIZE];
+        PageManager::init_page_metadata_buffer(&mut page, PageType::Slotted);
+
+        // verify NULL_PAGE bytes are written
+        let next_bytes = &page[OFFSET_NEXT_PAGE..OFFSET_NEXT_PAGE + 4];
+        assert_eq!(next_bytes, &NULL_PAGE.to_le_bytes());
+
+        // verify reading back gives None
+        let meta = PageManager::read_metadata_from_buffer(&page, PageType::Slotted);
+        assert_eq!(meta.next_page().unwrap(), None);
+    }
 }
