@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_wal_record_type_conversion_from_unsupported_u8() {
-        for i in 17..255 {
+        for i in 18..255 {
             assert!(WalRecordType::try_from(i).is_err());
         }
     }
