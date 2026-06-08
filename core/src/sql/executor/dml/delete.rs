@@ -74,7 +74,7 @@ pub fn execute_delete(
         PageManager::update_metadata_in_buffer(page_data, &page_meta);
 
         // mark page dirty
-        db.mark_dirty(loc.page_id(), lsn);
+        db.mark_dirty(loc.page_id(), lsn)?;
 
         deleted_rows.push(row);
     }

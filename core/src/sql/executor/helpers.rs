@@ -159,7 +159,7 @@ pub fn insert_row_into_page(
         PageManager::update_metadata_in_buffer(&mut last_page_data, &last_page_meta);
 
         // mark page dirty
-        db.mark_dirty(last_page, lsn);
+        db.mark_dirty(last_page, lsn)?;
 
         // Track page write
         if let Some(m) = metrics.as_mut() {
@@ -202,7 +202,7 @@ pub fn insert_row_into_page(
 
         PageManager::update_metadata_in_buffer(&mut new_page_data, &new_page_meta);
         // mark page dirty
-        buffer_pool.mark_dirty(new_page, lsn);
+        buffer_pool.mark_dirty(new_page, lsn)?;
 
         // Track new page write
         if let Some(m) = metrics.as_mut() {

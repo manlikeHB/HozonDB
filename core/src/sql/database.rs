@@ -63,8 +63,8 @@ impl Database {
         self.buffer_pool.get_page_mut(page_id)
     }
 
-    pub fn mark_dirty(&mut self, page_id: PageId, lsn: u64) {
-        self.buffer_pool.mark_dirty(page_id, lsn);
+    pub fn mark_dirty(&mut self, page_id: PageId, lsn: u64) -> io::Result<()> {
+        self.buffer_pool.mark_dirty(page_id, lsn)
     }
 
     pub fn read_page_metadata(
@@ -290,12 +290,6 @@ impl Database {
 
     pub fn total_num_of_db_pages(&self) -> u32 {
         self.buffer_pool.total_num_of_db_pages()
-    }
-
-    pub fn write_raw_page(&mut self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> io::Result<()> {
-        let page_data = self.get_page_mut(page_id)?;
-        page_data[..].copy_from_slice(data);
-        Ok(())
     }
 
     pub fn checkpoint(&mut self) -> io::Result<()> {

@@ -56,6 +56,11 @@ impl BufferPool {
             let page_data = self.get_page_mut(free_page_id)?;
             PageManager::init_page_metadata_buffer(page_data, page_type);
 
+            // mark dirty
+            // this ensures the page with it's write metadata is flushed
+            // to the disk
+            self.mark_dirty(free_page_id, 0)?;
+
             return Ok(free_page_id);
         }
 
@@ -146,8 +151,15 @@ impl BufferPool {
     }
 
     // TODO: - prevent making a non dirty page dirty?
-    pub fn mark_dirty(&mut self, page_id: PageId, lsn: u64) {
-        self.frames[self.page_table[&page_id]].mark_dirty(lsn);
+    pub fn mark_dirty(&mut self, page_id: PageId, lsn: u64) -> io::Result<()> {
+        let idx = self.page_table.get(&page_id).ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("page {} not in buffer pool", page_id),
+            )
+        })?;
+        self.frames[*idx].mark_dirty(lsn);
+        Ok(())
     }
 
     pub fn read_page_metadata(
@@ -214,7 +226,7 @@ impl BufferPool {
         PageManager::update_metadata_in_buffer(page_data, &page_meta);
 
         // mark dirty
-        self.mark_dirty(page_id, lsn);
+        self.mark_dirty(page_id, lsn)?;
         Ok(())
     }
 

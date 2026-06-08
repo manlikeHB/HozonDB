@@ -145,7 +145,7 @@ pub fn execute_update(
             PageManager::update_metadata_in_buffer(page_data, &page_meta);
 
             // mark page dirty
-            db.mark_dirty(loc.page_id(), lsn);
+            db.mark_dirty(loc.page_id(), lsn)?;
 
             // delete old row index
             helpers::delete_indexes(db, &index_entries, &old_value_and_col_pairs)?;
@@ -188,7 +188,7 @@ pub fn execute_update(
             PageManager::update_metadata_in_buffer(page_data, &page_meta);
 
             // mark page dirty
-            db.mark_dirty(loc.page_id(), lsn);
+            db.mark_dirty(loc.page_id(), lsn)?;
 
             // collect old row to be freed if indexed
             deleted_rows.push(row);
