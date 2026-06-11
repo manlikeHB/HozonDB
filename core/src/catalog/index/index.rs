@@ -256,7 +256,7 @@ mod tests {
 
     fn setup(basename: &str) -> (IndexCatalog, BufferPool, WalWriter) {
         let pm = PageManager::new(basename).unwrap();
-        let mut wal_writer = WalWriter::new("test").unwrap();
+        let mut wal_writer = WalWriter::new(basename).unwrap();
         let mut buffer_pool = BufferPool::new(pm, 5);
         let _ = TableCatalog::new(&mut buffer_pool, &mut wal_writer).unwrap();
         let ic = IndexCatalog::new(&mut buffer_pool, &mut wal_writer).unwrap();
