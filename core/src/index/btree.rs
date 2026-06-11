@@ -31,7 +31,7 @@ impl BPlusTree {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
     ) -> io::Result<Self> {
-        let root_page_id = buffer_pool.allocate_raw_page()?;
+        let root_page_id = buffer_pool.allocate_raw_page(wal_writer)?;
         let root_leaf = Node::Leaf(LeafNode::new());
 
         let mut b_plus_tree = BPlusTree {
@@ -93,7 +93,7 @@ impl BPlusTree {
 
                             if leaf.is_full(self.order) {
                                 // assign new page
-                                let new_page = buffer_pool.allocate_raw_page()?;
+                                let new_page = buffer_pool.allocate_raw_page(wal_writer)?;
 
                                 // split leaf
                                 let (k, new_leaf) = leaf.split(new_page);
@@ -163,7 +163,7 @@ impl BPlusTree {
                             );
 
                             if internal.is_full(self.order) {
-                                let new_page = buffer_pool.allocate_raw_page()?;
+                                let new_page = buffer_pool.allocate_raw_page(wal_writer)?;
 
                                 // split internal node
                                 let (k, new_internal) = internal.split();
@@ -237,7 +237,7 @@ impl BPlusTree {
             // create new leaf node since root is None
             let mut leaf = LeafNode::new();
             leaf.insert(LeafEntry::new(key, row_location)); // insert new index
-            let new_page = buffer_pool.allocate_raw_page()?;
+            let new_page = buffer_pool.allocate_raw_page(wal_writer)?;
 
             // add the new leaf to nodes
             self.cache.insert(new_page, Node::Leaf(leaf));
@@ -283,7 +283,7 @@ impl BPlusTree {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
     ) -> io::Result<()> {
-        let new_root_page = buffer_pool.allocate_raw_page()?;
+        let new_root_page = buffer_pool.allocate_raw_page(wal_writer)?;
         let new_root = InternalNode::new(vec![key], vec![left, right]);
 
         self.write_node(
@@ -387,8 +387,8 @@ impl BPlusTree {
         }
     }
 
-    // this checks cache for node first
-    // otherwise read from disk and cache it
+    /// this checks cache for node first
+    /// otherwise read from disk and cache it
     //
     // TODO: Buffer pool — the node cache grows unbounded within a session.
     // Lazy loading prevents loading nodes that are never accessed, but over

@@ -15,10 +15,10 @@ pub struct IndexCatalog {
 }
 
 impl IndexCatalog {
-    pub fn new(buffer_pool: &mut BufferPool) -> io::Result<Self> {
+    pub fn new(buffer_pool: &mut BufferPool, wal_writer: &mut WalWriter) -> io::Result<Self> {
         // If this is a new database (only page 0 and 1 exists), allocate page 2 for index catalog
         if buffer_pool.total_num_of_db_pages() == 2 {
-            buffer_pool.allocate_raw_page()?;
+            buffer_pool.allocate_raw_page(wal_writer)?;
         }
 
         let catalog_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
@@ -256,10 +256,10 @@ mod tests {
 
     fn setup(basename: &str) -> (IndexCatalog, BufferPool, WalWriter) {
         let pm = PageManager::new(basename).unwrap();
-        let wal_writer = WalWriter::new("test").unwrap();
+        let mut wal_writer = WalWriter::new("test").unwrap();
         let mut buffer_pool = BufferPool::new(pm, 5);
-        let _ = TableCatalog::new(&mut buffer_pool).unwrap();
-        let ic = IndexCatalog::new(&mut buffer_pool).unwrap();
+        let _ = TableCatalog::new(&mut buffer_pool, &mut wal_writer).unwrap();
+        let ic = IndexCatalog::new(&mut buffer_pool, &mut wal_writer).unwrap();
         (ic, buffer_pool, wal_writer)
     }
 

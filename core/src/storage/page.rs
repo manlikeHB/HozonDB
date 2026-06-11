@@ -28,11 +28,33 @@ pub struct PageManager {
     first_free_page: Option<PageId>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PageType {
     Slotted,
     Raw,
     Free,
+}
+
+impl PageType {
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            PageType::Slotted => 1,
+            PageType::Raw => 2,
+            PageType::Free => 3,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> io::Result<Self> {
+        match value {
+            1 => Ok(PageType::Slotted),
+            2 => Ok(PageType::Raw),
+            3 => Ok(PageType::Free),
+            other => Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Unknown PageType: {}", other),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -338,10 +360,17 @@ impl PageManager {
             let mut file = self.file.lock().unwrap();
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(&buffer)?;
-            //TODO: sync_all is being removed since the WAL holds all logs and
-            // flushing to disk will only be happening at checkpoints
+            // sync_all intentionally omitted — pages are flushed in batches at checkpoint
+            // time. BufferPool::flush_dirty calls PageManager::sync() after all dirty
+            // pages are written, ensuring durability before the checkpoint WAL record.
         };
 
+        Ok(())
+    }
+
+    pub fn sync(&mut self) -> io::Result<()> {
+        let file = self.file.lock().unwrap();
+        file.sync_all()?;
         Ok(())
     }
 
@@ -1257,7 +1286,6 @@ mod tests {
         {
             let mut pm = PageManager::new("test_raw_meta_persist").unwrap();
             let page_id = pm.allocate_page(PageType::Raw).unwrap();
-            eprintln!("{page_id}");
             pm.update_page_metadata(page_id, &PageMetadata::Raw { lsn: 55 })
                 .unwrap();
         }

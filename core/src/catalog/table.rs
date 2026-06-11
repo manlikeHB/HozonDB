@@ -35,10 +35,10 @@ pub struct TableCatalog {
 }
 
 impl TableCatalog {
-    pub fn new(buffer_pool: &mut BufferPool) -> io::Result<Self> {
+    pub fn new(buffer_pool: &mut BufferPool, wal_writer: &mut WalWriter) -> io::Result<Self> {
         // If this is a new database (only page 0 exists), allocate page 1 for catalog
         if buffer_pool.total_num_of_db_pages() == 1 {
-            buffer_pool.allocate_raw_page()?;
+            buffer_pool.allocate_raw_page(wal_writer)?;
         }
 
         let catalog_data = buffer_pool.read_page(constants::TABLE_CATALOG_PAGE_ID)?;
@@ -132,8 +132,7 @@ impl TableCatalog {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
     ) -> io::Result<()> {
-        // allocate page for table data
-        let first_page = buffer_pool.allocate_slotted_page()?;
+        let first_page = buffer_pool.allocate_slotted_page(wal_writer)?;
 
         let table_name = schema.table_name().to_string();
         let table_metadata = TableMetadata {
@@ -141,12 +140,12 @@ impl TableCatalog {
             first_page,
             last_page: first_page,
         };
-
         self.tables.insert(table_name, table_metadata);
 
         let table_catalog = self.to_bytes();
 
-        let old_data = buffer_pool.read_page(first_page)?;
+        // read old_data from CATALOG page
+        let old_data = buffer_pool.read_page(constants::TABLE_CATALOG_PAGE_ID)?;
 
         let mut new_data = old_data.clone();
         new_data[constants::OFFSET_RAW_PAGE_START
@@ -155,12 +154,14 @@ impl TableCatalog {
         new_data[constants::OFFSET_RAW_PAGE_START + table_catalog.len()..].fill(0);
 
         // log to WAL
-        let lsn =
-            wal_writer.append_raw(WalRecordType::CreateTable, first_page, &new_data, old_data)?;
+        let lsn = wal_writer.append_raw(
+            WalRecordType::CreateTable,
+            constants::TABLE_CATALOG_PAGE_ID,
+            &new_data,
+            old_data,
+        )?;
 
-        // save catalog
         self.save(buffer_pool, &new_data, lsn)?;
-
         Ok(())
     }
 
@@ -263,7 +264,7 @@ impl TableCatalog {
 
         // log to WAL
         let lsn = wal_writer.append_raw(
-            WalRecordType::DropTable,
+            WalRecordType::UpdateLastPage,
             constants::TABLE_CATALOG_PAGE_ID,
             &new_data,
             old_data,
@@ -290,8 +291,8 @@ mod tests {
     fn setup(db_name: &str) -> (TableCatalog, BufferPool, WalWriter) {
         let pm = PageManager::new(db_name).unwrap();
         let mut buffer_pool = BufferPool::new(pm, 5);
-        let wal_writer = WalWriter::new(db_name).unwrap();
-        let catalog = TableCatalog::new(&mut buffer_pool).unwrap();
+        let mut wal_writer = WalWriter::new(db_name).unwrap();
+        let catalog = TableCatalog::new(&mut buffer_pool, &mut wal_writer).unwrap();
         (catalog, buffer_pool, wal_writer)
     }
 

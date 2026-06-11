@@ -82,4 +82,8 @@ impl Executor {
 
         result
     }
+
+    pub fn checkpoint(&mut self) -> io::Result<()> {
+        self.database.checkpoint()
+    }
 }

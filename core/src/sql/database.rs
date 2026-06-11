@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io::{self, Error, ErrorKind},
+    path::Path,
 };
 
 use crate::{
@@ -16,7 +17,7 @@ use crate::{
         buffer_pool::BufferPool,
         page::{PAGE_SIZE, PageManager, PageMetadata, PageType},
     },
-    wal::{record_type::WalRecordType, writer::WalWriter},
+    wal::{reader::WalReader, record_type::WalRecordType, writer::WalWriter},
 };
 
 pub struct Database {
@@ -32,16 +33,21 @@ impl Database {
         let page_manager = PageManager::new(db_name)?;
         let mut buffer_pool = BufferPool::new(page_manager, constants::BUFFER_POOL_CAPACITY);
 
-        let table_catalog = TableCatalog::new(&mut buffer_pool)?;
-        let index_catalog = IndexCatalog::new(&mut buffer_pool)?;
-        let mut indexes = HashMap::new();
+        // recover FIRST — before anything reads from buffer pool
+        if Path::new(&format!("{}.wal", db_name)).exists() {
+            WalReader::new(db_name)?.recover(&mut buffer_pool)?;
+        }
 
-        let wal_writer = WalWriter::new(db_name)?;
+        let mut wal_writer = WalWriter::new(db_name)?;
+
+        // now safe to load catalogs — pages reflect recovered state
+        let table_catalog = TableCatalog::new(&mut buffer_pool, &mut wal_writer)?;
+        let index_catalog = IndexCatalog::new(&mut buffer_pool, &mut wal_writer)?;
+        let mut indexes = HashMap::new();
 
         // load b+ tree for all indexes
         for entry in index_catalog.all_indexes() {
             let btree = BPlusTree::load(entry.root_page_id(), entry.column_type().order());
-
             indexes.insert(entry.index_name().to_owned(), btree);
         }
 
@@ -73,14 +79,6 @@ impl Database {
         page_type: PageType,
     ) -> io::Result<PageMetadata> {
         self.buffer_pool.read_page_metadata(page_id, page_type)
-    }
-
-    pub fn update_page_metadata(
-        &mut self,
-        page_id: u32,
-        metadata: &PageMetadata,
-    ) -> io::Result<()> {
-        self.buffer_pool.update_page_metadata(page_id, metadata)
     }
 
     pub fn free_page(&mut self, page_id: PageId) -> io::Result<()> {
@@ -129,6 +127,22 @@ impl Database {
 
     pub fn list_tables(&self) -> Vec<String> {
         self.table_catalog.list_tables()
+    }
+
+    pub fn first_free_page(&self) -> Option<PageId> {
+        self.buffer_pool.first_free_page()
+    }
+
+    pub fn get_table_first_page(&self, table_name: &str) -> io::Result<PageId> {
+        match self.table_catalog.get_table(table_name) {
+            Some(table_meta) => Ok(table_meta.first_page()),
+            None => {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("Table '{}' does not exist", table_name),
+                ));
+            }
+        }
     }
 
     // TODO: drop_table does not free B+ tree index pages — only the index

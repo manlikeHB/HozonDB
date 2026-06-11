@@ -7,6 +7,8 @@ pub enum WalRecordType {
     Delete,
     Update,
 
+    LinkPage,
+
     // Raw variants (DDL)
     // Catalog
     CreateTable,
@@ -25,6 +27,7 @@ pub enum WalRecordType {
     DeleteKey,
 
     FreePage,
+    AllocatePage,
 
     // Checkpoint
     Checkpoint,
@@ -56,6 +59,8 @@ impl From<WalRecordType> for u8 {
             WalRecordType::IndexRoot => 15,
             WalRecordType::DeleteKey => 16,
             WalRecordType::FreePage => 17,
+            WalRecordType::LinkPage => 18,
+            WalRecordType::AllocatePage => 19,
         }
     }
 }
@@ -82,6 +87,8 @@ impl TryFrom<u8> for WalRecordType {
             15 => Ok(WalRecordType::IndexRoot),
             16 => Ok(WalRecordType::DeleteKey),
             17 => Ok(WalRecordType::FreePage),
+            18 => Ok(WalRecordType::LinkPage),
+            19 => Ok(WalRecordType::AllocatePage),
             other => Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!("Unknown value for WAL record type: {}", other),
@@ -113,6 +120,8 @@ mod tests {
         assert_eq!(WalRecordType::IndexRoot.to_u8(), 15);
         assert_eq!(WalRecordType::DeleteKey.to_u8(), 16);
         assert_eq!(WalRecordType::FreePage.to_u8(), 17);
+        assert_eq!(WalRecordType::LinkPage.to_u8(), 18);
+        assert_eq!(WalRecordType::AllocatePage.to_u8(), 19);
     }
 
     #[test]
@@ -173,11 +182,19 @@ mod tests {
             WalRecordType::try_from(17).unwrap(),
             WalRecordType::FreePage
         );
+        assert_eq!(
+            WalRecordType::try_from(18).unwrap(),
+            WalRecordType::LinkPage
+        );
+        assert_eq!(
+            WalRecordType::try_from(19).unwrap(),
+            WalRecordType::AllocatePage
+        );
     }
 
     #[test]
     fn test_wal_record_type_conversion_from_unsupported_u8() {
-        for i in 18..255 {
+        for i in 20..255 {
             assert!(WalRecordType::try_from(i).is_err());
         }
     }

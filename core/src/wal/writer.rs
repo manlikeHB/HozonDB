@@ -174,6 +174,26 @@ impl WalWriter {
         Ok(lsn)
     }
 
+    pub fn append_link_page(&mut self, page_id: PageId, next_page: PageId) -> io::Result<u64> {
+        // read current lsn and increment
+        let lsn = self.lsn;
+        self.lsn += 1;
+
+        // create new record
+        let record = WalRecord::new_link_page(lsn, page_id, next_page);
+
+        self.append(&record)?;
+        Ok(lsn)
+    }
+
+    pub fn append_allocate_page(&mut self, page_id: PageId, page_type: u8) -> io::Result<u64> {
+        let lsn = self.lsn;
+        let record = WalRecord::new_allocate_page(lsn, page_id, page_type);
+        self.append(&record)?;
+        self.lsn += 1;
+        Ok(lsn)
+    }
+
     fn append(&mut self, record: &WalRecord) -> io::Result<()> {
         let record_byte = record.to_bytes();
 
@@ -435,5 +455,55 @@ mod tests {
         }
 
         let _ = fs::remove_file("test_raw_persist.wal");
+    }
+
+    #[test]
+    fn test_append_link_page() {
+        let _ = fs::remove_file("test_link_page.wal");
+        let mut wal = WalWriter::new("test_link_page").unwrap();
+
+        let lsn = wal.append_link_page(3, 7).unwrap(); // page_id=3, next_page=7
+        assert_eq!(lsn, 1);
+        assert_eq!(wal.lsn, 2);
+
+        let _ = fs::remove_file("test_link_page.wal");
+    }
+
+    #[test]
+    fn test_append_link_page_lsn_increments_with_other_records() {
+        let _ = fs::remove_file("test_link_lsn.wal");
+        let mut wal = WalWriter::new("test_link_lsn").unwrap();
+
+        let lsn1 = wal
+            .append_slotted(WalRecordType::Insert, "users", 3, 0, b"row", &[])
+            .unwrap();
+        let lsn2 = wal.append_link_page(3, 4).unwrap();
+        let lsn3 = wal
+            .append_slotted(WalRecordType::Insert, "users", 4, 0, b"row2", &[])
+            .unwrap();
+
+        assert_eq!(lsn1, 1);
+        assert_eq!(lsn2, 2);
+        assert_eq!(lsn3, 3);
+
+        let _ = fs::remove_file("test_link_lsn.wal");
+    }
+
+    #[test]
+    fn test_append_link_page_persists_across_reopen() {
+        let _ = fs::remove_file("test_link_persist.wal");
+
+        {
+            let mut wal = WalWriter::new("test_link_persist").unwrap();
+            wal.append_link_page(3, 4).unwrap();
+            wal.append_link_page(4, 5).unwrap();
+        }
+
+        {
+            let wal = WalWriter::new("test_link_persist").unwrap();
+            assert_eq!(wal.lsn, 3);
+        }
+
+        let _ = fs::remove_file("test_link_persist.wal");
     }
 }

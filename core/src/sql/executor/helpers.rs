@@ -169,7 +169,7 @@ pub fn insert_row_into_page(
         (last_page, last_page_meta.slot_count()? - 1)
     } else {
         // Create a new page
-        let new_page = buffer_pool.allocate_slotted_page()?;
+        let new_page = buffer_pool.allocate_slotted_page(wal_writer)?;
         let mut new_page_data = buffer_pool.get_page_mut(new_page)?;
         let mut new_page_meta =
             PageManager::read_metadata_from_buffer(&new_page_data, PageType::Slotted);
@@ -210,8 +210,7 @@ pub fn insert_row_into_page(
         }
 
         // Update the previous page's metadata to point to the new page
-        last_page_meta.set_next_page(new_page);
-        buffer_pool.update_page_metadata(last_page, &last_page_meta)?;
+        buffer_pool.update_next_page_in_page_metadata(last_page, new_page, wal_writer)?;
 
         if let Some(m) = metrics.as_mut() {
             m.pages_written += 1;

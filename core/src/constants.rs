@@ -22,3 +22,5 @@ pub const BUFFER_POOL_CAPACITY: usize = 64; // TODO
 pub const WAL_RECORD_SLOTTED_TYPE: u8 = 1;
 pub const WAL_RECORD_RAW_TYPE: u8 = 2;
 pub const WAL_RECORD_CHECKPOINT_TYPE: u8 = 3;
+pub const WAL_RECORD_LINK_PAGE_TYPE: u8 = 4;
+pub const WAL_RECORD_ALLOCATE_PAGE_TYPE: u8 = 5;
