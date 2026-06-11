@@ -29,9 +29,29 @@ pub struct Database {
 }
 
 impl Database {
+    /// Creates or opens a database
+    ///
+    /// args
+    /// db_name: name of database e.g mydb
+    /// Uses BufferPool default capacity of 1024 frames (4MB).
     pub fn new(db_name: &str) -> io::Result<Self> {
+        Self::with_capacity(db_name, constants::DEFAULT_BUFFER_POOL_CAPACITY)
+    }
+
+    /// Creates or opens a database with BufferPool frames capacity
+    ///
+    /// args
+    /// db_name: name of database e.g mydb
+    /// capacity: max number of frames in BufferPool.
+    ///   Each frame holds one 4KB page. Minimum recommended: 64 frames (256KB).
+    ///   Very small capacities cause frequent eviction and poor performance.
+    ///
+    /// Use Database::new(db_name) for the default capacity of 1024 frames (4MB).
+    // TODO: buffer pool capacity is fixed at startup. Production databases
+    // support online resizing — shrinking evicts frames, growing allocates more.
+    pub fn with_capacity(db_name: &str, capacity: usize) -> io::Result<Self> {
         let page_manager = PageManager::new(db_name)?;
-        let mut buffer_pool = BufferPool::new(page_manager, constants::BUFFER_POOL_CAPACITY);
+        let mut buffer_pool = BufferPool::new(page_manager, capacity);
 
         // recover FIRST — before anything reads from buffer pool
         if Path::new(&format!("{}.wal", db_name)).exists() {

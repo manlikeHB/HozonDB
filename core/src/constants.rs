@@ -16,7 +16,7 @@ pub const MAX_TEXT_INDEX_KEY_BYTES: usize = 255;
 pub const INTERNAL_NODE_TYPE: u8 = 1;
 pub const LEAF_NODE_TYPE: u8 = 2;
 
-pub const BUFFER_POOL_CAPACITY: usize = 64; // TODO
+pub const DEFAULT_BUFFER_POOL_CAPACITY: usize = 1024; // 4MB
 
 // WAL
 pub const WAL_RECORD_SLOTTED_TYPE: u8 = 1;
