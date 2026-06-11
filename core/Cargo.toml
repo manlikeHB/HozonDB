@@ -7,8 +7,13 @@ edition = "2024"
 tonic = { workspace = true}
 prost = {workspace = true}
 crc32fast = { workspace = true }
+comfy-table = { workspace = true }
 
 [dev-dependencies]
 
 [build-dependencies]
 tonic-build = { workspace = true}
+
+[[bin]]
+name = "benchmark"
+path = "src/benchmark/main.rs"

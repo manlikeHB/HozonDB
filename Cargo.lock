@@ -388,6 +388,7 @@ dependencies = [
 name = "hozondb-core"
 version = "0.1.0"
 dependencies = [
+ "comfy-table",
  "crc32fast",
  "prost",
  "tonic",

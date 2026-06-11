@@ -194,6 +194,10 @@ impl WalWriter {
         Ok(lsn)
     }
 
+    // Each WAL append syncs to disk immediately — O(n) fsyncs for bulk operations.
+    // TODO: implement group commit once transactions are supported.
+    // With transactions, sync_all moves to commit time, amortizing the cost
+    // across all operations in a transaction.
     fn append(&mut self, record: &WalRecord) -> io::Result<()> {
         let record_byte = record.to_bytes();
 

@@ -146,6 +146,9 @@ pub fn execute_update(
 
             // mark page dirty
             db.mark_dirty(loc.page_id(), lsn)?;
+            if let Some(m) = metrics.as_mut() {
+                m.pages_dirtied += 1;
+            }
 
             // delete old row index
             helpers::delete_indexes(db, &index_entries, &old_value_and_col_pairs)?;
@@ -189,13 +192,14 @@ pub fn execute_update(
 
             // mark page dirty
             db.mark_dirty(loc.page_id(), lsn)?;
+            if let Some(m) = metrics.as_mut() {
+                m.pages_dirtied += 1;
+            }
 
             // collect old row to be freed if indexed
             deleted_rows.push(row);
         }
     }
-
-    // TODO: track pages written to for metrics
 
     // delete indexed keys for deleted rows
     if index_entries.len() > 0 {

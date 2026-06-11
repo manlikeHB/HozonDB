@@ -291,6 +291,10 @@ impl BufferPool {
     pub fn first_free_page(&self) -> Option<PageId> {
         self.page_manager.first_free_page()
     }
+
+    pub fn is_cached(&self, page_id: PageId) -> bool {
+        self.page_table.contains_key(&page_id)
+    }
 }
 
 #[cfg(test)]

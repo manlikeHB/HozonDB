@@ -1386,76 +1386,89 @@ mod tests {
     #[test]
     fn test_select_index_vs_full_scan_page_reads() {
         cleanup("test_select_index_metrics");
-        let mut executor = create_test_executor("test_select_index_metrics");
 
-        executor
-            .execute(
-                Statement::CreateTable {
-                    name: "users".to_string(),
-                    columns: vec![
-                        Column::new("id", DataType::Integer, true),
-                        Column::new("name", DataType::Text, false),
-                    ],
-                },
-                &mut None,
-            )
-            .unwrap();
-
-        for i in 1..=250 {
+        // session 1 — create table and insert rows
+        {
+            let mut executor = create_test_executor("test_select_index_metrics");
             executor
                 .execute(
-                    Statement::Insert {
-                        table_name: "users".to_string(),
-                        values: vec![Value::Integer(i), Value::Text(format!("user_{}", i))],
+                    Statement::CreateTable {
+                        name: "users".to_string(),
+                        columns: vec![
+                            Column::new("id", DataType::Integer, true),
+                            Column::new("name", DataType::Text, false),
+                        ],
                     },
                     &mut None,
                 )
                 .unwrap();
+
+            for i in 1..=250 {
+                executor
+                    .execute(
+                        Statement::Insert {
+                            table_name: "users".to_string(),
+                            values: vec![Value::Integer(i), Value::Text(format!("user_{}", i))],
+                        },
+                        &mut None,
+                    )
+                    .unwrap();
+            }
+
+            executor.checkpoint().unwrap();
         }
 
-        // full scan metrics
-        let mut full_scan_metrics = Some(QueryMetrics::new());
-        executor
-            .execute(
-                Statement::Select {
-                    table_name: "users".to_string(),
-                    columns: SelectColumns::All,
-                    where_clause: Some(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("name".to_string())),
-                        op: BinaryOperator::Equals,
-                        right: Box::new(Expr::Literal(Value::Text("user_250".to_string()))),
-                    }),
-                },
-                &mut full_scan_metrics,
-            )
-            .unwrap();
+        // session 2 — full scan on cold cache
+        let full_scan_disk_reads = {
+            let mut executor = create_test_executor("test_select_index_metrics");
+            let mut metrics = Some(QueryMetrics::new());
 
-        // index scan metrics — same query on indexed column
-        let mut index_metrics = Some(QueryMetrics::new());
-        executor
-            .execute(
-                Statement::Select {
-                    table_name: "users".to_string(),
-                    columns: SelectColumns::All,
-                    where_clause: Some(Expr::BinaryOp {
-                        left: Box::new(Expr::Column("id".to_string())),
-                        op: BinaryOperator::Equals,
-                        right: Box::new(Expr::Literal(Value::Integer(250))),
-                    }),
-                },
-                &mut index_metrics,
-            )
-            .unwrap();
+            executor
+                .execute(
+                    Statement::Select {
+                        table_name: "users".to_string(),
+                        columns: SelectColumns::All,
+                        where_clause: Some(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("name".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Text("user_250".to_string()))),
+                        }),
+                    },
+                    &mut metrics,
+                )
+                .unwrap();
 
-        let full_scan_pages = full_scan_metrics.unwrap().pages_read;
-        let index_pages = index_metrics.unwrap().pages_read;
+            metrics.unwrap().disk_reads
+        };
 
-        // index should read significantly fewer pages
+        // session 3 — index scan on cold cache
+        let index_disk_reads = {
+            let mut executor = create_test_executor("test_select_index_metrics");
+            let mut metrics = Some(QueryMetrics::new());
+
+            executor
+                .execute(
+                    Statement::Select {
+                        table_name: "users".to_string(),
+                        columns: SelectColumns::All,
+                        where_clause: Some(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("id".to_string())),
+                            op: BinaryOperator::Equals,
+                            right: Box::new(Expr::Literal(Value::Integer(250))),
+                        }),
+                    },
+                    &mut metrics,
+                )
+                .unwrap();
+
+            metrics.unwrap().disk_reads
+        };
+
         assert!(
-            index_pages < full_scan_pages,
-            "index read {} pages, full scan read {} pages — index should be faster",
-            index_pages,
-            full_scan_pages
+            index_disk_reads < full_scan_disk_reads,
+            "index read {} pages from disk, full scan read {} pages — index should be faster",
+            index_disk_reads,
+            full_scan_disk_reads
         );
 
         cleanup("test_select_index_metrics");

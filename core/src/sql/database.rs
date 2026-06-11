@@ -105,6 +105,10 @@ impl Database {
         self.buffer_pool.free_page(page_id, &mut self.wal_writer)
     }
 
+    pub fn is_page_cached(&self, page_id: PageId) -> bool {
+        self.buffer_pool.is_cached(page_id)
+    }
+
     // table catalog
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
         self.table_catalog.create_table(

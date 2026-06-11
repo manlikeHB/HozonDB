@@ -75,11 +75,12 @@ pub fn execute_delete(
 
         // mark page dirty
         db.mark_dirty(loc.page_id(), lsn)?;
+        if let Some(m) = metrics.as_mut() {
+            m.pages_dirtied += 1;
+        }
 
         deleted_rows.push(row);
     }
-
-    // TODO: track number of pages that were written to for metrics
 
     // delete indexed keys
     let index_entries = db

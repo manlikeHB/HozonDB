@@ -53,13 +53,17 @@ fn scan_table_with_locations(
     let mut cur_page = first_page;
 
     loop {
-        // Read page data
-        let page_data = db.read_page(cur_page)?;
-
         // track page reads
         if let Some(m) = metrics.as_mut() {
-            m.pages_read += 1;
+            if db.is_page_cached(cur_page) {
+                m.buffer_pool_hits += 1;
+            } else {
+                m.disk_reads += 1;
+            }
         }
+
+        // Read page data
+        let page_data = db.read_page(cur_page)?;
 
         let page_meta = PageManager::read_metadata_from_buffer(&page_data, PageType::Slotted);
 
@@ -111,13 +115,18 @@ pub fn insert_row_into_page(
     metrics: &mut Option<QueryMetrics>,
 ) -> io::Result<(PageId, u16)> {
     let (wal_writer, buffer_pool) = db.get_wal_and_buffer_pool();
-    // let mut last_page_data = db.read_page(last_page)?;
-    let mut last_page_data = buffer_pool.get_page_mut(last_page)?;
 
     // Track page read
     if let Some(m) = metrics.as_mut() {
-        m.pages_read += 1;
+        if buffer_pool.is_cached(last_page) {
+            m.buffer_pool_hits += 1;
+        } else {
+            m.disk_reads += 1;
+        }
     }
+
+    // let mut last_page_data = db.read_page(last_page)?;
+    let mut last_page_data = buffer_pool.get_page_mut(last_page)?;
 
     let mut last_page_meta =
         PageManager::read_metadata_from_buffer(&last_page_data, PageType::Slotted);
@@ -163,7 +172,7 @@ pub fn insert_row_into_page(
 
         // Track page write
         if let Some(m) = metrics.as_mut() {
-            m.pages_written += 1;
+            m.pages_dirtied += 1;
         }
 
         (last_page, last_page_meta.slot_count()? - 1)
@@ -206,14 +215,14 @@ pub fn insert_row_into_page(
 
         // Track new page write
         if let Some(m) = metrics.as_mut() {
-            m.pages_written += 1;
+            m.pages_dirtied += 1;
         }
 
         // Update the previous page's metadata to point to the new page
         buffer_pool.update_next_page_in_page_metadata(last_page, new_page, wal_writer)?;
 
         if let Some(m) = metrics.as_mut() {
-            m.pages_written += 1;
+            m.pages_dirtied += 1;
         }
 
         // update table's last page
@@ -333,12 +342,15 @@ pub fn resolve_rows(
                         // point lookup
                         match db.search_index(entry.index_name(), &key)? {
                             Some(loc) => {
+                                if let Some(m) = metrics.as_mut() {
+                                    if db.is_page_cached(loc.page_id()) {
+                                        m.buffer_pool_hits += 1;
+                                    } else {
+                                        m.disk_reads += 1;
+                                    }
+                                }
                                 let row = read_row(db.read_page(loc.page_id())?, loc)?;
                                 filtered_rows_and_loc.push((row, loc));
-                                if let Some(m) = metrics.as_mut() {
-                                    m.pages_read += 1;
-                                    m.rows_scanned += 1;
-                                }
                             }
                             None => {}
                         }
@@ -349,11 +361,14 @@ pub fn resolve_rows(
                         let locations =
                             db.range_index_scan(entry.index_name(), None, Some(&key), op)?;
                         for loc in locations {
-                            let row = read_row(db.read_page(loc.page_id())?, loc)?;
                             if let Some(m) = metrics.as_mut() {
-                                m.pages_read += 1; // TODO: track pages read for metrics
-                                m.rows_scanned += 1;
+                                if db.is_page_cached(loc.page_id()) {
+                                    m.buffer_pool_hits += 1;
+                                } else {
+                                    m.disk_reads += 1;
+                                }
                             }
+                            let row = read_row(db.read_page(loc.page_id())?, loc)?;
                             filtered_rows_and_loc.push((row, loc));
                         }
                         true
@@ -363,11 +378,14 @@ pub fn resolve_rows(
                         let locations =
                             db.range_index_scan(entry.index_name(), Some(&key), None, op)?;
                         for loc in locations {
-                            let row = read_row(db.read_page(loc.page_id())?, loc)?;
                             if let Some(m) = metrics.as_mut() {
-                                m.pages_read += 1; // TODO: track pages read for metrics
-                                m.rows_scanned += 1;
+                                if db.is_page_cached(loc.page_id()) {
+                                    m.buffer_pool_hits += 1;
+                                } else {
+                                    m.disk_reads += 1;
+                                }
                             }
+                            let row = read_row(db.read_page(loc.page_id())?, loc)?;
                             filtered_rows_and_loc.push((row, loc));
                         }
                         true
