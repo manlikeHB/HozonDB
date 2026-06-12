@@ -593,3 +593,196 @@ fn test_recovery_free_page_reuse_non_indexed() {
 
     cleanup("rec_free_page_non_indexed");
 }
+
+#[test]
+fn test_recovery_free_page_reuse_wal_ordering() {
+    // Verifies that when pages are freed and reallocated from the free list
+    // without a checkpoint, recovery correctly restores the reallocated page
+    // with the right data — not stale free page content.
+    // This exercises the WAL ordering around free list allocation:
+    // the AllocatePage record must be logged before the free list head
+    // is updated, otherwise recovery cannot reinitialize the page.
+    cleanup("rec_alloc_wal_order");
+
+    {
+        let mut ex = create_executor("rec_alloc_wal_order");
+
+        ex.execute(
+            Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![Column::new("id", DataType::Integer, false)],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        for i in 1..=50 {
+            ex.execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i)],
+                },
+                &mut None,
+            )
+            .unwrap();
+        }
+
+        ex.checkpoint().unwrap();
+
+        // free pages by dropping the table
+        ex.execute(
+            Statement::DropTable {
+                name: "users".to_string(),
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        // reallocate from free list — no checkpoint before crash
+        ex.execute(
+            Statement::CreateTable {
+                name: "orders".to_string(),
+                columns: vec![Column::new("id", DataType::Integer, false)],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        ex.execute(
+            Statement::Insert {
+                table_name: "orders".to_string(),
+                values: vec![Value::Integer(42)],
+            },
+            &mut None,
+        )
+        .unwrap();
+        // crash — free list reallocation only in WAL
+    }
+
+    {
+        let mut ex = create_executor("rec_alloc_wal_order");
+
+        // users dropped — should not exist
+        let result = ex.execute(
+            Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            },
+            &mut None,
+        );
+        assert!(result.is_err());
+
+        // orders should exist with correct data — not stale free page content
+        let values = row_values(select_all(&mut ex, "orders"));
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0][0], Value::Integer(42));
+    }
+
+    cleanup("rec_alloc_wal_order");
+}
+
+#[test]
+fn test_recovery_free_list_head_not_stale_after_alloc() {
+    // Verifies that after recovery, a page that was allocated from the
+    // free list before the crash is not still listed as the free list head.
+    // recover_allocate_page must update PageManager::first_free_page
+    // to reflect the allocation — otherwise the next allocate_page call
+    // would hand out a page already in use.
+    cleanup("rec_free_list_stale");
+
+    {
+        let mut ex = create_executor("rec_free_list_stale");
+
+        // create and populate a table
+        ex.execute(
+            Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![Column::new("id", DataType::Integer, false)],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        for i in 1..=20 {
+            ex.execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(i)],
+                },
+                &mut None,
+            )
+            .unwrap();
+        }
+
+        ex.checkpoint().unwrap();
+
+        // free pages — free list now has entries on disk
+        ex.execute(
+            Statement::DropTable {
+                name: "users".to_string(),
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        ex.checkpoint().unwrap();
+
+        // allocate from free list — no checkpoint before crash
+        ex.execute(
+            Statement::CreateTable {
+                name: "orders".to_string(),
+                columns: vec![Column::new("id", DataType::Integer, false)],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        ex.execute(
+            Statement::Insert {
+                table_name: "orders".to_string(),
+                values: vec![Value::Integer(1)],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        // crash — AllocatePage logged but free list header not updated on disk
+    }
+
+    {
+        let mut ex = create_executor("rec_free_list_stale");
+
+        // orders should be intact
+        let values = row_values(select_all(&mut ex, "orders"));
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0][0], Value::Integer(1));
+
+        // now allocate again — if free list head is stale, this hands out
+        // a page already used by orders, corrupting it
+        ex.execute(
+            Statement::CreateTable {
+                name: "logs".to_string(),
+                columns: vec![Column::new("id", DataType::Integer, false)],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        ex.execute(
+            Statement::Insert {
+                table_name: "logs".to_string(),
+                values: vec![Value::Integer(99)],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        // orders must still have correct data — not corrupted by stale free page reuse
+        let values = row_values(select_all(&mut ex, "orders"));
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0][0], Value::Integer(1));
+    }
+
+    cleanup("rec_free_list_stale");
+}

@@ -331,6 +331,14 @@ fn recover_allocate_page(
     *page_data = [0u8; PAGE_SIZE];
     PageManager::init_page_metadata_buffer(page_data, page_type);
 
+    // update free list head — this page was allocated so it should no
+    // longer be the free list head. read_next_free gives us what the
+    // head should point to after this allocation.
+    let next_free = buffer_pool.read_next_free(page_id)?;
+    if buffer_pool.first_free_page() == Some(page_id) {
+        buffer_pool.set_first_free_page(next_free)?;
+    }
+
     buffer_pool.mark_dirty(page_id, 0)?;
     Ok(())
 }

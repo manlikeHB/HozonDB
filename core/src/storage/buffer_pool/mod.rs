@@ -53,20 +53,18 @@ impl BufferPool {
             // read next free pointer from buffer pool frame
             let next_free = self.read_next_free(free_page_id)?;
 
+            // log
+            let lsn = wal_writer.append_allocate_page(free_page_id, page_type.to_u8())?;
+
             // update free list head
             self.page_manager.set_first_free_page(next_free)?;
-
-            // log
-            wal_writer.append_allocate_page(free_page_id, page_type.to_u8())?;
 
             // reset page metadata of free page for reuse
             let page_data = self.get_page_mut(free_page_id)?;
             PageManager::init_page_metadata_buffer(page_data, page_type);
 
             // mark dirty
-            // this ensures the page with it's write metadata is flushed
-            // to the disk
-            self.mark_dirty(free_page_id, 0)?;
+            self.mark_dirty(free_page_id, lsn)?;
 
             return Ok(free_page_id);
         }
@@ -290,6 +288,10 @@ impl BufferPool {
 
     pub fn first_free_page(&self) -> Option<PageId> {
         self.page_manager.first_free_page()
+    }
+
+    pub(crate) fn set_first_free_page(&mut self, next_free: Option<PageId>) -> io::Result<()> {
+        self.page_manager.set_first_free_page(next_free)
     }
 
     pub fn is_cached(&self, page_id: PageId) -> bool {
@@ -904,5 +906,36 @@ mod tests {
         }
 
         cleanup("test_bp_next_page_persist");
+    }
+
+    #[test]
+    fn test_allocate_from_free_list_stamps_real_lsn() {
+        // Verifies that a page allocated from the free list is marked dirty
+        // with the LSN from the AllocatePage WAL record, not 0.
+        // LSN 0 means "no WAL record" — a reused page stamped with 0 would
+        // be skipped by LSN comparison during recovery even if its WAL record
+        // exists.
+
+        cleanup("test_alloc_reuse_lsn");
+        let (mut bp, mut wal) = setup("test_alloc_reuse_lsn");
+
+        let page_id = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        bp.free_page(page_id, &mut wal).unwrap();
+
+        bp.flush_dirty().unwrap();
+        wal.checkpoint().unwrap();
+
+        // allocate from free list — should stamp real LSN
+        let reused = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        assert_eq!(reused, page_id);
+
+        let idx = bp.page_table[&reused];
+        assert!(bp.frames[idx].dirty());
+        assert!(
+            bp.frames[idx].last_lsn() > 0,
+            "reused page should be stamped with WAL LSN, not 0"
+        );
+
+        cleanup("test_alloc_reuse_lsn");
     }
 }

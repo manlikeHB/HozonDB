@@ -246,13 +246,12 @@ impl PageManager {
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(0))?; // go to start
         file.write_all(&headers)?;
-        file.sync_all()?;
 
         Ok(())
     }
 
     /// Add a page to the free list
-    pub fn set_first_free_page(&mut self, next_free: Option<PageId>) -> io::Result<()> {
+    pub(crate) fn set_first_free_page(&mut self, next_free: Option<PageId>) -> io::Result<()> {
         // update head to new free page
         self.first_free_page = next_free;
         self.write_header()?; // update header
