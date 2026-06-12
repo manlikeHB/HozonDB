@@ -29,7 +29,7 @@ fn test_clean_shutdown_data_survives() {
         )
         .unwrap();
 
-        ex.checkpoint().unwrap(); // clean shutdown
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
     }
 
     {
@@ -66,7 +66,7 @@ fn test_checkpoint_then_crash_recovers_remaining() {
         )
         .unwrap();
 
-        ex.checkpoint().unwrap(); // row 1 safe on disk
+        ex.execute(Statement::Checkpoint, &mut None).unwrap(); // row 1 safe on disk
 
         ex.execute(
             Statement::Insert {
@@ -111,7 +111,7 @@ fn test_multiple_checkpoints_data_survives() {
                 &mut None,
             )
             .unwrap();
-            ex.checkpoint().unwrap(); // checkpoint after each insert
+            ex.execute(Statement::Checkpoint, &mut None).unwrap(); // checkpoint after each insert
         }
     }
 
@@ -142,7 +142,7 @@ fn test_table_schema_persists_across_restart() {
         )
         .unwrap();
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
     }
 
     {
@@ -196,7 +196,7 @@ fn test_index_persists_across_restart() {
             .unwrap();
         }
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
     }
 
     {
@@ -243,7 +243,7 @@ fn test_empty_table_persists() {
         )
         .unwrap();
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
     }
 
     {

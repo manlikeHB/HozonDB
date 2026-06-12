@@ -74,6 +74,12 @@ impl Executor {
                 where_clause,
                 metrics,
             ),
+            Statement::Checkpoint => {
+                self.database.checkpoint()?;
+                Ok(ExecutionResult::Success {
+                    message: "Checkpoint complete.".to_string(),
+                })
+            }
         };
 
         if let Some(m) = metrics {
@@ -81,9 +87,5 @@ impl Executor {
         }
 
         result
-    }
-
-    pub fn checkpoint(&mut self) -> io::Result<()> {
-        self.database.checkpoint()
     }
 }

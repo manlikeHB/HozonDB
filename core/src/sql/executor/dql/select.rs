@@ -1415,7 +1415,7 @@ mod tests {
                     .unwrap();
             }
 
-            executor.checkpoint().unwrap();
+            executor.execute(Statement::Checkpoint, &mut None).unwrap();
         }
 
         // session 2 — full scan on cold cache

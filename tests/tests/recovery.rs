@@ -101,7 +101,7 @@ fn test_recovery_delete() {
             .unwrap();
         }
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
 
         ex.execute(
             Statement::Delete {
@@ -162,7 +162,7 @@ fn test_recovery_update() {
         )
         .unwrap();
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
 
         ex.execute(
             Statement::Update {
@@ -310,7 +310,7 @@ fn test_recovery_is_idempotent() {
             .unwrap();
         }
         // no checkpoint
-        ex.checkpoint().unwrap()
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
     }
 
     // recover twice — result should be identical
@@ -351,7 +351,7 @@ fn test_recovery_drop_table() {
         )
         .unwrap();
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
 
         ex.execute(
             Statement::DropTable {
@@ -414,7 +414,7 @@ fn test_recovery_multi_page_link_preserved() {
             .unwrap();
         }
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
 
         // insert more rows after checkpoint — tests page link recovery
         for i in 100..150 {
@@ -627,7 +627,7 @@ fn test_recovery_free_page_reuse_wal_ordering() {
             .unwrap();
         }
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
 
         // free pages by dropping the table
         ex.execute(
@@ -715,7 +715,7 @@ fn test_recovery_free_list_head_not_stale_after_alloc() {
             .unwrap();
         }
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
 
         // free pages — free list now has entries on disk
         ex.execute(
@@ -726,7 +726,7 @@ fn test_recovery_free_list_head_not_stale_after_alloc() {
         )
         .unwrap();
 
-        ex.checkpoint().unwrap();
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
 
         // allocate from free list — no checkpoint before crash
         ex.execute(

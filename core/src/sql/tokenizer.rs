@@ -51,6 +51,7 @@ pub enum Token {
 
     // Special
     Eof, // End of input
+    Checkpoint,
 }
 
 pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
@@ -195,6 +196,7 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                     "SET" => Token::Set,
                     "PRIMARY" => Token::Primary,
                     "KEY" => Token::Key,
+                    "CHECKPOINT" => Token::Checkpoint,
                     _ => Token::Identifier(word),
                 };
 
@@ -372,5 +374,12 @@ mod tests {
         assert_eq!(tokens[8], Token::RightParen);
         assert_eq!(tokens[9], Token::Semicolon);
         assert_eq!(tokens[10], Token::Eof);
+    }
+
+    #[test]
+    fn test_tokenize_checkpoint() {
+        let tokens = tokenize("checkpoint").unwrap();
+
+        assert_eq!(tokens[0], Token::Checkpoint);
     }
 }

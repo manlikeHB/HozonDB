@@ -29,6 +29,7 @@ pub enum Statement {
         assignments: Vec<(String, Value)>,
         where_clause: Option<Expr>,
     },
+    Checkpoint,
 }
 
 #[derive(Debug, PartialEq)]
@@ -113,6 +114,11 @@ impl Parser {
                 Token::Drop => self.parse_drop_table(),
                 Token::Delete => self.parse_delete(),
                 Token::Update => self.parse_update(),
+                Token::Checkpoint => {
+                    self.advance();
+                    self.expect(Token::Semicolon)?;
+                    Ok(Statement::Checkpoint)
+                }
                 _ => Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("Unexpected token: {:?}", token),
