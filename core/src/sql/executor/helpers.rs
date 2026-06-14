@@ -172,7 +172,7 @@ pub fn insert_row_into_page(
 
         // Track page write
         if let Some(m) = metrics.as_mut() {
-            m.pages_dirtied += 1;
+            m.pages_dirtied.insert(last_page);
         }
 
         (last_page, last_page_meta.slot_count()? - 1)
@@ -215,14 +215,14 @@ pub fn insert_row_into_page(
 
         // Track new page write
         if let Some(m) = metrics.as_mut() {
-            m.pages_dirtied += 1;
+            m.pages_dirtied.insert(new_page);
         }
 
         // Update the previous page's metadata to point to the new page
         buffer_pool.update_next_page_in_page_metadata(last_page, new_page, wal_writer)?;
 
         if let Some(m) = metrics.as_mut() {
-            m.pages_dirtied += 1;
+            m.pages_dirtied.insert(last_page);
         }
 
         // update table's last page
@@ -345,8 +345,10 @@ pub fn resolve_rows(
                                 if let Some(m) = metrics.as_mut() {
                                     if db.is_page_cached(loc.page_id()) {
                                         m.buffer_pool_hits += 1;
+                                        m.rows_scanned += 1;
                                     } else {
                                         m.disk_reads += 1;
+                                        m.rows_scanned += 1;
                                     }
                                 }
                                 let row = read_row(db.read_page(loc.page_id())?, loc)?;
@@ -364,8 +366,10 @@ pub fn resolve_rows(
                             if let Some(m) = metrics.as_mut() {
                                 if db.is_page_cached(loc.page_id()) {
                                     m.buffer_pool_hits += 1;
+                                    m.rows_scanned += 1;
                                 } else {
                                     m.disk_reads += 1;
+                                    m.rows_scanned += 1;
                                 }
                             }
                             let row = read_row(db.read_page(loc.page_id())?, loc)?;
@@ -381,8 +385,10 @@ pub fn resolve_rows(
                             if let Some(m) = metrics.as_mut() {
                                 if db.is_page_cached(loc.page_id()) {
                                     m.buffer_pool_hits += 1;
+                                    m.rows_scanned += 1;
                                 } else {
                                     m.disk_reads += 1;
+                                    m.rows_scanned += 1;
                                 }
                             }
                             let row = read_row(db.read_page(loc.page_id())?, loc)?;

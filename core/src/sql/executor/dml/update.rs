@@ -147,7 +147,7 @@ pub fn execute_update(
             // mark page dirty
             db.mark_dirty(loc.page_id(), lsn)?;
             if let Some(m) = metrics.as_mut() {
-                m.pages_dirtied += 1;
+                m.pages_dirtied.insert(loc.page_id());
             }
 
             // delete old row index
@@ -193,7 +193,7 @@ pub fn execute_update(
             // mark page dirty
             db.mark_dirty(loc.page_id(), lsn)?;
             if let Some(m) = metrics.as_mut() {
-                m.pages_dirtied += 1;
+                m.pages_dirtied.insert(loc.page_id());
             }
 
             // collect old row to be freed if indexed

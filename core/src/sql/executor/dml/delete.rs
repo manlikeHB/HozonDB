@@ -76,7 +76,7 @@ pub fn execute_delete(
         // mark page dirty
         db.mark_dirty(loc.page_id(), lsn)?;
         if let Some(m) = metrics.as_mut() {
-            m.pages_dirtied += 1;
+            m.pages_dirtied.insert(loc.page_id());
         }
 
         deleted_rows.push(row);

@@ -104,7 +104,7 @@ fn print_results(results: &[BenchmarkResult]) {
             r.operation.clone(),
             format!("{:.2}", r.metrics.duration_ms),
             r.metrics.buffer_pool_hits.to_string(),
-            r.metrics.pages_dirtied.to_string(),
+            r.metrics.pages_dirtied.len().to_string(),
             r.metrics.rows_modified.to_string(),
         ]);
     }
