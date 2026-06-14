@@ -149,6 +149,10 @@ impl BufferPool {
                 let page_id = self.frames[idx].page_id().ok_or_else(|| {
                     Error::new(ErrorKind::InvalidData, "Non empty frame has no page ID")
                 })?;
+
+                // Write is not synced here — durability for this page is guaranteed by
+                // the next checkpoint's sync_all, backed by WAL replay if it doesn't
+                // make it to disk before a crash.
                 self.page_manager
                     .write_page(page_id, self.frames[idx].data())?;
             }
