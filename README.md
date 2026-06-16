@@ -1,104 +1,22 @@
 # HozonDB
 
-A relational database engine built from scratch in Rust. HozonDB implements core database internals — page-based storage, a hand-written SQL parser, query execution, slotted page layout, and B+ tree indexing.
-
----
-
-## Why This Project Exists
-
-HozonDB is a systems programming project aimed at exploring the internal architecture of relational databases.
-
-Modern databases hide significant complexity behind simple SQL interfaces. This project focuses on implementing core components from scratch in order to understand how storage engines, query execution, and data layout interact in real systems.
-
-Rather than relying on existing database libraries, HozonDB explicitly implements key subsystems such as page management, row serialization, SQL parsing, query execution, and indexing. The goal is to make the behavior of the database transparent and observable while experimenting with design trade-offs commonly found in production database engines.
-
----
-
-## Prerequisites
-
-- Rust (latest stable)
-- `protoc` — Protocol Buffers compiler
-
-On Debian/Ubuntu:
-```bash
-sudo apt-get install protobuf-compiler
-```
-
-On macOS:
-```bash
-brew install protobuf
-```
-
----
-
-## Workspace Structure
-
-```
-hozondb/
-├── core/       # database engine (library) — storage, executor, parser, proto types
-├── server/     # gRPC server binary
-├── client/     # gRPC client library
-├── hsql/       # interactive CLI (connects to server over gRPC)
-└── tests/      # integration tests
-```
-
----
-
-## Capabilities
-
-- Page-based persistent storage with file-level locking
-- **Slotted page layout** — stable row locations, in-place updates and deletes
-- SQL: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
-- `PRIMARY KEY` support with automatic B+ tree index creation
-- `WHERE` clause filtering with comparison and range operators (`=`, `<`, `>`, `<=`, `>=`)
-- **B+ tree indexing** — O(log n) point lookups and range scans on indexed columns
-- Index-aware `INSERT`, `UPDATE`, `DELETE` — indexes stay consistent on every write
-- Multi-page tables with automatic page allocation
-- System catalog for schema and index persistence across restarts
-- Benchmark suite with before/after index metrics
-- **gRPC client-server interface** — server exposes SQL execution over gRPC
-- **`hsql` CLI** — readline-powered interactive shell that connects to the server over gRPC
+A relational database engine built from scratch in Rust. The goal is to understand how databases work at the implementation level — storage, indexing, crash recovery, and eventually distributed consensus — by building each piece rather than using existing libraries.
 
 ---
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────┐
-│             hsql (CLI client)            │  rustyline-based interactive shell
-└────────────────────┬─────────────────────┘
-                     │ gRPC
-┌────────────────────▼─────────────────────┐
-│            gRPC Server                   │  tonic + tokio async transport
-└────────────────────┬─────────────────────┘
-                     │
-┌────────────────────▼─────────────────────┐
-│              SQL Parser                  │  Hand-written lexer + recursive descent
-│   Lexer → Token stream → AST             │
-└────────────────────┬─────────────────────┘
-                     │
-┌────────────────────▼─────────────────────┐
-│            Query Executor                │  AST → execution → row iteration
-│   Index seek / Range scan / Full scan    │
-└────────────────────┬─────────────────────┘
-                     │
-┌────────────────────▼─────────────────────┐
-│           B+ Tree Index Layer            │  Per-column indexes, page-backed nodes
-│   Point lookup / Range scan / Node cache │
-└────────────────────┬─────────────────────┘
-                     │
-┌────────────────────▼─────────────────────┐
-│         Table Storage Layer              │  Slotted pages, schema-aware row I/O
-│   Slot directory, in-place update/delete │
-└────────────────────┬─────────────────────┘
-                     │
-┌────────────────────▼─────────────────────┐
-│            Page Manager                  │  Fixed 4KB pages, file I/O, metadata
-│   allocate_page / read_page / write_page │
-└────────────────────┬─────────────────────┘
-                     │
-                  .hdb file
-```
+![HozonDB Architecture](assets/architecture.png)
+
+**Crate layout:**
+
+| Crate | Role |
+|---|---|
+| `core` | Storage engine, SQL executor, WAL, buffer pool |
+| `server` | gRPC server — runs the database as a standalone process |
+| `client` | gRPC client library — transport layer for connecting to the server |
+| `hsql` | readline-powered REPL that connects over gRPC |
+| `tests` | Integration tests — recovery, persistence, gRPC |
 
 **Page layout:**
 ```
@@ -110,16 +28,28 @@ Page 3+:  user data pages and B+ tree node pages (shared space)
 
 ---
 
-## How Indexing Works
+## Storage
 
-When a table is created with a `PRIMARY KEY` column, HozonDB automatically creates a B+ tree index on that column. The index is stored as a set of pages within the same `.hdb` file.
+HozonDB stores all data in a single `.hdb` file. The file is a sequence of fixed-size 4KB pages. Each page has a type:
+
+- **Slotted pages** — row data. Each page has a slot directory at the front and row data growing from the back. Rows have stable `(page_id, slot)` addresses even after updates.
+- **Raw pages** — B+ tree index nodes and system catalog pages.
+- **Free pages** — released pages tracked in a linked free list, reused on next allocation.
+
+A separate `.wal` file holds the write-ahead log.
+
+---
+
+## Indexing
+
+Every `PRIMARY KEY` column automatically gets a B+ tree index. The index is stored as raw pages within the same `.hdb` file.
 
 ```sql
 -- auto-creates a B+ tree index on `id`
 CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
 ```
 
-On every `INSERT`, the indexed column value and the new row's `RowLocation` (page + slot) are inserted into the tree. On `SELECT WHERE id = 5`, the executor uses the tree to find the exact page and slot in O(log n) rather than scanning all pages.
+On every `INSERT`, the indexed column value and the row's `RowLocation` (page + slot) are inserted into the tree. On `SELECT WHERE id = 5`, the executor uses the tree to find the exact page and slot in O(log n) rather than scanning all pages.
 
 **Index-eligible operators:**
 - `=` — point lookup, reads 1 data page
@@ -128,46 +58,80 @@ On every `INSERT`, the indexed column value and the new row's `RowLocation` (pag
 
 ---
 
+## Buffer Pool
+
+The buffer pool sits between the executor and disk. Every page read checks the pool first. Every page write goes through it — the change is logged to WAL, the frame is marked dirty, and the actual disk flush is deferred to checkpoint time.
+
+Clock sweep eviction handles memory pressure — referenced frames get a second chance before eviction, the same algorithm PostgreSQL uses.
+
+---
+
+## Write-Ahead Log (WAL)
+
+Every write is logged before it touches a page. HozonDB uses physiological logging — records describe changes at the page and slot level, not raw byte offsets or full SQL statements.
+
+WAL record types:
+
+- `Slotted` — row-level DML (INSERT, UPDATE, DELETE): table, page, slot, old bytes, new bytes
+- `Raw` — full page image for B+ tree nodes and catalog pages
+- `Checkpoint` — recovery boundary marker
+- `LinkPage` — page chain pointer change
+- `AllocatePage` — page lifecycle
+
+On startup, `WalReader` replays records from the last checkpoint. Each record is applied only if the target page's stored LSN is older than the record's LSN — idempotent by design.
+
+CRC32 checksum per record detects torn writes. Recovery stops at the last valid record if corruption is detected.
+
+---
+
 ## Benchmark Results
 
-**10,000 rows, 66 pages, with B+ tree index on primary key:**
+**10,000 rows, with B+ tree index on primary key**
 
-| Operation | Duration | Pages Read | Rows Scanned |
+| Operation | Duration | BP Hits | Pages Dirtied |
 |---|---|---|---|
-| SELECT full scan | 12.27ms | 66 | 10,000 |
-| SELECT idx seek (point lookup) | **0.02ms** | **1** | **1** |
-| SELECT range scan | 10.81ms | 66 | 10,000 |
+| SELECT full scan | 11.06ms | 66 | — |
+| SELECT idx seek (point lookup) | 0.02ms | 1 | — |
+| INSERT (single row) | 8.52ms | 1 | 1 |
+| UPDATE (fits slot) | 13.02ms | 1 | 1 |
+| UPDATE (exceeds slot) | 29.95ms | 2 | 3 |
+| UPDATE bulk 10% (1000 rows) | 12,227.99ms | 1000 | 8 |
+| DELETE (single row) | 9.89ms | 1 | 1 |
+| DELETE bulk 10% (1000 rows) | 7,740.22ms | 1000 | 8 |
 
-| Operation | Duration | Pages Read | Pages Written |
-|---|---|---|---|
-| INSERT (single row) | 7.34ms | 1 | 1 |
-| UPDATE (fits slot) | **9.89ms** | **1** | **1** |
-| UPDATE (exceeds slot) | 29.10ms | 2 | 3 |
-| DELETE (single row) | **7.68ms** | **1** | **1** |
-
-Point lookups on indexed columns: **59x fewer page reads** compared to full scan.
+The bulk write cost is the price of the durability guarantee — every WAL append is a synchronous fsync to disk. Group commit (batching fsyncs per transaction) is the planned fix once transactions land.
 
 ---
 
 ## Status / Roadmap
 
 **Implemented:**
-- Page manager with file locking and slotted page layout
-- In-place row updates and deletes (no page chain rewrite)
-- System catalog with schema and index persistence
-- Full SQL CRUD with WHERE filtering and range operators
+- Slotted page storage with stable row addresses
+- Page manager with file locking and free list
 - B+ tree indexing — point lookup and range scan
 - Index-aware INSERT, UPDATE, DELETE
 - PRIMARY KEY uniqueness enforcement
-- Benchmark suite with index metrics
-- gRPC client-server interface
+- System catalog with schema and index persistence
+- Full SQL CRUD with WHERE filtering and range operators
+- Buffer pool with clock sweep eviction
+- Write-ahead log with physiological logging, CRC32 checksums, and checkpointing
+- Crash recovery via LSN-based redo pass
+- gRPC client-server interface (tonic + tokio)
 - `hsql` interactive CLI over gRPC
 
+**Known gaps:**
+- Dead slot compaction — deleted rows leave dead slots permanently; free space is never reclaimed within a page
+- `DROP TABLE` orphans B+ tree index pages — node pages are never freed, only the catalog entry is removed
+- Single-page catalog limit — table and index catalogs are each limited to 4KB; overflow returns an error
+- SELECT buffers all results — no true server-side streaming
+- Index seek for UPDATE/DELETE WHERE — falls back to full scan on indexed columns; correct results, performance gap only
+- B+ tree in-memory node cache grows unbounded within a session
+- WAL truncation not implemented — `.wal` file grows unbounded; old records before the last checkpoint are never deleted
+- `pin_count` in `Frame` exists but is never enforced — safe now (single-threaded), gap when concurrency arrives
+
 **Planned:**
+- `BEGIN` / `COMMIT` / `ROLLBACK` transaction support — unlocks group commit and gives `old_data` in WAL records a purpose (rollback)
 - `CREATE INDEX` — explicit index creation on any column
-- Server-side streaming for SELECT results
-- Write-ahead log (WAL) for crash recovery
-- `BEGIN` / `COMMIT` / `ROLLBACK` transaction support
 - Distributed replication (Raft consensus)
 
 ---
@@ -179,9 +143,14 @@ Point lookups on indexed columns: **59x fewer page reads** compared to full scan
 cargo run -p hozondb-server -- mydb
 ```
 
+Optionally specify a custom address (default: `[::]:50051`):
+```bash
+cargo run -p hozondb-server -- mydb --addr 0.0.0.0:50051
+```
+
 **Connect with the CLI:**
 ```bash
-cargo run -p hsql -- http://[::1]:50051
+cargo run -p hsql -- http://localhost:50051
 ```
 
 ```sql
@@ -195,6 +164,17 @@ hozondb> DELETE FROM users WHERE id = 2;
 hozondb> .exit
 ```
 
+**Run the benchmark suite:**
 ```bash
-cargo test --workspace   # run all tests
+cargo run -p hozondb-core --bin benchmark
+```
+
+Optionally pass a custom row count (default: 10,000):
+```bash
+cargo run -p hozondb-core --bin benchmark -- 50000
+```
+
+**Run all tests:**
+```bash
+cargo test --workspace
 ```
