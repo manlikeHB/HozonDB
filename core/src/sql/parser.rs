@@ -30,6 +30,9 @@ pub enum Statement {
         where_clause: Option<Expr>,
     },
     Checkpoint,
+    Begin,
+    Commit,
+    RollBack,
 }
 
 #[derive(Debug, PartialEq)]
@@ -118,6 +121,21 @@ impl Parser {
                     self.advance();
                     self.expect(Token::Semicolon)?;
                     Ok(Statement::Checkpoint)
+                }
+                Token::Begin => {
+                    self.advance();
+                    self.expect(Token::Semicolon)?;
+                    Ok(Statement::Begin)
+                }
+                Token::Commit => {
+                    self.advance();
+                    self.expect(Token::Semicolon)?;
+                    Ok(Statement::Commit)
+                }
+                Token::RollBack => {
+                    self.advance();
+                    self.expect(Token::Semicolon)?;
+                    Ok(Statement::RollBack)
                 }
                 _ => Err(Error::new(
                     ErrorKind::InvalidData,
@@ -1172,6 +1190,58 @@ mod tests {
                 assert_eq!(columns[1].is_primary_key(), false);
             }
             _ => panic!("Expected CreateTable statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_checkpoint() {
+        let sql = "Checkpoint;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Checkpoint => {}
+            _ => panic!("Expected Checkpoint statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_begin_transaction() {
+        let sql = "Begin;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Begin => {}
+            _ => panic!("Expected Begin statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_commit_transaction() {
+        let sql = "Commit;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::Commit => {}
+            _ => panic!("Expected Commit statement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rollback_transaction() {
+        let sql = "Rollback;";
+        let tokens = tokenize(sql).unwrap();
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse().unwrap();
+
+        match statement {
+            Statement::RollBack => {}
+            _ => panic!("Expected RollBack statement"),
         }
     }
 }
