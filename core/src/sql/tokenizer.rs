@@ -52,6 +52,11 @@ pub enum Token {
     // Special
     Eof, // End of input
     Checkpoint,
+
+    // Transaction
+    Begin,
+    Commit,
+    RollBack,
 }
 
 pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
@@ -197,6 +202,9 @@ pub fn tokenize(str: &str) -> io::Result<Vec<Token>> {
                     "PRIMARY" => Token::Primary,
                     "KEY" => Token::Key,
                     "CHECKPOINT" => Token::Checkpoint,
+                    "BEGIN" => Token::Begin,
+                    "COMMIT" => Token::Commit,
+                    "ROLLBACK" => Token::RollBack,
                     _ => Token::Identifier(word),
                 };
 
@@ -381,5 +389,25 @@ mod tests {
         let tokens = tokenize("checkpoint").unwrap();
 
         assert_eq!(tokens[0], Token::Checkpoint);
+    }
+
+    #[test]
+    fn test_tokenize_begin() {
+        let tokens = tokenize("begin").unwrap();
+
+        assert_eq!(tokens[0], Token::Begin);
+    }
+
+    #[test]
+    fn test_tokenize_commit() {
+        let tokens = tokenize("commit").unwrap();
+
+        assert_eq!(tokens[0], Token::Commit);
+    }
+    #[test]
+    fn test_tokenize_roll_back() {
+        let tokens = tokenize("rollback").unwrap();
+
+        assert_eq!(tokens[0], Token::RollBack);
     }
 }
