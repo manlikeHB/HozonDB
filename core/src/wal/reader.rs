@@ -54,7 +54,8 @@ impl WalReader {
         }
     }
 
-    pub fn recover(mut self, buffer_pool: &mut BufferPool) -> io::Result<()> {
+    pub fn recover(mut self, buffer_pool: &mut BufferPool) -> io::Result<u64> {
+        let mut last_txn_id = 0;
         // walk the records and re apply changes
         loop {
             let mut record_len_bytes = [0u8; 4];
@@ -76,6 +77,12 @@ impl WalReader {
             match record {
                 WalRecord::Checkpoint { .. } => {}
                 WalRecord::Slotted { record_type, .. } => {
+                    last_txn_id = record.txn_id().ok_or_else(|| {
+                        io::Error::new(
+                            ErrorKind::InvalidData,
+                            "Slotted WAL record type should contain a tnx_id",
+                        )
+                    })?;
                     match record_type {
                         WalRecordType::Insert => recover_insert(&record, buffer_pool)?,
                         WalRecordType::Update => recover_update(&record, buffer_pool)?,
@@ -83,11 +90,33 @@ impl WalReader {
                         _ => {} // other slotted types don't need recovery
                     }
                 }
-                WalRecord::Raw { .. } => replay_raw_page_new_data(&record, buffer_pool)?,
-                WalRecord::LinkPage { .. } => recover_page_link(&record, buffer_pool)?,
+                WalRecord::Raw { .. } => {
+                    last_txn_id = record.txn_id().ok_or_else(|| {
+                        io::Error::new(
+                            ErrorKind::InvalidData,
+                            "Raw WAL record type should contain a tnx_id",
+                        )
+                    })?;
+                    replay_raw_page_new_data(&record, buffer_pool)?
+                }
+                WalRecord::LinkPage { .. } => {
+                    last_txn_id = record.txn_id().ok_or_else(|| {
+                        io::Error::new(
+                            ErrorKind::InvalidData,
+                            "LinkPage WAL record type should contain a tnx_id",
+                        )
+                    })?;
+                    recover_page_link(&record, buffer_pool)?
+                }
                 WalRecord::AllocatePage {
                     page_id, page_type, ..
                 } => {
+                    last_txn_id = record.txn_id().ok_or_else(|| {
+                        io::Error::new(
+                            ErrorKind::InvalidData,
+                            "AllocatePage WAL record type should contain a tnx_id",
+                        )
+                    })?;
                     recover_allocate_page(page_id, page_type, buffer_pool)?;
                 }
             }
@@ -95,7 +124,7 @@ impl WalReader {
 
         // flush all replayed changes to disk
         buffer_pool.flush_dirty()?;
-        Ok(())
+        Ok(last_txn_id)
     }
 }
 
@@ -379,8 +408,16 @@ mod tests {
 
         let row_bytes = b"hello world";
 
-        wal.append_slotted(WalRecordType::Insert, "users", page_id, 0, row_bytes, &[])
-            .unwrap();
+        wal.append_slotted(
+            WalRecordType::Insert,
+            "users",
+            page_id,
+            0,
+            row_bytes,
+            &[],
+            24,
+        )
+        .unwrap();
 
         // no flush — simulates crash before checkpoint
         WalReader::new("test_rec_insert")
@@ -413,7 +450,15 @@ mod tests {
         let row_bytes = b"row data";
 
         let lsn = wal
-            .append_slotted(WalRecordType::Insert, "users", page_id, 0, row_bytes, &[])
+            .append_slotted(
+                WalRecordType::Insert,
+                "users",
+                page_id,
+                0,
+                row_bytes,
+                &[],
+                23,
+            )
             .unwrap();
 
         // apply insert to frame and flush — simulates insert + checkpoint
@@ -458,7 +503,15 @@ mod tests {
         let row_bytes = b"some row data";
 
         let insert_lsn = wal
-            .append_slotted(WalRecordType::Insert, "users", page_id, 0, row_bytes, &[])
+            .append_slotted(
+                WalRecordType::Insert,
+                "users",
+                page_id,
+                0,
+                row_bytes,
+                &[],
+                24,
+            )
             .unwrap();
 
         // apply insert to frame
@@ -480,8 +533,16 @@ mod tests {
         wal.checkpoint().unwrap();
 
         // log delete — what recovery will replay
-        wal.append_slotted(WalRecordType::Delete, "users", page_id, 0, &[], row_bytes)
-            .unwrap();
+        wal.append_slotted(
+            WalRecordType::Delete,
+            "users",
+            page_id,
+            0,
+            &[],
+            row_bytes,
+            24,
+        )
+        .unwrap();
 
         WalReader::new("test_rec_delete")
             .unwrap()
@@ -511,7 +572,15 @@ mod tests {
         let row_bytes = b"some row data";
 
         let insert_lsn = wal
-            .append_slotted(WalRecordType::Insert, "users", page_id, 0, row_bytes, &[])
+            .append_slotted(
+                WalRecordType::Insert,
+                "users",
+                page_id,
+                0,
+                row_bytes,
+                &[],
+                654,
+            )
             .unwrap();
 
         // apply insert
@@ -530,7 +599,15 @@ mod tests {
         };
 
         let delete_lsn = wal
-            .append_slotted(WalRecordType::Delete, "users", page_id, 0, &[], row_bytes)
+            .append_slotted(
+                WalRecordType::Delete,
+                "users",
+                page_id,
+                0,
+                &[],
+                row_bytes,
+                242,
+            )
             .unwrap();
 
         // apply delete to frame — simulates delete + checkpoint
@@ -574,7 +651,7 @@ mod tests {
         wal.checkpoint().unwrap();
 
         // log link page — what recovery will replay
-        wal.append_link_page(page_id, next_page_id).unwrap();
+        wal.append_link_page(page_id, next_page_id, 543).unwrap();
 
         // verify next_page is None before recovery
         let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
@@ -601,7 +678,7 @@ mod tests {
         let page_id = bp.allocate_slotted_page(&mut wal).unwrap();
         let next_page_id = bp.allocate_slotted_page(&mut wal).unwrap();
 
-        let lsn = wal.append_link_page(page_id, next_page_id).unwrap();
+        let lsn = wal.append_link_page(page_id, next_page_id, 432).unwrap();
 
         // apply link to frame — simulates link + checkpoint
         {
@@ -642,7 +719,7 @@ mod tests {
         new_page[OFFSET_RAW_PAGE_START + 1] = 0xAB;
 
         let old_page = bp.read_page(page_id).unwrap().clone();
-        wal.append_raw(WalRecordType::IndexNode, page_id, &new_page, &old_page)
+        wal.append_raw(WalRecordType::IndexNode, page_id, &new_page, &old_page, 87)
             .unwrap();
 
         // no flush — simulates crash
@@ -673,7 +750,7 @@ mod tests {
 
         let old_page = bp.read_page(page_id).unwrap().clone();
         let lsn = wal
-            .append_raw(WalRecordType::IndexNode, page_id, &new_page, &old_page)
+            .append_raw(WalRecordType::IndexNode, page_id, &new_page, &old_page, 234)
             .unwrap();
 
         // apply raw write to frame — simulates write + checkpoint

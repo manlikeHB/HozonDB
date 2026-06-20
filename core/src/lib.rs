@@ -5,6 +5,7 @@ pub mod index;
 pub mod proto;
 pub mod sql;
 pub mod storage;
+pub mod transaction;
 pub mod wal;
 
 #[cfg(test)]

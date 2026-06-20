@@ -114,6 +114,7 @@ pub fn insert_row_into_page(
     values: &[Value],
     metrics: &mut Option<QueryMetrics>,
 ) -> io::Result<(PageId, u16)> {
+    let txn_id = db.cur_txn_id()?;
     let (wal_writer, buffer_pool) = db.get_wal_and_buffer_pool();
 
     // Track page read
@@ -147,6 +148,7 @@ pub fn insert_row_into_page(
             last_page_meta.slot_count()?,
             &row_bytes,
             &vec![],
+            txn_id,
         )?;
         // write row to page data
         last_page_data[row_offset..row_offset + row_bytes.len()].copy_from_slice(&row_bytes);
@@ -192,6 +194,7 @@ pub fn insert_row_into_page(
             new_page_meta.slot_count()?,
             &row_bytes,
             &vec![],
+            txn_id,
         )?;
         // write row to page data
         new_page_data[row_offset..row_offset + row_bytes.len()].copy_from_slice(&row_bytes);
@@ -219,7 +222,7 @@ pub fn insert_row_into_page(
         }
 
         // Update the previous page's metadata to point to the new page
-        buffer_pool.update_next_page_in_page_metadata(last_page, new_page, wal_writer)?;
+        buffer_pool.update_next_page_in_page_metadata(last_page, new_page, wal_writer, txn_id)?;
 
         if let Some(m) = metrics.as_mut() {
             m.pages_dirtied.insert(last_page);

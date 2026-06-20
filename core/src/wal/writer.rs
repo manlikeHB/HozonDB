@@ -124,6 +124,7 @@ impl WalWriter {
         slot: u16,
         new_data: &[u8],
         old_data: &[u8],
+        txn_id: u64,
     ) -> io::Result<u64> {
         // read current lsn and increment
         let lsn = self.lsn;
@@ -138,6 +139,7 @@ impl WalWriter {
             slot,
             new_data,
             old_data,
+            txn_id,
         );
 
         self.append(&record)?;
@@ -150,13 +152,14 @@ impl WalWriter {
         page_id: PageId,
         new_data: &[u8],
         old_data: &[u8],
+        txn_id: u64,
     ) -> io::Result<u64> {
         // read current lsn and increment
         let lsn = self.lsn;
         self.lsn += 1;
 
         // create new record
-        let record = WalRecord::new_raw(lsn, record_type, page_id, new_data, old_data);
+        let record = WalRecord::new_raw(lsn, record_type, page_id, new_data, old_data, txn_id);
 
         self.append(&record)?;
         Ok(lsn)
@@ -174,21 +177,31 @@ impl WalWriter {
         Ok(lsn)
     }
 
-    pub fn append_link_page(&mut self, page_id: PageId, next_page: PageId) -> io::Result<u64> {
+    pub fn append_link_page(
+        &mut self,
+        page_id: PageId,
+        next_page: PageId,
+        txn_id: u64,
+    ) -> io::Result<u64> {
         // read current lsn and increment
         let lsn = self.lsn;
         self.lsn += 1;
 
         // create new record
-        let record = WalRecord::new_link_page(lsn, page_id, next_page);
+        let record = WalRecord::new_link_page(lsn, page_id, next_page, txn_id);
 
         self.append(&record)?;
         Ok(lsn)
     }
 
-    pub fn append_allocate_page(&mut self, page_id: PageId, page_type: u8) -> io::Result<u64> {
+    pub fn append_allocate_page(
+        &mut self,
+        page_id: PageId,
+        page_type: u8,
+        txn_id: u64,
+    ) -> io::Result<u64> {
         let lsn = self.lsn;
-        let record = WalRecord::new_allocate_page(lsn, page_id, page_type);
+        let record = WalRecord::new_allocate_page(lsn, page_id, page_type, txn_id);
         self.append(&record)?;
         self.lsn += 1;
         Ok(lsn)
@@ -254,7 +267,7 @@ mod tests {
         let _ = fs::remove_file("test_append.wal");
         let mut wal = WalWriter::new("test_append").unwrap();
         let lsn = wal
-            .append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[])
+            .append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[], 234)
             .unwrap();
         assert_eq!(lsn, 1);
         assert_eq!(wal.lsn, 2);
@@ -266,9 +279,9 @@ mod tests {
         let _ = fs::remove_file("test_lsn.wal");
         {
             let mut wal = WalWriter::new("test_lsn").unwrap();
-            wal.append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[])
+            wal.append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[], 6543)
                 .unwrap();
-            wal.append_slotted(WalRecordType::Insert, "users", 1, 1, b"data", &[])
+            wal.append_slotted(WalRecordType::Insert, "users", 1, 1, b"data", &[], 652)
                 .unwrap();
         }
         // reopen — should derive lsn = 3
@@ -292,7 +305,7 @@ mod tests {
     fn test_checkpoint_updates_header() {
         let _ = fs::remove_file("test_cp.wal");
         let mut wal = WalWriter::new("test_cp").unwrap();
-        wal.append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[])
+        wal.append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[], 234)
             .unwrap();
         let cp = wal.checkpoint().unwrap(); // checkpoint
         assert!(cp > WAL_RECORD_START as u64);
@@ -310,17 +323,25 @@ mod tests {
         {
             let mut wal = WalWriter::new("test_persist").unwrap();
             let lsn = wal
-                .append_slotted(WalRecordType::Insert, "users", 1, 0, b"alice", &[])
+                .append_slotted(WalRecordType::Insert, "users", 1, 0, b"alice", &[], 2345)
                 .unwrap();
             assert_eq!(lsn, 1);
 
             let lsn = wal
-                .append_slotted(WalRecordType::Insert, "users", 1, 1, b"bob", &[])
+                .append_slotted(WalRecordType::Insert, "users", 1, 1, b"bob", &[], 2345)
                 .unwrap();
             assert_eq!(lsn, 2);
 
             let lsn = wal
-                .append_slotted(WalRecordType::Update, "users", 1, 0, b"alice2", b"alice")
+                .append_slotted(
+                    WalRecordType::Update,
+                    "users",
+                    1,
+                    0,
+                    b"alice2",
+                    b"alice",
+                    7654,
+                )
                 .unwrap();
             assert_eq!(lsn, 3);
 
@@ -341,7 +362,7 @@ mod tests {
 
             // should still be able to append
             let lsn = wal
-                .append_slotted(WalRecordType::Delete, "users", 1, 1, &[], b"bob")
+                .append_slotted(WalRecordType::Delete, "users", 1, 1, &[], b"bob", 52)
                 .unwrap();
             assert_eq!(lsn, 4);
 
@@ -372,6 +393,7 @@ mod tests {
                 1,
                 b"new_page_data",
                 b"old_page_data",
+                212,
             )
             .unwrap();
 
@@ -387,13 +409,13 @@ mod tests {
         let mut wal = WalWriter::new("test_lsn_mixed").unwrap();
 
         let lsn1 = wal
-            .append_slotted(WalRecordType::Insert, "users", 1, 0, b"row", &[])
+            .append_slotted(WalRecordType::Insert, "users", 1, 0, b"row", &[], 654)
             .unwrap();
         let lsn2 = wal
-            .append_raw(WalRecordType::IndexNode, 2, b"node", b"old")
+            .append_raw(WalRecordType::IndexNode, 2, b"node", b"old", 86)
             .unwrap();
         let lsn3 = wal
-            .append_slotted(WalRecordType::Delete, "users", 1, 0, &[], b"row")
+            .append_slotted(WalRecordType::Delete, "users", 1, 0, &[], b"row", 124)
             .unwrap();
 
         assert_eq!(lsn1, 1);
@@ -409,11 +431,11 @@ mod tests {
         let _ = fs::remove_file("test_multi_cp.wal");
         let mut wal = WalWriter::new("test_multi_cp").unwrap();
 
-        wal.append_slotted(WalRecordType::Insert, "t", 1, 0, b"a", &[])
+        wal.append_slotted(WalRecordType::Insert, "t", 1, 0, b"a", &[], 876)
             .unwrap();
         let cp1 = wal.checkpoint().unwrap();
 
-        wal.append_slotted(WalRecordType::Insert, "t", 1, 1, b"b", &[])
+        wal.append_slotted(WalRecordType::Insert, "t", 1, 1, b"b", &[], 2345)
             .unwrap();
         let cp2 = wal.checkpoint().unwrap();
 
@@ -447,9 +469,9 @@ mod tests {
 
         {
             let mut wal = WalWriter::new("test_raw_persist").unwrap();
-            wal.append_raw(WalRecordType::IndexNode, 5, b"new", b"old")
+            wal.append_raw(WalRecordType::IndexNode, 5, b"new", b"old", 8234)
                 .unwrap();
-            wal.append_raw(WalRecordType::CreateTable, 1, b"catalog", &[])
+            wal.append_raw(WalRecordType::CreateTable, 1, b"catalog", &[], 6543)
                 .unwrap();
         }
 
@@ -466,7 +488,7 @@ mod tests {
         let _ = fs::remove_file("test_link_page.wal");
         let mut wal = WalWriter::new("test_link_page").unwrap();
 
-        let lsn = wal.append_link_page(3, 7).unwrap(); // page_id=3, next_page=7
+        let lsn = wal.append_link_page(3, 7, 234).unwrap(); // page_id=3, next_page=7
         assert_eq!(lsn, 1);
         assert_eq!(wal.lsn, 2);
 
@@ -479,11 +501,11 @@ mod tests {
         let mut wal = WalWriter::new("test_link_lsn").unwrap();
 
         let lsn1 = wal
-            .append_slotted(WalRecordType::Insert, "users", 3, 0, b"row", &[])
+            .append_slotted(WalRecordType::Insert, "users", 3, 0, b"row", &[], 234)
             .unwrap();
-        let lsn2 = wal.append_link_page(3, 4).unwrap();
+        let lsn2 = wal.append_link_page(3, 4, 6543).unwrap();
         let lsn3 = wal
-            .append_slotted(WalRecordType::Insert, "users", 4, 0, b"row2", &[])
+            .append_slotted(WalRecordType::Insert, "users", 4, 0, b"row2", &[], 6543)
             .unwrap();
 
         assert_eq!(lsn1, 1);
@@ -499,8 +521,8 @@ mod tests {
 
         {
             let mut wal = WalWriter::new("test_link_persist").unwrap();
-            wal.append_link_page(3, 4).unwrap();
-            wal.append_link_page(4, 5).unwrap();
+            wal.append_link_page(3, 4, 1234).unwrap();
+            wal.append_link_page(4, 5, 5421).unwrap();
         }
 
         {

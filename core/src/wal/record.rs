@@ -19,6 +19,7 @@ pub enum WalRecord {
         slot: u16,
         new_data: Vec<u8>,
         old_data: Vec<u8>,
+        txn_id: u64,
     },
     Raw {
         lsn: u64,
@@ -26,6 +27,7 @@ pub enum WalRecord {
         page_id: PageId,
         new_data: Vec<u8>,
         old_data: Vec<u8>,
+        txn_id: u64,
     },
     Checkpoint {
         lsn: u64,
@@ -34,11 +36,13 @@ pub enum WalRecord {
         lsn: u64,
         page_id: PageId,
         next_page: PageId,
+        txn_id: u64,
     },
     AllocatePage {
         lsn: u64,
         page_id: PageId,
         page_type: u8, // serialized as u8
+        txn_id: u64,
     },
 }
 
@@ -51,6 +55,7 @@ impl WalRecord {
         slot: u16,
         new_data: &[u8],
         old_data: &[u8],
+        txn_id: u64,
     ) -> Self {
         WalRecord::Slotted {
             lsn,
@@ -60,6 +65,7 @@ impl WalRecord {
             slot,
             new_data: new_data.to_vec(),
             old_data: old_data.to_vec(),
+            txn_id,
         }
     }
 
@@ -69,6 +75,7 @@ impl WalRecord {
         page_id: PageId,
         new_data: &[u8],
         old_data: &[u8],
+        txn_id: u64,
     ) -> Self {
         WalRecord::Raw {
             lsn,
@@ -76,6 +83,7 @@ impl WalRecord {
             page_id,
             new_data: new_data.to_vec(),
             old_data: old_data.to_vec(),
+            txn_id,
         }
     }
 
@@ -83,19 +91,21 @@ impl WalRecord {
         WalRecord::Checkpoint { lsn }
     }
 
-    pub fn new_link_page(lsn: u64, page_id: PageId, next_page: PageId) -> Self {
+    pub fn new_link_page(lsn: u64, page_id: PageId, next_page: PageId, txn_id: u64) -> Self {
         WalRecord::LinkPage {
             lsn,
             page_id,
             next_page,
+            txn_id,
         }
     }
 
-    pub fn new_allocate_page(lsn: u64, page_id: PageId, page_type: u8) -> Self {
+    pub fn new_allocate_page(lsn: u64, page_id: PageId, page_type: u8, txn_id: u64) -> Self {
         WalRecord::AllocatePage {
             lsn,
             page_id,
             page_type,
+            txn_id,
         }
     }
 
@@ -117,6 +127,7 @@ impl WalRecord {
                 slot,
                 new_data,
                 old_data,
+                txn_id,
             } => {
                 // add record type
                 buf.push(WAL_RECORD_SLOTTED_TYPE);
@@ -138,6 +149,8 @@ impl WalRecord {
                 // add old data (len + [u8])
                 buf.extend_from_slice(&(old_data.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&old_data);
+                // add txn_id
+                buf.extend_from_slice(&txn_id.to_le_bytes());
             }
             WalRecord::Raw {
                 lsn,
@@ -145,6 +158,7 @@ impl WalRecord {
                 page_id,
                 new_data,
                 old_data,
+                txn_id,
             } => {
                 // add record type
                 buf.push(WAL_RECORD_RAW_TYPE);
@@ -160,6 +174,8 @@ impl WalRecord {
                 // add old data (len + [u8])
                 buf.extend_from_slice(&(old_data.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&old_data);
+                // add txn_id
+                buf.extend_from_slice(&txn_id.to_le_bytes());
             }
             WalRecord::Checkpoint { lsn } => {
                 // add record type
@@ -171,6 +187,7 @@ impl WalRecord {
                 lsn,
                 page_id,
                 next_page,
+                txn_id,
             } => {
                 // add record type
                 buf.push(WAL_RECORD_LINK_PAGE_TYPE);
@@ -180,16 +197,21 @@ impl WalRecord {
                 buf.extend_from_slice(&page_id.to_le_bytes());
                 // add next page
                 buf.extend_from_slice(&next_page.to_le_bytes());
+                // add txn_id
+                buf.extend_from_slice(&txn_id.to_le_bytes());
             }
             WalRecord::AllocatePage {
                 lsn,
                 page_id,
                 page_type,
+                txn_id,
             } => {
                 buf.push(WAL_RECORD_ALLOCATE_PAGE_TYPE);
                 buf.extend_from_slice(&lsn.to_le_bytes());
                 buf.extend_from_slice(&page_id.to_le_bytes());
                 buf.push(*page_type);
+                // add txn_id
+                buf.extend_from_slice(&txn_id.to_le_bytes());
             }
         }
 
@@ -338,6 +360,24 @@ impl WalRecord {
                 let old_data = bytes[offset..offset + old_data_len].to_vec();
                 offset += old_data_len;
 
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for txn_id",
+                    ));
+                }
+                let txn_id = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
                 if bytes.len() < offset + 4 {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -360,6 +400,7 @@ impl WalRecord {
                     slot,
                     &new_data,
                     &old_data,
+                    txn_id,
                 );
 
                 (record, stored_checksum)
@@ -459,6 +500,24 @@ impl WalRecord {
                     ));
                 }
 
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for txn_id",
+                    ));
+                }
+                let txn_id = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
                 let stored_checksum = u32::from_le_bytes([
                     bytes[offset],
                     bytes[offset + 1],
@@ -466,7 +525,7 @@ impl WalRecord {
                     bytes[offset + 3],
                 ]);
 
-                let record = Self::new_raw(lsn, record_type, page_id, &new_data, &old_data);
+                let record = Self::new_raw(lsn, record_type, page_id, &new_data, &old_data, txn_id);
 
                 (record, stored_checksum)
             }
@@ -562,6 +621,24 @@ impl WalRecord {
                     ));
                 }
 
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for txn_id",
+                    ));
+                }
+                let txn_id = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
                 let stored_checksum = u32::from_le_bytes([
                     bytes[offset],
                     bytes[offset + 1],
@@ -569,17 +646,60 @@ impl WalRecord {
                     bytes[offset + 3],
                 ]);
 
-                let record = Self::new_link_page(lsn, page_id, next_page);
+                let record = Self::new_link_page(lsn, page_id, next_page, txn_id);
 
                 (record, stored_checksum)
             }
             WAL_RECORD_ALLOCATE_PAGE_TYPE => {
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for lsn",
+                    ));
+                }
+
                 let lsn = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
                 offset += 8;
+
+                if bytes.len() < offset + 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for page id",
+                    ));
+                }
+
                 let page_id = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
                 offset += 4;
+
+                if bytes.len() < offset + 1 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for page type",
+                    ));
+                }
+
                 let page_type = bytes[offset];
                 offset += 1;
+
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for txn_id",
+                    ));
+                }
+
+                let txn_id = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
                 let stored_checksum =
                     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
                 (
@@ -587,6 +707,7 @@ impl WalRecord {
                         lsn,
                         page_id,
                         page_type,
+                        txn_id,
                     },
                     stored_checksum,
                 )
@@ -685,6 +806,16 @@ impl WalRecord {
             _ => None,
         }
     }
+
+    pub fn txn_id(&self) -> Option<u64> {
+        match self {
+            WalRecord::Slotted { txn_id, .. } => Some(*txn_id),
+            WalRecord::Raw { txn_id, .. } => Some(*txn_id),
+            WalRecord::Checkpoint { .. } => None,
+            WalRecord::LinkPage { txn_id, .. } => Some(*txn_id),
+            WalRecord::AllocatePage { txn_id, .. } => Some(*txn_id),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -703,6 +834,7 @@ mod tests {
             17,
             new_data,
             old_data,
+            25,
         );
 
         let record_bytes = record.to_bytes();
@@ -711,14 +843,15 @@ mod tests {
 
     #[test]
     fn test_wal_record_serialization_empty_data_slotted() {
-        let record = WalRecord::new_slotted(0, WalRecordType::Checkpoint, "", 0, 0, &[], &[]);
+        let record = WalRecord::new_slotted(0, WalRecordType::Checkpoint, "", 0, 0, &[], &[], 25);
         let bytes = record.to_bytes();
         assert_eq!(WalRecord::from_bytes(&bytes).unwrap(), record);
     }
 
     #[test]
     fn test_wal_record_checksum_mismatch_slotted() {
-        let record = WalRecord::new_slotted(1, WalRecordType::Insert, "users", 5, 0, b"data", &[]);
+        let record =
+            WalRecord::new_slotted(1, WalRecordType::Insert, "users", 5, 0, b"data", &[], 16);
         let mut bytes = record.to_bytes();
         // corrupt a byte in the middle
         bytes[4] ^= 0xFF;
@@ -727,7 +860,8 @@ mod tests {
 
     #[test]
     fn test_wal_record_truncated_input_slotted() {
-        let record = WalRecord::new_slotted(1, WalRecordType::Insert, "users", 5, 0, b"data", &[]);
+        let record =
+            WalRecord::new_slotted(1, WalRecordType::Insert, "users", 5, 0, b"data", &[], 13);
         let bytes = record.to_bytes();
         // try every truncation length
         for len in 0..bytes.len() {
@@ -748,7 +882,7 @@ mod tests {
             WalRecordType::Checkpoint,
         ];
         for rt in types {
-            let record = WalRecord::new_slotted(1, rt, "t", 1, 0, b"new", b"old");
+            let record = WalRecord::new_slotted(1, rt, "t", 1, 0, b"new", b"old", 14);
             let bytes = record.to_bytes();
             assert_eq!(WalRecord::from_bytes(&bytes).unwrap(), record);
         }
@@ -756,7 +890,8 @@ mod tests {
 
     #[test]
     fn test_write_to_non_empty_buffer_slotted() {
-        let record = WalRecord::new_slotted(1, WalRecordType::Insert, "users", 1, 0, b"data", &[]);
+        let record =
+            WalRecord::new_slotted(1, WalRecordType::Insert, "users", 1, 0, b"data", &[], 89);
         let mut buf = vec![0xAAu8; 10]; // pre-existing data
         record.write_to(&mut buf);
         // the appended record should deserialize correctly
@@ -767,14 +902,14 @@ mod tests {
 
     #[test]
     fn test_wal_record_serialization_link_page() {
-        let record = WalRecord::new_link_page(5, 3, 7); // lsn=5, page_id=3, next_page=7
+        let record = WalRecord::new_link_page(5, 3, 7, 345); // lsn=5, page_id=3, next_page=7
         let bytes = record.to_bytes();
         assert_eq!(WalRecord::from_bytes(&bytes).unwrap(), record);
     }
 
     #[test]
     fn test_wal_record_link_page_accessors() {
-        let record = WalRecord::new_link_page(1, 4, 9);
+        let record = WalRecord::new_link_page(1, 4, 9, 2445);
         assert_eq!(record.lsn(), 1);
         assert_eq!(record.page_id(), Some(4));
         assert_eq!(record.next_page(), Some(9));
@@ -785,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_wal_record_link_page_checksum_mismatch() {
-        let record = WalRecord::new_link_page(1, 3, 7);
+        let record = WalRecord::new_link_page(1, 3, 7, 6542);
         let mut bytes = record.to_bytes();
         bytes[4] ^= 0xFF; // corrupt a byte
         assert!(WalRecord::from_bytes(&bytes).is_err());
@@ -793,7 +928,7 @@ mod tests {
 
     #[test]
     fn test_wal_record_link_page_truncated() {
-        let record = WalRecord::new_link_page(1, 3, 7);
+        let record = WalRecord::new_link_page(1, 3, 7, 346);
         let bytes = record.to_bytes();
         for len in 0..bytes.len() {
             assert!(WalRecord::from_bytes(&bytes[..len]).is_err());
@@ -814,15 +949,21 @@ mod tests {
 
     #[test]
     fn test_wal_record_serialization_raw() {
-        let record =
-            WalRecord::new_raw(10, WalRecordType::IndexNode, 5, &[0u8; 4096], &[1u8; 4096]);
+        let record = WalRecord::new_raw(
+            10,
+            WalRecordType::IndexNode,
+            5,
+            &[0u8; 4096],
+            &[1u8; 4096],
+            643,
+        );
         let bytes = record.to_bytes();
         assert_eq!(WalRecord::from_bytes(&bytes).unwrap(), record);
     }
 
     #[test]
     fn test_wal_record_raw_checksum_mismatch() {
-        let record = WalRecord::new_raw(1, WalRecordType::IndexNode, 3, b"new", b"old");
+        let record = WalRecord::new_raw(1, WalRecordType::IndexNode, 3, b"new", b"old", 234);
         let mut bytes = record.to_bytes();
         bytes[4] ^= 0xFF;
         assert!(WalRecord::from_bytes(&bytes).is_err());
@@ -830,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_wal_record_raw_truncated() {
-        let record = WalRecord::new_raw(1, WalRecordType::CreateTable, 1, b"data", &[]);
+        let record = WalRecord::new_raw(1, WalRecordType::CreateTable, 1, b"data", &[], 7543);
         let bytes = record.to_bytes();
         for len in 0..bytes.len() {
             assert!(WalRecord::from_bytes(&bytes[..len]).is_err());

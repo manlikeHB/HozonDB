@@ -90,6 +90,7 @@ impl IndexCatalog {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         entry: IndexEntry,
+        txn_id: u64,
     ) -> io::Result<()> {
         let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
@@ -121,6 +122,7 @@ impl IndexCatalog {
             constants::INDEX_CATALOG_PAGE_ID,
             &new_page,
             old_data,
+            txn_id,
         )?;
 
         self.save(buffer_pool, &new_page, lsn)?;
@@ -158,6 +160,7 @@ impl IndexCatalog {
         index_name: &str,
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
+        txn_id: u64,
     ) -> io::Result<()> {
         let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
@@ -191,6 +194,7 @@ impl IndexCatalog {
             constants::INDEX_CATALOG_PAGE_ID,
             &new_page,
             old_data,
+            txn_id,
         )?;
 
         self.save(buffer_pool, &new_page, lsn)?;
@@ -206,6 +210,7 @@ impl IndexCatalog {
         table_name: &str,
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
+        txn_id: u64,
     ) -> io::Result<()> {
         let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
@@ -234,6 +239,7 @@ impl IndexCatalog {
             constants::INDEX_CATALOG_PAGE_ID,
             &new_page,
             old_data,
+            txn_id,
         )?;
 
         self.save(buffer_pool, &new_page, lsn)?;
@@ -263,6 +269,8 @@ mod tests {
         (ic, buffer_pool, wal_writer)
     }
 
+    const TEST_TXN_ID: u64 = 1;
+
     #[test]
     fn test_new_index_catalog() {
         cleanup("test_new_index_catalog");
@@ -288,7 +296,7 @@ mod tests {
             true,
             99,
         );
-        ic.add_index(&mut bp, &mut ww, index).unwrap();
+        ic.add_index(&mut bp, &mut ww, index, TEST_TXN_ID).unwrap();
 
         let indexes = ic.get_indexes_for_table("users");
         assert!(indexes.is_some());
@@ -318,8 +326,10 @@ mod tests {
             true,
             98,
         );
-        ic.add_index(&mut bp, &mut ww, users_index).unwrap();
-        ic.add_index(&mut bp, &mut ww, orders_index).unwrap();
+        ic.add_index(&mut bp, &mut ww, users_index, TEST_TXN_ID)
+            .unwrap();
+        ic.add_index(&mut bp, &mut ww, orders_index, TEST_TXN_ID)
+            .unwrap();
 
         let users_indexes = ic.get_indexes_for_table("users");
         let orders_indexes = ic.get_indexes_for_table("orders");
@@ -353,8 +363,10 @@ mod tests {
             99,
         );
 
-        ic.add_index(&mut bp, &mut ww, index_1).unwrap();
-        ic.add_index(&mut bp, &mut ww, index_2).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_1, TEST_TXN_ID)
+            .unwrap();
+        ic.add_index(&mut bp, &mut ww, index_2, TEST_TXN_ID)
+            .unwrap();
 
         let primary = ic.get_primary_index("users");
         assert!(primary.is_some());
@@ -377,7 +389,7 @@ mod tests {
             99,
         );
 
-        ic.add_index(&mut bp, &mut ww, index).unwrap();
+        ic.add_index(&mut bp, &mut ww, index, TEST_TXN_ID).unwrap();
 
         assert!(ic.get_primary_index("users").is_none());
         cleanup("test_get_primary_index_none");
@@ -398,8 +410,8 @@ mod tests {
             99,
         );
 
-        ic.add_index(&mut bp, &mut ww, index).unwrap();
-        ic.remove_index("users", "idx_users_id", &mut bp, &mut ww)
+        ic.add_index(&mut bp, &mut ww, index, TEST_TXN_ID).unwrap();
+        ic.remove_index("users", "idx_users_id", &mut bp, &mut ww, TEST_TXN_ID)
             .unwrap();
 
         let indexes = ic.get_indexes_for_table("users");
@@ -430,8 +442,10 @@ mod tests {
                 false,
                 98,
             );
-            ic.add_index(&mut bp, &mut ww, index_1).unwrap();
-            ic.add_index(&mut bp, &mut ww, index_2).unwrap();
+            ic.add_index(&mut bp, &mut ww, index_1, TEST_TXN_ID)
+                .unwrap();
+            ic.add_index(&mut bp, &mut ww, index_2, TEST_TXN_ID)
+                .unwrap();
 
             let indexes = ic.get_indexes_for_table("users");
             assert!(indexes.is_some());
@@ -472,10 +486,13 @@ mod tests {
             98,
         );
 
-        ic.add_index(&mut bp, &mut ww, index_1).unwrap();
-        ic.add_index(&mut bp, &mut ww, index_2).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_1, TEST_TXN_ID)
+            .unwrap();
+        ic.add_index(&mut bp, &mut ww, index_2, TEST_TXN_ID)
+            .unwrap();
 
-        ic.remove_table_indexes("users", &mut bp, &mut ww).unwrap();
+        ic.remove_table_indexes("users", &mut bp, &mut ww, TEST_TXN_ID)
+            .unwrap();
 
         let indexes = ic.get_indexes_for_table("users");
         assert!(indexes.is_none());
@@ -513,9 +530,12 @@ mod tests {
             97,
         );
 
-        ic.add_index(&mut bp, &mut ww, index_1).unwrap();
-        ic.add_index(&mut bp, &mut ww, index_2).unwrap();
-        ic.add_index(&mut bp, &mut ww, index_3).unwrap();
+        ic.add_index(&mut bp, &mut ww, index_1, TEST_TXN_ID)
+            .unwrap();
+        ic.add_index(&mut bp, &mut ww, index_2, TEST_TXN_ID)
+            .unwrap();
+        ic.add_index(&mut bp, &mut ww, index_3, TEST_TXN_ID)
+            .unwrap();
 
         assert_eq!(ic.total_count(), ic.all_indexes().len());
 

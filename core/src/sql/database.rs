@@ -17,6 +17,7 @@ use crate::{
         buffer_pool::BufferPool,
         page::{PAGE_SIZE, PageManager, PageMetadata, PageType},
     },
+    transaction::Txn,
     wal::{reader::WalReader, record_type::WalRecordType, writer::WalWriter},
 };
 
@@ -26,6 +27,10 @@ pub struct Database {
     indexes: HashMap<String, BPlusTree>, // index name -> B+ tree
     buffer_pool: BufferPool,
     wal_writer: WalWriter,
+    // represents the current transaction
+    // HozonDB is single threaded so there could only be an instance of a Txn at a time
+    txn: Option<Txn>,
+    next_txn_id: u64,
 }
 
 impl Database {
@@ -52,10 +57,11 @@ impl Database {
     pub fn with_capacity(db_name: &str, capacity: usize) -> io::Result<Self> {
         let page_manager = PageManager::new(db_name)?;
         let mut buffer_pool = BufferPool::new(page_manager, capacity);
+        let mut txn_id = 0;
 
         // recover FIRST — before anything reads from buffer pool
         if Path::new(&format!("{}.wal", db_name)).exists() {
-            WalReader::new(db_name)?.recover(&mut buffer_pool)?;
+            txn_id = WalReader::new(db_name)?.recover(&mut buffer_pool)?;
         }
 
         let mut wal_writer = WalWriter::new(db_name)?;
@@ -77,6 +83,8 @@ impl Database {
             indexes,
             buffer_pool,
             wal_writer,
+            txn: None,
+            next_txn_id: txn_id + 1,
         })
     }
 
@@ -102,7 +110,9 @@ impl Database {
     }
 
     pub fn free_page(&mut self, page_id: PageId) -> io::Result<()> {
-        self.buffer_pool.free_page(page_id, &mut self.wal_writer)
+        let txn_id = self.cur_txn_id()?;
+        self.buffer_pool
+            .free_page(page_id, &mut self.wal_writer, txn_id)
     }
 
     pub fn is_page_cached(&self, page_id: PageId) -> bool {
@@ -111,10 +121,12 @@ impl Database {
 
     // table catalog
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
+        let txn_id = self.cur_txn_id()?;
         self.table_catalog.create_table(
             schema.clone(),
             &mut self.buffer_pool,
             &mut self.wal_writer,
+            txn_id,
         )?;
 
         if let Some(pk_col) = schema.columns().iter().find(|c| c.is_primary_key()) {
@@ -123,6 +135,7 @@ impl Database {
                 column_type.order(),
                 &mut self.buffer_pool,
                 &mut self.wal_writer,
+                txn_id,
             )?;
             let root_page_id = btree.root().ok_or_else(|| {
                 return Error::new(ErrorKind::InvalidData, "b+ tree root page id not set");
@@ -182,12 +195,19 @@ impl Database {
         let page_chain = helpers::collect_page_chain(&mut self.buffer_pool, first_page)?;
 
         // remove catalog entry
-        self.table_catalog
-            .drop_table(table_name, &mut self.buffer_pool, &mut self.wal_writer)?;
+        let txn_id = self.cur_txn_id()?;
+        self.table_catalog.drop_table(
+            table_name,
+            &mut self.buffer_pool,
+            &mut self.wal_writer,
+            txn_id,
+        )?;
 
         // free pages
+        let txn_id = self.cur_txn_id()?;
         for page_id in page_chain {
-            self.buffer_pool.free_page(page_id, &mut self.wal_writer)?;
+            self.buffer_pool
+                .free_page(page_id, &mut self.wal_writer, txn_id)?;
         }
 
         // drop indexes
@@ -201,8 +221,9 @@ impl Database {
         let btree = BPlusTree::load(entry.root_page_id(), entry.column_type().order());
         let index_name = entry.index_name().to_owned();
 
+        let txn_id = self.cur_txn_id()?;
         self.index_catalog
-            .add_index(&mut self.buffer_pool, &mut self.wal_writer, entry)?;
+            .add_index(&mut self.buffer_pool, &mut self.wal_writer, entry, txn_id)?;
         self.indexes.insert(index_name, btree);
 
         Ok(())
@@ -217,11 +238,14 @@ impl Database {
     }
 
     pub fn remove_index(&mut self, table_name: &str, index_name: &str) -> io::Result<()> {
+        let txn_id = self.cur_txn_id()?;
+
         self.index_catalog.remove_index(
             table_name,
             index_name,
             &mut self.buffer_pool,
             &mut self.wal_writer,
+            txn_id,
         )
     }
 
@@ -230,10 +254,12 @@ impl Database {
     }
 
     pub fn drop_table_indexes(&mut self, table_name: &str) -> io::Result<()> {
+        let txn_id = self.cur_txn_id()?;
         self.index_catalog.remove_table_indexes(
             table_name,
             &mut self.buffer_pool,
             &mut self.wal_writer,
+            txn_id,
         )
     }
 
@@ -242,11 +268,13 @@ impl Database {
     }
 
     pub fn update_table_last_page(&mut self, table_name: &str, page_id: PageId) -> io::Result<()> {
+        let txn_id = self.cur_txn_id()?;
         self.table_catalog.update_last_page(
             table_name,
             page_id,
             &mut self.buffer_pool,
             &mut self.wal_writer,
+            txn_id,
         )
     }
 
@@ -257,6 +285,7 @@ impl Database {
         key: IndexKey,
         row_location: RowLocation,
     ) -> io::Result<()> {
+        let txn_id = self.cur_txn_id()?;
         let btree = self.indexes.get_mut(index_name).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -269,6 +298,7 @@ impl Database {
             row_location,
             &mut self.buffer_pool,
             &mut self.wal_writer,
+            txn_id,
         )
     }
 
@@ -289,11 +319,14 @@ impl Database {
     }
 
     pub fn delete_from_index(&mut self, index_name: &str, key: &IndexKey) -> io::Result<()> {
+        let txn_id = self.cur_txn_id()?;
+
         let btree = self
             .indexes
             .get_mut(index_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
-        btree.delete(key, &mut self.buffer_pool, &mut self.wal_writer)
+
+        btree.delete(key, &mut self.buffer_pool, &mut self.wal_writer, txn_id)
     }
 
     pub fn range_index_scan(
@@ -345,6 +378,7 @@ impl Database {
         new_data: &[u8],
         old_data: &[u8],
     ) -> io::Result<u64> {
+        let txn_id = self.cur_txn_id()?;
         Ok(self.wal_writer.append_slotted(
             record_type,
             table_name,
@@ -352,6 +386,7 @@ impl Database {
             slot,
             new_data,
             old_data,
+            txn_id,
         )?)
     }
 
@@ -362,8 +397,25 @@ impl Database {
         new_data: &[u8],
         old_data: &[u8],
     ) -> io::Result<u64> {
+        let txn_id = self.cur_txn_id()?;
         Ok(self
             .wal_writer
-            .append_raw(record_type, page_id, new_data, old_data)?)
+            .append_raw(record_type, page_id, new_data, old_data, txn_id)?)
+    }
+
+    pub fn next_txn_id(&mut self) -> u64 {
+        let txn_id = self.next_txn_id;
+        self.next_txn_id += 1;
+        txn_id
+    }
+
+    pub fn cur_txn_id(&self) -> io::Result<u64> {
+        match &self.txn {
+            Some(txn) => Ok(txn.id()),
+            None => Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "No active transaction",
+            )),
+        }
     }
 }

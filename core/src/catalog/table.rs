@@ -131,6 +131,7 @@ impl TableCatalog {
         schema: Schema,
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
+        txn_id: u64,
     ) -> io::Result<()> {
         let first_page = buffer_pool.allocate_slotted_page(wal_writer)?;
 
@@ -159,6 +160,7 @@ impl TableCatalog {
             constants::TABLE_CATALOG_PAGE_ID,
             &new_data,
             old_data,
+            txn_id,
         )?;
 
         self.save(buffer_pool, &new_data, lsn)?;
@@ -208,6 +210,7 @@ impl TableCatalog {
         name: &str,
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
+        txn_id: u64,
     ) -> io::Result<()> {
         match self.tables.remove(name) {
             Some(_) => {
@@ -227,6 +230,7 @@ impl TableCatalog {
                     constants::TABLE_CATALOG_PAGE_ID,
                     &new_data,
                     old_data,
+                    txn_id,
                 )?;
 
                 self.save(buffer_pool, &new_data, lsn)?;
@@ -247,6 +251,7 @@ impl TableCatalog {
         page_id: PageId,
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
+        txn_id: u64,
     ) -> io::Result<()> {
         if let Some(meta) = self.tables.get_mut(table_name) {
             meta.update_last_page(page_id);
@@ -268,6 +273,7 @@ impl TableCatalog {
             constants::TABLE_CATALOG_PAGE_ID,
             &new_data,
             old_data,
+            txn_id,
         )?;
 
         self.save(buffer_pool, &new_data, lsn)?;
@@ -296,6 +302,8 @@ mod tests {
         (catalog, buffer_pool, wal_writer)
     }
 
+    const TEST_TXN_ID: u64 = 1;
+
     #[test]
     fn test_new_catalog_empty() {
         cleanup("test_new_catalog");
@@ -322,7 +330,8 @@ mod tests {
         )
         .unwrap();
 
-        tc.create_table(schema, &mut bp, &mut ww).unwrap();
+        tc.create_table(schema, &mut bp, &mut ww, TEST_TXN_ID)
+            .unwrap();
 
         assert_eq!(tc.tables.len(), 1);
         assert!(tc.tables.contains_key("users"));
@@ -342,7 +351,8 @@ mod tests {
         // Create first table
         let users_schema =
             Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap();
-        tc.create_table(users_schema, &mut bp, &mut ww).unwrap();
+        tc.create_table(users_schema, &mut bp, &mut ww, TEST_TXN_ID)
+            .unwrap();
 
         // Create second table
         let orders_schema = Schema::new(
@@ -353,7 +363,8 @@ mod tests {
             ],
         )
         .unwrap();
-        tc.create_table(orders_schema, &mut bp, &mut ww).unwrap();
+        tc.create_table(orders_schema, &mut bp, &mut ww, TEST_TXN_ID)
+            .unwrap();
 
         assert_eq!(tc.tables.len(), 2);
         assert!(tc.tables.contains_key("users"));
@@ -379,7 +390,8 @@ mod tests {
             )
             .unwrap();
 
-            tc.create_table(schema, &mut bp, &mut ww).unwrap();
+            tc.create_table(schema, &mut bp, &mut ww, TEST_TXN_ID)
+                .unwrap();
             assert_eq!(tc.tables.len(), 1);
             bp.flush_dirty().unwrap();
         } // catalog dropped, file closed
@@ -411,6 +423,7 @@ mod tests {
                 Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
                 &mut bp,
                 &mut ww,
+                TEST_TXN_ID,
             )
             .unwrap();
 
@@ -425,6 +438,7 @@ mod tests {
                 .unwrap(),
                 &mut bp,
                 &mut ww,
+                TEST_TXN_ID,
             )
             .unwrap();
 
@@ -439,6 +453,7 @@ mod tests {
                 .unwrap(),
                 &mut bp,
                 &mut ww,
+                TEST_TXN_ID,
             )
             .unwrap();
             bp.flush_dirty().unwrap();
@@ -480,6 +495,7 @@ mod tests {
             Schema::new("users", vec![Column::new("id", DataType::Integer, true)]).unwrap(),
             &mut bp,
             &mut ww,
+            TEST_TXN_ID,
         )
         .unwrap();
 
@@ -491,6 +507,7 @@ mod tests {
             Schema::new("orders", vec![Column::new("id", DataType::Integer, false)]).unwrap(),
             &mut bp,
             &mut ww,
+            TEST_TXN_ID,
         )
         .unwrap();
 
@@ -517,7 +534,8 @@ mod tests {
         )
         .unwrap();
 
-        tc.create_table(schema, &mut bp, &mut ww).unwrap();
+        tc.create_table(schema, &mut bp, &mut ww, TEST_TXN_ID)
+            .unwrap();
         bp.flush_dirty().unwrap();
 
         // Reload and verify
@@ -540,7 +558,8 @@ mod tests {
         let schema = Schema::new("", vec![Column::new("id", DataType::Integer, true)]).unwrap();
 
         // Should still work (validation not implemented yet)
-        tc.create_table(schema, &mut bp, &mut ww).unwrap();
+        tc.create_table(schema, &mut bp, &mut ww, TEST_TXN_ID)
+            .unwrap();
         assert!(tc.tables.contains_key(""));
 
         cleanup("test_empty_name");
@@ -559,7 +578,8 @@ mod tests {
         )
         .unwrap();
 
-        tc.create_table(schema, &mut bp, &mut ww).unwrap();
+        tc.create_table(schema, &mut bp, &mut ww, TEST_TXN_ID)
+            .unwrap();
         bp.flush_dirty().unwrap();
 
         // Reload and verify
@@ -580,7 +600,8 @@ mod tests {
 
         let schema =
             Schema::new("users", vec![Column::new("id", DataType::Integer, false)]).unwrap();
-        tc.create_table(schema, &mut bp, &mut ww).unwrap();
+        tc.create_table(schema, &mut bp, &mut ww, TEST_TXN_ID)
+            .unwrap();
 
         let result = tc.get_table("users");
         assert!(result.is_some());
@@ -606,12 +627,27 @@ mod tests {
 
         let (mut tc, mut bp, mut ww) = setup("test_list");
 
-        tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
-            .unwrap();
-        tc.create_table(Schema::new("orders", vec![]).unwrap(), &mut bp, &mut ww)
-            .unwrap();
-        tc.create_table(Schema::new("products", vec![]).unwrap(), &mut bp, &mut ww)
-            .unwrap();
+        tc.create_table(
+            Schema::new("users", vec![]).unwrap(),
+            &mut bp,
+            &mut ww,
+            TEST_TXN_ID,
+        )
+        .unwrap();
+        tc.create_table(
+            Schema::new("orders", vec![]).unwrap(),
+            &mut bp,
+            &mut ww,
+            TEST_TXN_ID,
+        )
+        .unwrap();
+        tc.create_table(
+            Schema::new("products", vec![]).unwrap(),
+            &mut bp,
+            &mut ww,
+            TEST_TXN_ID,
+        )
+        .unwrap();
 
         let tables = tc.list_tables();
         assert_eq!(tables.len(), 3);
@@ -628,14 +664,25 @@ mod tests {
 
         let (mut tc, mut bp, mut ww) = setup("test_drop");
 
-        tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
-            .unwrap();
-        tc.create_table(Schema::new("orders", vec![]).unwrap(), &mut bp, &mut ww)
-            .unwrap();
+        tc.create_table(
+            Schema::new("users", vec![]).unwrap(),
+            &mut bp,
+            &mut ww,
+            TEST_TXN_ID,
+        )
+        .unwrap();
+        tc.create_table(
+            Schema::new("orders", vec![]).unwrap(),
+            &mut bp,
+            &mut ww,
+            TEST_TXN_ID,
+        )
+        .unwrap();
 
         assert_eq!(tc.tables.len(), 2);
 
-        tc.drop_table("users", &mut bp, &mut ww).unwrap();
+        tc.drop_table("users", &mut bp, &mut ww, TEST_TXN_ID)
+            .unwrap();
 
         assert_eq!(tc.tables.len(), 1);
         assert!(tc.get_table("users").is_none());
@@ -651,11 +698,22 @@ mod tests {
         {
             let (mut tc, mut bp, mut ww) = setup("test_drop_persist");
 
-            tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
+            tc.create_table(
+                Schema::new("users", vec![]).unwrap(),
+                &mut bp,
+                &mut ww,
+                TEST_TXN_ID,
+            )
+            .unwrap();
+            tc.create_table(
+                Schema::new("orders", vec![]).unwrap(),
+                &mut bp,
+                &mut ww,
+                TEST_TXN_ID,
+            )
+            .unwrap();
+            tc.drop_table("users", &mut bp, &mut ww, TEST_TXN_ID)
                 .unwrap();
-            tc.create_table(Schema::new("orders", vec![]).unwrap(), &mut bp, &mut ww)
-                .unwrap();
-            tc.drop_table("users", &mut bp, &mut ww).unwrap();
             bp.flush_dirty().unwrap();
         }
 
@@ -677,7 +735,7 @@ mod tests {
 
         let (mut tc, mut bp, mut ww) = setup("test_drop_none");
 
-        let result = tc.drop_table("nonexistent", &mut bp, &mut ww);
+        let result = tc.drop_table("nonexistent", &mut bp, &mut ww, TEST_TXN_ID);
         assert!(result.is_err()); // Should return error
 
         cleanup("test_drop_none");
@@ -690,8 +748,13 @@ mod tests {
         {
             let (mut tc, mut bp, mut ww) = setup("test_table_first_and_last_name_persists");
 
-            tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
-                .unwrap();
+            tc.create_table(
+                Schema::new("users", vec![]).unwrap(),
+                &mut bp,
+                &mut ww,
+                TEST_TXN_ID,
+            )
+            .unwrap();
 
             let table_meta = tc.tables.get("users").unwrap();
             assert_eq!(table_meta.first_page(), table_meta.last_page());
@@ -717,14 +780,19 @@ mod tests {
         {
             let (mut tc, mut bp, mut ww) = setup("test_update_table_last_page");
 
-            tc.create_table(Schema::new("users", vec![]).unwrap(), &mut bp, &mut ww)
-                .unwrap();
+            tc.create_table(
+                Schema::new("users", vec![]).unwrap(),
+                &mut bp,
+                &mut ww,
+                TEST_TXN_ID,
+            )
+            .unwrap();
 
             let table_meta = tc.tables.get("users").unwrap();
             assert_eq!(table_meta.first_page(), table_meta.last_page());
 
             // update last page
-            tc.update_last_page("users", new_last_page, &mut bp, &mut ww)
+            tc.update_last_page("users", new_last_page, &mut bp, &mut ww, TEST_TXN_ID)
                 .unwrap();
             assert_eq!(tc.get_last_page("users").unwrap(), new_last_page);
             bp.flush_dirty().unwrap();
