@@ -220,6 +220,10 @@ impl WalWriter {
         record_data.extend_from_slice(&record_byte);
 
         self.file.write_all(&record_data)?;
+        Ok(())
+    }
+
+    pub fn sync(&mut self) -> io::Result<()> {
         self.file.sync_all()?;
         Ok(())
     }

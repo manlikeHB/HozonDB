@@ -43,9 +43,25 @@ impl Executor {
         let start = std::time::Instant::now();
 
         let result = match statement {
-            Statement::CreateTable { name, columns } => execute_create(self, name, columns),
+            Statement::CreateTable { name, columns } => {
+                // begin an implicit transaction if no active transaction
+                self.database.begin_implicit_txn()?;
+                let res = execute_create(self, name, columns);
+                // Commit an implicit transaction
+                if self.database.is_txn_implicit()? {
+                    self.database.commit_txn()?;
+                }
+                res
+            }
             Statement::Insert { table_name, values } => {
-                execute_insert(&mut self.database, table_name, values, metrics)
+                // begin an implicit transaction if no active transaction
+                self.database.begin_implicit_txn()?;
+                let res = execute_insert(&mut self.database, table_name, values, metrics);
+                // Commit an implicit transaction
+                if self.database.is_txn_implicit()? {
+                    self.database.commit_txn()?;
+                }
+                res
             }
             Statement::Select {
                 table_name,
@@ -58,26 +74,73 @@ impl Executor {
                 where_clause,
                 metrics,
             ),
-            Statement::DropTable { name } => execute_drop_table(&mut self.database, name),
+            Statement::DropTable { name } => {
+                // begin an implicit transaction if no active transaction
+                self.database.begin_implicit_txn()?;
+
+                let res = execute_drop_table(&mut self.database, name);
+                // Commit an implicit transaction
+                if self.database.is_txn_implicit()? {
+                    self.database.commit_txn()?;
+                }
+                res
+            }
             Statement::Delete {
                 table_name,
                 where_clause,
-            } => execute_delete(&mut self.database, table_name, where_clause, metrics),
+            } => {
+                // begin an implicit transaction if no active transaction
+                self.database.begin_implicit_txn()?;
+                let res = execute_delete(&mut self.database, table_name, where_clause, metrics);
+                // Commit an implicit transaction
+                if self.database.is_txn_implicit()? {
+                    self.database.commit_txn()?;
+                }
+                res
+            }
             Statement::Update {
                 table_name,
                 assignments,
                 where_clause,
-            } => execute_update(
-                &mut self.database,
-                table_name,
-                assignments,
-                where_clause,
-                metrics,
-            ),
+            } => {
+                // begin an implicit transaction if no active transaction
+                self.database.begin_implicit_txn()?;
+
+                let res = execute_update(
+                    &mut self.database,
+                    table_name,
+                    assignments,
+                    where_clause,
+                    metrics,
+                );
+                // Commit an implicit transaction
+                if self.database.is_txn_implicit()? {
+                    self.database.commit_txn()?;
+                }
+                res
+            }
             Statement::Checkpoint => {
                 self.database.checkpoint()?;
                 Ok(ExecutionResult::Success {
                     message: "Checkpoint complete.".to_string(),
+                })
+            }
+            Statement::Begin => {
+                let txn_id = self.database.begin_explicit_txn()?;
+                Ok(ExecutionResult::Success {
+                    message: format!("Transaction {} started", txn_id),
+                })
+            }
+            Statement::Commit => {
+                self.database.commit_txn()?;
+                Ok(ExecutionResult::Success {
+                    message: "Transaction committed".to_string(),
+                })
+            }
+            Statement::RollBack => {
+                // TODO: roll back txn
+                Ok(ExecutionResult::Success {
+                    message: "Transaction rolled back".to_string(),
                 })
             }
         };

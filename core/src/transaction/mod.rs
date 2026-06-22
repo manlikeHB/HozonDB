@@ -13,22 +13,12 @@ pub struct Txn {
 }
 
 impl Txn {
-    fn new(txn_id: u64, is_implicit: bool) -> Self {
+    pub fn new(txn_id: u64, is_implicit: bool) -> Self {
         Self {
             id: txn_id,
             lsns: Vec::new(),
             is_implicit,
         }
-    }
-
-    /// Creates an implicit Txn
-    pub fn implicit_txn(txn_id: u64) -> Self {
-        Self::new(txn_id, true)
-    }
-
-    // Creates an explicit Txn when `BEGIN` is called
-    pub fn explicit_txn(txn_id: u64) -> Self {
-        Self::new(txn_id, false)
     }
 
     pub fn id(&self) -> u64 {

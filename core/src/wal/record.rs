@@ -518,6 +518,12 @@ impl WalRecord {
                 ]);
                 offset += 8;
 
+                if bytes.len() < offset + 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for stored_checksum",
+                    ));
+                }
                 let stored_checksum = u32::from_le_bytes([
                     bytes[offset],
                     bytes[offset + 1],
@@ -639,6 +645,12 @@ impl WalRecord {
                 ]);
                 offset += 8;
 
+                if bytes.len() < offset + 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for stored_checksum",
+                    ));
+                }
                 let stored_checksum = u32::from_le_bytes([
                     bytes[offset],
                     bytes[offset + 1],

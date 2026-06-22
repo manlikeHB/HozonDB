@@ -403,6 +403,7 @@ impl Database {
             .append_raw(record_type, page_id, new_data, old_data, txn_id)?)
     }
 
+    // Transaction
     pub fn next_txn_id(&mut self) -> u64 {
         let txn_id = self.next_txn_id;
         self.next_txn_id += 1;
@@ -416,6 +417,62 @@ impl Database {
                 ErrorKind::InvalidData,
                 "No active transaction",
             )),
+        }
+    }
+
+    /// Creates an implicit Txn
+    /// Begins an implicit transaction if no active transaction
+
+    pub fn begin_implicit_txn(&mut self) -> io::Result<()> {
+        if self.txn.is_none() {
+            self.begin_txn(true)?;
+        }
+
+        Ok(())
+    }
+
+    /// Creates an explicit Txn when `BEGIN` is called
+    pub fn begin_explicit_txn(&mut self) -> io::Result<u64> {
+        self.begin_txn(false)
+    }
+
+    fn begin_txn(&mut self, is_implicit: bool) -> io::Result<u64> {
+        if let Some(txn) = &self.txn {
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                format!(
+                    "transaction {} is already active, commit or rollback before starting a new one",
+                    txn.id()
+                ),
+            ));
+        }
+
+        let txn_id = self.next_txn_id();
+        let txn = Txn::new(txn_id, is_implicit);
+        self.txn = Some(txn);
+        Ok(txn_id)
+    }
+
+    pub fn commit_txn(&mut self) -> io::Result<()> {
+        if self.txn.is_none() {
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                "No active transaction to commit",
+            ));
+        }
+
+        // flush WAL to disk
+        self.wal_writer.sync()?;
+        //remove current txn
+        self.txn = None;
+        Ok(())
+    }
+
+    pub fn is_txn_implicit(&self) -> io::Result<bool> {
+        if let Some(txn) = &self.txn {
+            Ok(txn.is_implicit())
+        } else {
+            Err(io::Error::new(ErrorKind::Other, "No active transaction"))
         }
     }
 }
