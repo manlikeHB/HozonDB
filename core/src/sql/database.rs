@@ -119,6 +119,29 @@ impl Database {
         self.buffer_pool.is_cached(page_id)
     }
 
+    pub fn allocate_slotted_page(&mut self) -> io::Result<PageId> {
+        self.buffer_pool.allocate_slotted_page(&mut self.wal_writer)
+    }
+
+    pub fn update_next_page_in_page_metadata(
+        &mut self,
+        page_id: PageId,
+        next_page: PageId,
+    ) -> io::Result<()> {
+        let txn_id = self.cur_txn_id()?;
+        self.buffer_pool.update_next_page_in_page_metadata(
+            page_id,
+            next_page,
+            &mut self.wal_writer,
+            txn_id,
+        )
+    }
+
+    /// Check if page is cached in buffer pool (frames)
+    pub fn page_is_cached(&self, page_id: PageId) -> bool {
+        self.buffer_pool.is_cached(page_id)
+    }
+
     // table catalog
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
@@ -347,16 +370,6 @@ impl Database {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
 
         btree.range_scan(start, end, op, buffer_pool)
-    }
-
-    pub(crate) fn get_wal_and_buffer_pool(&mut self) -> (&mut WalWriter, &mut BufferPool) {
-        let Database {
-            buffer_pool,
-            wal_writer,
-            ..
-        } = self;
-
-        (wal_writer, buffer_pool)
     }
 
     pub fn total_num_of_db_pages(&self) -> u32 {

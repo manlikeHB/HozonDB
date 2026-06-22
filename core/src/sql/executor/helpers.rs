@@ -114,20 +114,16 @@ pub fn insert_row_into_page(
     values: &[Value],
     metrics: &mut Option<QueryMetrics>,
 ) -> io::Result<(PageId, u16)> {
-    let txn_id = db.cur_txn_id()?;
-    let (wal_writer, buffer_pool) = db.get_wal_and_buffer_pool();
-
     // Track page read
     if let Some(m) = metrics.as_mut() {
-        if buffer_pool.is_cached(last_page) {
+        if db.page_is_cached(last_page) {
             m.buffer_pool_hits += 1;
         } else {
             m.disk_reads += 1;
         }
     }
 
-    // let mut last_page_data = db.read_page(last_page)?;
-    let mut last_page_data = buffer_pool.get_page_mut(last_page)?;
+    let mut last_page_data = db.read_page(last_page)?.clone();
 
     let mut last_page_meta =
         PageManager::read_metadata_from_buffer(&last_page_data, PageType::Slotted);
@@ -141,15 +137,15 @@ pub fn insert_row_into_page(
         // get row offset to insert new row
         let row_offset = last_page_meta.free_space_end()? as usize - row_bytes.len();
         // append record to WAL log
-        let lsn = wal_writer.append_slotted(
+        let lsn = db.wal_append_slotted(
             WalRecordType::Insert,
             table_name,
             last_page,
             last_page_meta.slot_count()?,
             &row_bytes,
-            &vec![],
-            txn_id,
+            &[],
         )?;
+
         // write row to page data
         last_page_data[row_offset..row_offset + row_bytes.len()].copy_from_slice(&row_bytes);
         // write slot to page data
@@ -169,6 +165,10 @@ pub fn insert_row_into_page(
         // update metadata and write page to disk
         PageManager::update_metadata_in_buffer(&mut last_page_data, &last_page_meta);
 
+        // write page to buffer pool
+        let mut_last_page = db.get_page_mut(last_page)?;
+        mut_last_page.copy_from_slice(&last_page_data);
+
         // mark page dirty
         db.mark_dirty(last_page, lsn)?;
 
@@ -180,22 +180,22 @@ pub fn insert_row_into_page(
         (last_page, last_page_meta.slot_count()? - 1)
     } else {
         // Create a new page
-        let new_page = buffer_pool.allocate_slotted_page(wal_writer)?;
-        let mut new_page_data = buffer_pool.get_page_mut(new_page)?;
+        let new_page = db.allocate_slotted_page()?;
+        let mut new_page_data = db.read_page(new_page)?.clone();
         let mut new_page_meta =
             PageManager::read_metadata_from_buffer(&new_page_data, PageType::Slotted);
         // get row offset
         let row_offset = new_page_meta.free_space_end()? as usize - row_bytes.len();
         // append record to WAL log
-        let lsn = wal_writer.append_slotted(
+        let lsn = db.wal_append_slotted(
             WalRecordType::Insert,
             table_name,
             new_page,
             new_page_meta.slot_count()?,
             &row_bytes,
-            &vec![],
-            txn_id,
+            &[],
         )?;
+
         // write row to page data
         new_page_data[row_offset..row_offset + row_bytes.len()].copy_from_slice(&row_bytes);
         // write slot
@@ -213,8 +213,13 @@ pub fn insert_row_into_page(
         new_page_meta.set_lsn(lsn);
 
         PageManager::update_metadata_in_buffer(&mut new_page_data, &new_page_meta);
+
+        // write page to buffer pool
+        let mut_new_page = db.get_page_mut(new_page)?;
+        mut_new_page.copy_from_slice(&new_page_data);
+
         // mark page dirty
-        buffer_pool.mark_dirty(new_page, lsn)?;
+        db.mark_dirty(new_page, lsn)?;
 
         // Track new page write
         if let Some(m) = metrics.as_mut() {
@@ -222,7 +227,7 @@ pub fn insert_row_into_page(
         }
 
         // Update the previous page's metadata to point to the new page
-        buffer_pool.update_next_page_in_page_metadata(last_page, new_page, wal_writer, txn_id)?;
+        db.update_next_page_in_page_metadata(last_page, new_page)?;
 
         if let Some(m) = metrics.as_mut() {
             m.pages_dirtied.insert(last_page);
