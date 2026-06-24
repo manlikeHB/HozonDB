@@ -37,3 +37,31 @@ impl Txn {
         self.lsns.push(lsn);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_txn_new_implicit() {
+        let txn = Txn::new(1, true);
+        assert_eq!(txn.id(), 1);
+        assert!(txn.is_implicit());
+        assert!(txn.lsns().is_empty());
+    }
+
+    #[test]
+    fn test_txn_new_explicit() {
+        let txn = Txn::new(2, false);
+        assert_eq!(txn.id(), 2);
+        assert!(!txn.is_implicit());
+    }
+
+    #[test]
+    fn test_add_lsn() {
+        let mut txn = Txn::new(1, false);
+        txn.add_lsn(10);
+        txn.add_lsn(20);
+        assert_eq!(txn.lsns(), &[10, 20]);
+    }
+}
