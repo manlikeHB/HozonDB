@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     catalog::index::index_entry::IndexEntry,
-    constants,
+    constants::{self, Lsn},
     storage::{buffer_pool::BufferPool, page::PAGE_SIZE},
     wal::{record_type::WalRecordType, writer::WalWriter},
 };
@@ -18,7 +18,9 @@ impl IndexCatalog {
     pub fn new(buffer_pool: &mut BufferPool, wal_writer: &mut WalWriter) -> io::Result<Self> {
         // If this is a new database (only page 0 and 1 exists), allocate page 2 for index catalog
         if buffer_pool.total_num_of_db_pages() == 2 {
-            buffer_pool.allocate_raw_page(wal_writer)?;
+            // This is only on start up when there no Transactions yet
+            // hence 0 (non-valid) txn_id
+            buffer_pool.allocate_raw_page(wal_writer, 0)?;
         }
 
         let catalog_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
@@ -91,7 +93,7 @@ impl IndexCatalog {
         wal_writer: &mut WalWriter,
         entry: IndexEntry,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Lsn> {
         let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
         self.indexes
@@ -126,7 +128,7 @@ impl IndexCatalog {
         )?;
 
         self.save(buffer_pool, &new_page, lsn)?;
-        Ok(())
+        Ok(lsn)
     }
 
     fn save(
@@ -161,7 +163,7 @@ impl IndexCatalog {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Lsn> {
         let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
         self.indexes
@@ -198,7 +200,7 @@ impl IndexCatalog {
         )?;
 
         self.save(buffer_pool, &new_page, lsn)?;
-        Ok(())
+        Ok(lsn)
     }
 
     pub fn total_count(&self) -> usize {
@@ -211,7 +213,7 @@ impl IndexCatalog {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Lsn> {
         let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
         self.indexes.remove(table_name);
@@ -243,7 +245,7 @@ impl IndexCatalog {
         )?;
 
         self.save(buffer_pool, &new_page, lsn)?;
-        Ok(())
+        Ok(lsn)
     }
 
     pub fn all_indexes(&self) -> Vec<&IndexEntry> {

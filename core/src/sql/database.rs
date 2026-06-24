@@ -10,7 +10,7 @@ use crate::{
         schema::Schema,
         table::{TableCatalog, TableMetadata},
     },
-    constants::{self, PageId},
+    constants::{self, Lsn, PageId},
     index::{btree::BPlusTree, key::IndexKey, node::leaf::RowLocation},
     sql::{executor::helpers, parser::BinaryOperator},
     storage::{
@@ -111,8 +111,10 @@ impl Database {
 
     pub fn free_page(&mut self, page_id: PageId) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
-        self.buffer_pool
-            .free_page(page_id, &mut self.wal_writer, txn_id)
+        let lsn = self
+            .buffer_pool
+            .free_page(page_id, &mut self.wal_writer, txn_id)?;
+        self.add_lsn_to_txn(lsn)
     }
 
     pub fn is_page_cached(&self, page_id: PageId) -> bool {
@@ -120,7 +122,12 @@ impl Database {
     }
 
     pub fn allocate_slotted_page(&mut self) -> io::Result<PageId> {
-        self.buffer_pool.allocate_slotted_page(&mut self.wal_writer)
+        let txn_id = self.cur_txn_id()?;
+        let (page_id, lsn) = self
+            .buffer_pool
+            .allocate_slotted_page(&mut self.wal_writer, txn_id)?;
+        self.add_lsn_to_txn(lsn)?;
+        Ok(page_id)
     }
 
     pub fn update_next_page_in_page_metadata(
@@ -129,12 +136,13 @@ impl Database {
         next_page: PageId,
     ) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
-        self.buffer_pool.update_next_page_in_page_metadata(
+        let lsn = self.buffer_pool.update_next_page_in_page_metadata(
             page_id,
             next_page,
             &mut self.wal_writer,
             txn_id,
-        )
+        )?;
+        self.add_lsn_to_txn(lsn)
     }
 
     /// Check if page is cached in buffer pool (frames)
@@ -145,21 +153,24 @@ impl Database {
     // table catalog
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
-        self.table_catalog.create_table(
+        let lsns = self.table_catalog.create_table(
             schema.clone(),
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
         )?;
 
+        self.add_lsns_to_txn(&lsns)?;
+
         if let Some(pk_col) = schema.columns().iter().find(|c| c.is_primary_key()) {
             let column_type = IndexColumnType::try_from(*pk_col.data_type())?;
-            let btree = BPlusTree::new(
+            let (btree, lsns) = BPlusTree::new(
                 column_type.order(),
                 &mut self.buffer_pool,
                 &mut self.wal_writer,
                 txn_id,
             )?;
+            self.add_lsns_to_txn(&lsns)?;
             let root_page_id = btree.root().ok_or_else(|| {
                 return Error::new(ErrorKind::InvalidData, "b+ tree root page id not set");
             })?;
@@ -219,19 +230,24 @@ impl Database {
 
         // remove catalog entry
         let txn_id = self.cur_txn_id()?;
-        self.table_catalog.drop_table(
+        let lsn = self.table_catalog.drop_table(
             table_name,
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
         )?;
+        self.add_lsn_to_txn(lsn)?;
 
         // free pages
         let txn_id = self.cur_txn_id()?;
+        let mut lsns = vec![];
         for page_id in page_chain {
-            self.buffer_pool
+            let lsn = self
+                .buffer_pool
                 .free_page(page_id, &mut self.wal_writer, txn_id)?;
+            lsns.push(lsn);
         }
+        self.add_lsns_to_txn(&lsns)?;
 
         // drop indexes
         self.drop_table_indexes(table_name)?;
@@ -245,8 +261,13 @@ impl Database {
         let index_name = entry.index_name().to_owned();
 
         let txn_id = self.cur_txn_id()?;
-        self.index_catalog
-            .add_index(&mut self.buffer_pool, &mut self.wal_writer, entry, txn_id)?;
+        let lsn = self.index_catalog.add_index(
+            &mut self.buffer_pool,
+            &mut self.wal_writer,
+            entry,
+            txn_id,
+        )?;
+        self.add_lsn_to_txn(lsn)?;
         self.indexes.insert(index_name, btree);
 
         Ok(())
@@ -263,13 +284,15 @@ impl Database {
     pub fn remove_index(&mut self, table_name: &str, index_name: &str) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
 
-        self.index_catalog.remove_index(
+        let lsn = self.index_catalog.remove_index(
             table_name,
             index_name,
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
-        )
+        )?;
+        self.add_lsn_to_txn(lsn)?;
+        Ok(())
     }
 
     pub fn total_index_count(&self) -> usize {
@@ -278,12 +301,13 @@ impl Database {
 
     pub fn drop_table_indexes(&mut self, table_name: &str) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
-        self.index_catalog.remove_table_indexes(
+        let lsn = self.index_catalog.remove_table_indexes(
             table_name,
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
-        )
+        )?;
+        self.add_lsn_to_txn(lsn)
     }
 
     pub fn get_table_last_page(&self, table_name: &str) -> Option<PageId> {
@@ -292,13 +316,14 @@ impl Database {
 
     pub fn update_table_last_page(&mut self, table_name: &str, page_id: PageId) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
-        self.table_catalog.update_last_page(
+        let lsn = self.table_catalog.update_last_page(
             table_name,
             page_id,
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
-        )
+        )?;
+        self.add_lsn_to_txn(lsn)
     }
 
     // Indexes
@@ -316,13 +341,15 @@ impl Database {
             )
         })?;
 
-        btree.insert(
+        let lsns = btree.insert(
             key,
             row_location,
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
-        )
+        )?;
+        self.add_lsns_to_txn(&lsns)?;
+        Ok(())
     }
 
     pub fn indexes(&self) -> &HashMap<String, BPlusTree> {
@@ -349,7 +376,8 @@ impl Database {
             .get_mut(index_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
 
-        btree.delete(key, &mut self.buffer_pool, &mut self.wal_writer, txn_id)
+        let lsn = btree.delete(key, &mut self.buffer_pool, &mut self.wal_writer, txn_id)?;
+        self.add_lsn_to_txn(lsn)
     }
 
     pub fn range_index_scan(
@@ -426,16 +454,12 @@ impl Database {
     pub fn cur_txn_id(&self) -> io::Result<u64> {
         match &self.txn {
             Some(txn) => Ok(txn.id()),
-            None => Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "No active transaction",
-            )),
+            None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
         }
     }
 
     /// Creates an implicit Txn
     /// Begins an implicit transaction if no active transaction
-
     pub fn begin_implicit_txn(&mut self) -> io::Result<()> {
         if self.txn.is_none() {
             self.begin_txn(true)?;
@@ -486,6 +510,25 @@ impl Database {
             Ok(txn.is_implicit())
         } else {
             Err(io::Error::new(ErrorKind::Other, "No active transaction"))
+        }
+    }
+
+    pub fn add_lsn_to_txn(&mut self, lsn: Lsn) -> io::Result<()> {
+        match &mut self.txn {
+            Some(txn) => Ok(txn.add_lsn(lsn)),
+            None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
+        }
+    }
+
+    pub fn add_lsns_to_txn(&mut self, lsns: &[Lsn]) -> io::Result<()> {
+        match &mut self.txn {
+            Some(txn) => {
+                for lsn in lsns {
+                    txn.add_lsn(*lsn);
+                }
+                Ok(())
+            }
+            None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
         }
     }
 }

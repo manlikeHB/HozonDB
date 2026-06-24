@@ -1,5 +1,5 @@
 use crate::catalog::schema::Schema;
-use crate::constants::{self, PageId};
+use crate::constants::{self, Lsn, PageId, TxnId};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::PAGE_SIZE;
 use crate::wal::record_type::WalRecordType;
@@ -38,7 +38,9 @@ impl TableCatalog {
     pub fn new(buffer_pool: &mut BufferPool, wal_writer: &mut WalWriter) -> io::Result<Self> {
         // If this is a new database (only page 0 exists), allocate page 1 for catalog
         if buffer_pool.total_num_of_db_pages() == 1 {
-            buffer_pool.allocate_raw_page(wal_writer)?;
+            // This is only on start up when there no Transactions yet
+            // hence 0 as the txn_id
+            buffer_pool.allocate_raw_page(wal_writer, 0)?;
         }
 
         let catalog_data = buffer_pool.read_page(constants::TABLE_CATALOG_PAGE_ID)?;
@@ -132,8 +134,8 @@ impl TableCatalog {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<()> {
-        let first_page = buffer_pool.allocate_slotted_page(wal_writer)?;
+    ) -> io::Result<Vec<Lsn>> {
+        let (first_page, lsn1) = buffer_pool.allocate_slotted_page(wal_writer, txn_id)?;
 
         let table_name = schema.table_name().to_string();
         let table_metadata = TableMetadata {
@@ -155,7 +157,7 @@ impl TableCatalog {
         new_data[constants::OFFSET_RAW_PAGE_START + table_catalog.len()..].fill(0);
 
         // log to WAL
-        let lsn = wal_writer.append_raw(
+        let lsn2 = wal_writer.append_raw(
             WalRecordType::CreateTable,
             constants::TABLE_CATALOG_PAGE_ID,
             &new_data,
@@ -163,8 +165,8 @@ impl TableCatalog {
             txn_id,
         )?;
 
-        self.save(buffer_pool, &new_data, lsn)?;
-        Ok(())
+        self.save(buffer_pool, &new_data, lsn2)?;
+        Ok(vec![lsn1, lsn2])
     }
 
     pub fn save(
@@ -210,8 +212,8 @@ impl TableCatalog {
         name: &str,
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
-        txn_id: u64,
-    ) -> io::Result<()> {
+        txn_id: TxnId,
+    ) -> io::Result<Lsn> {
         match self.tables.remove(name) {
             Some(_) => {
                 let table_catalog = self.to_bytes();
@@ -234,7 +236,7 @@ impl TableCatalog {
                 )?;
 
                 self.save(buffer_pool, &new_data, lsn)?;
-                return Ok(());
+                return Ok(lsn);
             }
             None => {
                 return Err(Error::new(
@@ -252,7 +254,7 @@ impl TableCatalog {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Lsn> {
         if let Some(meta) = self.tables.get_mut(table_name) {
             meta.update_last_page(page_id);
         }
@@ -277,7 +279,7 @@ impl TableCatalog {
         )?;
 
         self.save(buffer_pool, &new_data, lsn)?;
-        Ok(())
+        Ok(lsn)
     }
 
     pub fn get_last_page(&self, table_name: &str) -> Option<PageId> {

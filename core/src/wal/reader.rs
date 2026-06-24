@@ -399,9 +399,9 @@ mod tests {
         cleanup("test_rec_insert");
         let (mut bp, mut wal) = setup("test_rec_insert");
 
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let page_id = bp.allocate_slotted_page(&mut wal).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
@@ -444,9 +444,9 @@ mod tests {
         cleanup("test_rec_insert_skip");
         let (mut bp, mut wal) = setup("test_rec_insert_skip");
 
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let page_id = bp.allocate_slotted_page(&mut wal).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let row_bytes = b"row data";
 
         let lsn = wal
@@ -496,9 +496,9 @@ mod tests {
         cleanup("test_rec_delete");
         let (mut bp, mut wal) = setup("test_rec_delete");
 
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let page_id = bp.allocate_slotted_page(&mut wal).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         let row_bytes = b"some row data";
 
@@ -565,9 +565,9 @@ mod tests {
         cleanup("test_rec_delete_skip");
         let (mut bp, mut wal) = setup("test_rec_delete_skip");
 
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let page_id = bp.allocate_slotted_page(&mut wal).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         let row_bytes = b"some row data";
 
@@ -642,10 +642,10 @@ mod tests {
         cleanup("test_rec_link");
         let (mut bp, mut wal) = setup("test_rec_link");
 
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let page_id = bp.allocate_slotted_page(&mut wal).unwrap();
-        let next_page_id = bp.allocate_slotted_page(&mut wal).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (next_page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
@@ -673,10 +673,10 @@ mod tests {
         cleanup("test_rec_link_skip");
         let (mut bp, mut wal) = setup("test_rec_link_skip");
 
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let _ = bp.allocate_slotted_page(&mut wal).unwrap();
-        let page_id = bp.allocate_slotted_page(&mut wal).unwrap();
-        let next_page_id = bp.allocate_slotted_page(&mut wal).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (next_page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         let lsn = wal.append_link_page(page_id, next_page_id, 432).unwrap();
 
@@ -710,7 +710,7 @@ mod tests {
         cleanup("test_rec_raw");
         let (mut bp, mut wal) = setup("test_rec_raw");
 
-        let page_id = bp.allocate_raw_page(&mut wal).unwrap();
+        let (page_id, _) = bp.allocate_raw_page(&mut wal, 1).unwrap();
 
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
@@ -742,7 +742,7 @@ mod tests {
         cleanup("test_rec_raw_skip");
         let (mut bp, mut wal) = setup("test_rec_raw_skip");
 
-        let page_id = bp.allocate_raw_page(&mut wal).unwrap();
+        let (page_id, _) = bp.allocate_raw_page(&mut wal, 1).unwrap();
 
         // build new page with distinctive data
         let mut new_page = [0u8; PAGE_SIZE];

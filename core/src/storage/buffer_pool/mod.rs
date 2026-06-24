@@ -3,6 +3,7 @@ pub mod frame;
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 
+use crate::constants::{Lsn, TxnId};
 use crate::storage::buffer_pool::frame::Frame;
 use crate::storage::page::{PageMetadata, PageType};
 use crate::wal::record_type::WalRecordType;
@@ -36,25 +37,34 @@ impl BufferPool {
         Ok(self.frames[idx].data())
     }
 
-    pub fn allocate_slotted_page(&mut self, wal_writer: &mut WalWriter) -> io::Result<PageId> {
-        self.allocate_page(wal_writer, PageType::Slotted)
+    pub fn allocate_slotted_page(
+        &mut self,
+        wal_writer: &mut WalWriter,
+        txn_id: TxnId,
+    ) -> io::Result<(PageId, Lsn)> {
+        self.allocate_page(wal_writer, PageType::Slotted, txn_id)
     }
 
-    pub fn allocate_raw_page(&mut self, wal_writer: &mut WalWriter) -> io::Result<PageId> {
-        self.allocate_page(wal_writer, PageType::Raw)
+    pub fn allocate_raw_page(
+        &mut self,
+        wal_writer: &mut WalWriter,
+        txn_id: TxnId,
+    ) -> io::Result<(PageId, Lsn)> {
+        self.allocate_page(wal_writer, PageType::Raw, txn_id)
     }
 
     fn allocate_page(
         &mut self,
         wal_writer: &mut WalWriter,
         page_type: PageType,
-    ) -> io::Result<PageId> {
+        txn_id: TxnId,
+    ) -> io::Result<(PageId, Lsn)> {
         if let Some(free_page_id) = self.page_manager.first_free_page() {
             // read next free pointer from buffer pool frame
             let next_free = self.read_next_free(free_page_id)?;
 
             // log
-            let lsn = wal_writer.append_allocate_page(free_page_id, page_type.to_u8(), 1)?;
+            let lsn = wal_writer.append_allocate_page(free_page_id, page_type.to_u8(), txn_id)?;
 
             // update free list head
             self.page_manager.set_first_free_page(next_free)?;
@@ -66,16 +76,16 @@ impl BufferPool {
             // mark dirty
             self.mark_dirty(free_page_id, lsn)?;
 
-            return Ok(free_page_id);
+            return Ok((free_page_id, lsn));
         }
 
         // no free pages — delegate extension to PageManager
         let page_id = self.page_manager.allocate_page(page_type)?;
 
         // log
-        wal_writer.append_allocate_page(page_id, page_type.to_u8(), 1)?;
+        let lsn = wal_writer.append_allocate_page(page_id, page_type.to_u8(), txn_id)?;
 
-        Ok(page_id)
+        Ok((page_id, lsn))
     }
 
     // flush all dirty frames to disk — called at checkpoint
@@ -197,7 +207,7 @@ impl BufferPool {
         next_page: PageId,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Lsn> {
         // log to WAL
         let lsn = wal_writer.append_link_page(page_id, next_page, txn_id)?;
 
@@ -214,7 +224,7 @@ impl BufferPool {
 
         self.mark_dirty(page_id, lsn)?;
 
-        Ok(())
+        Ok(lsn)
     }
 
     pub fn total_num_of_db_pages(&self) -> u32 {
@@ -267,7 +277,7 @@ impl BufferPool {
         page_id: PageId,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Lsn> {
         // build new free page content
         let next_free = self.page_manager.first_free_page();
         let mut new_page = [0u8; PAGE_SIZE];
@@ -292,7 +302,7 @@ impl BufferPool {
         // update free list head and persist header
         self.page_manager.set_first_free_page(Some(page_id))?;
 
-        Ok(())
+        Ok(lsn)
     }
 
     /// Read next_free pointer from a free page
@@ -336,7 +346,7 @@ mod tests {
         cleanup("test_free_add");
         let (mut bp, mut wal) = setup("test_free_add");
 
-        let page1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         assert_eq!(page1, 1);
         assert_eq!(bp.page_manager.first_free_page(), None);
 
@@ -351,9 +361,9 @@ mod tests {
         cleanup("test_reuse");
         let (mut bp, mut wal) = setup("test_reuse");
 
-        let page1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let page2 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let page3 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (page2, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (page3, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         assert_eq!(page1, 1);
         assert_eq!(page2, 2);
@@ -363,7 +373,7 @@ mod tests {
         bp.free_page(page2, &mut wal, 2).unwrap();
         assert_eq!(bp.page_manager.first_free_page(), Some(2));
 
-        let page4 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page4, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         assert_eq!(page4, 2);
         assert_eq!(bp.page_manager.first_free_page(), None);
         assert_eq!(bp.page_manager.num_pages(), 4);
@@ -376,9 +386,9 @@ mod tests {
         cleanup("test_lifo");
         let (mut bp, mut wal) = setup("test_lifo");
 
-        let page1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let page2 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let page3 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (page2, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (page3, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         bp.free_page(page1, &mut wal, 2).unwrap();
         bp.free_page(page2, &mut wal, 3).unwrap();
@@ -386,13 +396,13 @@ mod tests {
 
         assert_eq!(bp.page_manager.first_free_page(), Some(3));
 
-        let realloc1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (realloc1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         assert_eq!(realloc1, 3);
 
-        let realloc2 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (realloc2, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         assert_eq!(realloc2, 2);
 
-        let realloc3 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (realloc3, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         assert_eq!(realloc3, 1);
 
         assert_eq!(bp.page_manager.first_free_page(), None);
@@ -407,9 +417,9 @@ mod tests {
         {
             let (mut bp, mut wal) = setup("test_free_persist");
 
-            let _ = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-            let page2 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-            let page3 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+            let _ = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+            let (page2, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+            let (page3, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
             bp.free_page(page2, &mut wal, 1).unwrap();
             bp.free_page(page3, &mut wal, 2).unwrap();
@@ -431,7 +441,7 @@ mod tests {
         let (mut bp, mut wal) = setup("test_cycles");
 
         for _ in 0..5 {
-            bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+            bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         }
         assert_eq!(bp.page_manager.num_pages(), 6);
 
@@ -439,8 +449,8 @@ mod tests {
         bp.free_page(3, &mut wal, 3).unwrap();
         bp.free_page(4, &mut wal, 4).unwrap();
 
-        let p1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p2 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (p1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p2, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         assert_eq!(p1, 4);
         assert_eq!(p2, 3);
         assert_eq!(bp.page_manager.first_free_page(), Some(2));
@@ -448,9 +458,9 @@ mod tests {
         bp.free_page(5, &mut wal, 5).unwrap();
         assert_eq!(bp.page_manager.first_free_page(), Some(5));
 
-        let p3 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p4 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p5 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (p3, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p4, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p5, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         assert_eq!(p3, 5);
         assert_eq!(p4, 2);
@@ -469,7 +479,7 @@ mod tests {
         cleanup("test_double_free");
         let (mut bp, mut wal) = setup("test_double_free");
 
-        let page1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         bp.free_page(page1, &mut wal, 1).unwrap();
         assert_eq!(bp.page_manager.first_free_page(), Some(1));
@@ -477,8 +487,8 @@ mod tests {
         bp.free_page(page1, &mut wal, 2).unwrap();
         assert_eq!(bp.page_manager.first_free_page(), Some(1));
 
-        let p1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p2 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (p1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p2, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         assert_eq!(p1, 1);
         assert_eq!(p2, 1);
 
@@ -490,7 +500,7 @@ mod tests {
         cleanup("test_header_first_free");
         let (mut bp, mut wal) = setup("test_header_first_free");
 
-        let page1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         bp.free_page(page1, &mut wal, 4).unwrap();
         assert_eq!(bp.page_manager.first_free_page(), Some(1));
 
@@ -508,7 +518,7 @@ mod tests {
         let (mut bp, mut wal) = setup("test_chain");
 
         for _ in 1..=6 {
-            bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+            bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         }
 
         // page 0, 1, 2 reserved
@@ -536,7 +546,7 @@ mod tests {
         let (mut bp, mut wal) = setup("test_allocate_all");
 
         for _ in 0..10 {
-            bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+            bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         }
 
         for i in 0..10 {
@@ -544,12 +554,12 @@ mod tests {
         }
 
         for _ in 0..10 {
-            bp.allocate_page(&mut wal, PageType::Raw).unwrap();
+            bp.allocate_page(&mut wal, PageType::Raw, 1).unwrap();
         }
 
         assert_eq!(bp.page_manager.first_free_page(), None);
 
-        let new_page = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (new_page, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         assert_eq!(new_page, 11);
 
         cleanup("test_allocate_all");
@@ -560,7 +570,7 @@ mod tests {
         cleanup("test_bp_read_page");
         let (mut bp, mut wal) = setup("test_bp_read_page");
 
-        let page_id = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page_id, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         bp.flush_dirty().unwrap(); // ensure page is on disk
 
         // clear frames to force a disk read
@@ -581,7 +591,7 @@ mod tests {
         cleanup("test_bp_cache_hit");
         let (mut bp, mut wal) = setup("test_bp_cache_hit");
 
-        let page_id = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page_id, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         // read twice — second should be a cache hit
         bp.read_page(page_id).unwrap();
@@ -614,7 +624,7 @@ mod tests {
         cleanup("test_bp_mut_dirty");
         let (mut bp, mut wal) = setup("test_bp_mut_dirty");
 
-        let page_id = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page_id, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         {
             let page = bp.get_page_mut(page_id).unwrap();
@@ -649,7 +659,7 @@ mod tests {
         cleanup("test_bp_flush");
         let (mut bp, mut wal) = setup("test_bp_flush");
 
-        let page_id = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page_id, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         {
             let page = bp.get_page_mut(page_id).unwrap();
@@ -678,7 +688,7 @@ mod tests {
         cleanup("test_bp_flush_clean");
         let (mut bp, mut wal) = setup("test_bp_flush_clean");
 
-        let page_id = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page_id, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         // read page into frame but don't mark dirty
         bp.read_page(page_id).unwrap();
@@ -699,7 +709,7 @@ mod tests {
 
         {
             let (mut bp, mut wal) = setup("test_bp_persist");
-            let page_id = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+            let (page_id, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
             {
                 let page = bp.get_page_mut(page_id).unwrap();
@@ -726,7 +736,7 @@ mod tests {
         cleanup("test_bp_raw_write");
         let (mut bp, mut wal) = setup("test_bp_raw_write");
 
-        let page_id = bp.allocate_raw_page(&mut wal).unwrap();
+        let (page_id, _) = bp.allocate_raw_page(&mut wal, 1).unwrap();
 
         let mut new_data = [0u8; PAGE_SIZE];
         new_data[8] = 0x55; // after raw page metadata region
@@ -746,7 +756,7 @@ mod tests {
         cleanup("test_bp_raw_lsn");
         let (mut bp, mut wal) = setup("test_bp_raw_lsn");
 
-        let page_id = bp.allocate_raw_page(&mut wal).unwrap();
+        let (page_id, _) = bp.allocate_raw_page(&mut wal, 1).unwrap();
         let new_data = [0u8; PAGE_SIZE];
 
         bp.write_raw_page(page_id, &new_data, 99).unwrap();
@@ -767,10 +777,10 @@ mod tests {
         let mut wal = WalWriter::new("test_bp_evict").unwrap();
 
         // allocate 4 pages — one more than pool capacity
-        let p1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p2 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p3 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p4 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (p1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p2, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p3, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p4, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         bp.flush_dirty().unwrap(); // get clean frames
 
@@ -799,9 +809,9 @@ mod tests {
         let mut bp = BufferPool::new(pm, 2); // 2 frames only
         let mut wal = WalWriter::new("test_bp_evict_dirty").unwrap();
 
-        let p1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p2 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p3 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (p1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p2, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p3, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         bp.flush_dirty().unwrap();
         bp.frames = vec![Frame::default(); 2];
@@ -838,9 +848,9 @@ mod tests {
         let mut bp = BufferPool::new(pm, 2);
         let mut wal = WalWriter::new("test_bp_clock").unwrap();
 
-        let p1 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p2 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
-        let p3 = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (p1, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p2, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
+        let (p3, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
 
         bp.flush_dirty().unwrap();
         bp.frames = vec![Frame::default(); 2];
@@ -871,12 +881,12 @@ mod tests {
         let (mut bp, mut wal) = setup("test_bp_next_page");
 
         // page 1 and 2 for catalogs
-        let _ = bp.allocate_raw_page(&mut wal).unwrap();
-        let _ = bp.allocate_raw_page(&mut wal).unwrap();
+        let _ = bp.allocate_raw_page(&mut wal, 1).unwrap();
+        let _ = bp.allocate_raw_page(&mut wal, 1).unwrap();
 
         // allocate two pages
-        let page_id = bp.allocate_slotted_page(&mut wal).unwrap();
-        let next_page_id = bp.allocate_slotted_page(&mut wal).unwrap();
+        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (next_page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         // verify next_page is None initially
         let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
@@ -907,8 +917,8 @@ mod tests {
 
         {
             let (mut bp, mut wal) = setup("test_bp_next_page_persist");
-            page_id = bp.allocate_slotted_page(&mut wal).unwrap();
-            next_page_id = bp.allocate_slotted_page(&mut wal).unwrap();
+            (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+            (next_page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
             bp.update_next_page_in_page_metadata(page_id, next_page_id, &mut wal, 5)
                 .unwrap();
@@ -935,14 +945,14 @@ mod tests {
         cleanup("test_alloc_reuse_lsn");
         let (mut bp, mut wal) = setup("test_alloc_reuse_lsn");
 
-        let page_id = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (page_id, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         bp.free_page(page_id, &mut wal, 7).unwrap();
 
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
 
         // allocate from free list — should stamp real LSN
-        let reused = bp.allocate_page(&mut wal, PageType::Slotted).unwrap();
+        let (reused, _) = bp.allocate_page(&mut wal, PageType::Slotted, 1).unwrap();
         assert_eq!(reused, page_id);
 
         let idx = bp.page_table[&reused];

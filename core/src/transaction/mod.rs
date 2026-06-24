@@ -25,11 +25,15 @@ impl Txn {
         self.id
     }
 
-    pub fn lsns(&self) -> &Vec<u64> {
+    pub fn lsns(&self) -> &[u64] {
         &self.lsns
     }
 
     pub fn is_implicit(&self) -> bool {
         self.is_implicit
+    }
+
+    pub fn add_lsn(&mut self, lsn: u64) {
+        self.lsns.push(lsn);
     }
 }

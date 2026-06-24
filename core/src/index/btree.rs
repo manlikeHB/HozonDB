@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    constants::{self, PageId},
+    constants::{self, Lsn, PageId, TxnId},
     index::{
         key::IndexKey,
         node::{
@@ -30,9 +30,9 @@ impl BPlusTree {
         order: usize,
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
-        txn_id: u64,
-    ) -> io::Result<Self> {
-        let root_page_id = buffer_pool.allocate_raw_page(wal_writer)?;
+        txn_id: TxnId,
+    ) -> io::Result<(Self, Vec<Lsn>)> {
+        let (root_page_id, lsn1) = buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
         let root_leaf = Node::Leaf(LeafNode::new());
 
         let mut b_plus_tree = BPlusTree {
@@ -41,7 +41,7 @@ impl BPlusTree {
             cache: HashMap::new(),
         };
 
-        b_plus_tree.write_node(
+        let lsn2 = b_plus_tree.write_node(
             buffer_pool,
             wal_writer,
             root_page_id,
@@ -50,7 +50,7 @@ impl BPlusTree {
             txn_id,
         )?;
 
-        Ok(b_plus_tree)
+        Ok((b_plus_tree, vec![lsn1, lsn2]))
     }
 
     /// Opens existing tree with empty cache (lazy loading)
@@ -72,7 +72,10 @@ impl BPlusTree {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<Lsn>> {
+        // collect lsns
+        let mut lsns = vec![];
+
         if let Some(page_id) = self.root {
             let (leaf_page_id, mut path) = self.find_leaf(&key, page_id, buffer_pool)?;
 
@@ -96,7 +99,9 @@ impl BPlusTree {
 
                             if leaf.is_full(self.order) {
                                 // assign new page
-                                let new_page = buffer_pool.allocate_raw_page(wal_writer)?;
+                                let (new_page, lsn) =
+                                    buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
+                                lsns.push(lsn);
 
                                 // split leaf
                                 let (k, new_leaf) = leaf.split(new_page);
@@ -106,7 +111,7 @@ impl BPlusTree {
                                 let mut left_bytes = vec![];
                                 left_bytes.push(constants::LEAF_NODE_TYPE);
                                 leaf.write_to(&mut left_bytes);
-                                Self::update_node(
+                                let lsn = Self::update_node(
                                     buffer_pool,
                                     wal_writer,
                                     cur_page,
@@ -114,10 +119,11 @@ impl BPlusTree {
                                     WalRecordType::IndexNode,
                                     txn_id,
                                 )?;
+                                lsns.push(lsn);
 
                                 // write right (new node) and add to cache
                                 let right_node = Node::Leaf(new_leaf);
-                                self.write_node(
+                                let lsn = self.write_node(
                                     buffer_pool,
                                     wal_writer,
                                     new_page,
@@ -125,6 +131,7 @@ impl BPlusTree {
                                     WalRecordType::IndexNode,
                                     txn_id,
                                 )?;
+                                lsns.push(lsn);
 
                                 cur_key = k;
                                 new_right_page = Some(new_page);
@@ -133,7 +140,7 @@ impl BPlusTree {
                                     Some(page_id) => page_id,
                                     None => {
                                         // split reached the root, create new root
-                                        self.create_new_root(
+                                        let lsn = self.create_new_root(
                                             cur_page,
                                             cur_key,
                                             new_right_page.expect("root creation reached without a prior split — this is a bug"),
@@ -141,6 +148,7 @@ impl BPlusTree {
                                             wal_writer,
                                             txn_id
                                         )?;
+                                        lsn.iter().for_each(|l| lsns.push(*l));
                                         break;
                                     }
                                 }
@@ -149,7 +157,7 @@ impl BPlusTree {
                                 let mut node_bytes = vec![];
                                 node_bytes.push(constants::LEAF_NODE_TYPE);
                                 leaf.write_to(&mut node_bytes);
-                                Self::update_node(
+                                let lsn = Self::update_node(
                                     buffer_pool,
                                     wal_writer,
                                     cur_page,
@@ -157,6 +165,7 @@ impl BPlusTree {
                                     WalRecordType::IndexNode,
                                     txn_id,
                                 )?;
+                                lsns.push(lsn);
 
                                 break;
                             }
@@ -170,7 +179,9 @@ impl BPlusTree {
                             );
 
                             if internal.is_full(self.order) {
-                                let new_page = buffer_pool.allocate_raw_page(wal_writer)?;
+                                let (new_page, lsn) =
+                                    buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
+                                lsns.push(lsn);
 
                                 // split internal node
                                 let (k, new_internal) = internal.split();
@@ -180,7 +191,7 @@ impl BPlusTree {
                                 let mut left_bytes = vec![];
                                 left_bytes.push(constants::INTERNAL_NODE_TYPE);
                                 internal.write_to(&mut left_bytes);
-                                Self::update_node(
+                                let lsn = Self::update_node(
                                     buffer_pool,
                                     wal_writer,
                                     cur_page,
@@ -188,10 +199,11 @@ impl BPlusTree {
                                     WalRecordType::IndexNode,
                                     txn_id,
                                 )?;
+                                lsns.push(lsn);
 
                                 // write right (new node) and add to cache
                                 let right_node = Node::Internal(new_internal);
-                                self.write_node(
+                                let lsn = self.write_node(
                                     buffer_pool,
                                     wal_writer,
                                     new_page,
@@ -199,6 +211,7 @@ impl BPlusTree {
                                     WalRecordType::IndexNode,
                                     txn_id,
                                 )?;
+                                lsns.push(lsn);
 
                                 cur_key = k;
                                 new_right_page = Some(new_page);
@@ -207,7 +220,7 @@ impl BPlusTree {
                                     Some(page_id) => page_id,
                                     None => {
                                         // split reached the root, create new root
-                                        self.create_new_root(
+                                        let lsn = self.create_new_root(
                                             cur_page,
                                             cur_key,
                                             new_right_page.expect("root creation reached without a prior split — this is a bug"),
@@ -215,6 +228,7 @@ impl BPlusTree {
                                             wal_writer,
                                             txn_id
                                         )?;
+                                        lsn.iter().for_each(|l| lsns.push(*l));
                                         break;
                                     }
                                 }
@@ -222,7 +236,7 @@ impl BPlusTree {
                                 let mut node_bytes = vec![];
                                 node_bytes.push(constants::INTERNAL_NODE_TYPE);
                                 internal.write_to(&mut node_bytes);
-                                Self::update_node(
+                                let lsn = Self::update_node(
                                     buffer_pool,
                                     wal_writer,
                                     cur_page,
@@ -230,6 +244,7 @@ impl BPlusTree {
                                     WalRecordType::IndexNode,
                                     txn_id,
                                 )?;
+                                lsns.push(lsn);
 
                                 break;
                             }
@@ -243,18 +258,19 @@ impl BPlusTree {
                 }
             }
 
-            Ok(())
+            Ok(lsns)
         } else {
             // create new leaf node since root is None
             let mut leaf = LeafNode::new();
             leaf.insert(LeafEntry::new(key, row_location)); // insert new index
-            let new_page = buffer_pool.allocate_raw_page(wal_writer)?;
+            let (new_page, lsn) = buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
+            lsns.push(lsn);
 
             // add the new leaf to nodes
             self.cache.insert(new_page, Node::Leaf(leaf));
             // set root to new leaf node
             self.root = Some(new_page);
-            Ok(())
+            Ok(lsns)
         }
     }
 
@@ -294,11 +310,11 @@ impl BPlusTree {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<()> {
-        let new_root_page = buffer_pool.allocate_raw_page(wal_writer)?;
+    ) -> io::Result<Vec<Lsn>> {
+        let (new_root_page, lsn1) = buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
         let new_root = InternalNode::new(vec![key], vec![left, right]);
 
-        self.write_node(
+        let lsn2 = self.write_node(
             buffer_pool,
             wal_writer,
             new_root_page,
@@ -308,7 +324,7 @@ impl BPlusTree {
         )?;
 
         self.root = Some(new_root_page);
-        Ok(())
+        Ok(vec![lsn1, lsn2])
     }
 
     pub fn search(
@@ -356,7 +372,7 @@ impl BPlusTree {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Lsn> {
         if let Some(root_page_id) = self.root {
             let (leaf_page_id, _) = self.find_leaf(key, root_page_id, buffer_pool)?;
 
@@ -370,7 +386,7 @@ impl BPlusTree {
                             leaf.write_to(&mut buf);
 
                             // log + write page
-                            Self::update_node(
+                            let lsn = Self::update_node(
                                 buffer_pool,
                                 wal_writer,
                                 leaf_page_id,
@@ -379,7 +395,7 @@ impl BPlusTree {
                                 txn_id,
                             )?;
 
-                            Ok(())
+                            Ok(lsn)
                         }
                         false => Err(Error::new(ErrorKind::NotFound, "key doesn't exist")),
                     },
@@ -435,7 +451,7 @@ impl BPlusTree {
         node: Node,
         record_type: WalRecordType,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Lsn> {
         let node_bytes = node.to_bytes();
         let old_data = buffer_pool.read_page(page_id)?;
 
@@ -449,7 +465,7 @@ impl BPlusTree {
         buffer_pool.write_raw_page(page_id, &new_data, lsn)?;
 
         self.cache.insert(page_id, node);
-        Ok(())
+        Ok(lsn)
     }
 
     pub fn root(&self) -> Option<PageId> {
@@ -565,7 +581,7 @@ impl BPlusTree {
         node_bytes: &[u8],
         record_type: WalRecordType,
         txn_id: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Lsn> {
         let old_data = buffer_pool.read_page(page_id)?;
 
         let mut new_data = old_data.clone();
@@ -576,7 +592,7 @@ impl BPlusTree {
         let lsn = wal_writer.append_raw(record_type, page_id, &new_data, old_data, txn_id)?;
 
         buffer_pool.write_raw_page(page_id, &new_data, lsn)?;
-        Ok(())
+        Ok(lsn)
     }
 }
 
@@ -603,7 +619,7 @@ mod tests {
         let pm = PageManager::new(name).unwrap();
         let mut buffer_pool = BufferPool::new(pm, 64);
         let mut wal_writer = WalWriter::new(name).unwrap();
-        let mut btree = BPlusTree::new(4, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+        let (mut btree, _) = BPlusTree::new(4, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
         for i in 1..=count {
             btree
@@ -627,7 +643,7 @@ mod tests {
         let pm = PageManager::new("test_insert_before_split").unwrap();
         let mut buffer_pool = BufferPool::new(pm, 64);
         let mut wal_writer = WalWriter::new("test_insert_before_split").unwrap();
-        let mut btree = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+        let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
         let rows = get_rows(btree.order);
         let keys = get_integer_keys(btree.order);
 
@@ -672,7 +688,7 @@ mod tests {
         let pm = PageManager::new("test_insert_till_leaf_split").unwrap();
         let mut buffer_pool = BufferPool::new(pm, 64);
         let mut wal_writer = WalWriter::new("test_insert_till_leaf_split").unwrap();
-        let mut btree = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+        let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
         let rows = get_rows(btree.order);
         let keys = get_integer_keys(btree.order);
 
@@ -710,7 +726,7 @@ mod tests {
         let pm = PageManager::new("test_insert_till_internal_node_split").unwrap();
         let mut buffer_pool = BufferPool::new(pm, 64);
         let mut wal_writer = WalWriter::new("test_insert_till_internal_node_split").unwrap();
-        let mut btree = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+        let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
         let rows = get_rows(btree.order);
         let keys = get_integer_keys(9);
 
@@ -771,7 +787,7 @@ mod tests {
         let pm = PageManager::new("test_search_empty_tree").unwrap();
         let mut buffer_pool = BufferPool::new(pm, 64);
         let mut wal_writer = WalWriter::new("test_search_empty_tree").unwrap();
-        let mut btree = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+        let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
         let res = btree
             .search(&IndexKey::Integer(5), &mut buffer_pool)
@@ -788,7 +804,7 @@ mod tests {
         let pm = PageManager::new("test_search_tree_with_leaf_nodes").unwrap();
         let mut buffer_pool = BufferPool::new(pm, 64);
         let mut wal_writer = WalWriter::new("test_search_tree_with_leaf_nodes").unwrap();
-        let mut btree = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+        let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
         let row_1 = RowLocation::new(100, 232);
         let key_1 = IndexKey::Integer(5);
@@ -818,7 +834,7 @@ mod tests {
         let pm = PageManager::new("test_search_tree_with_internal_nodes").unwrap();
         let mut buffer_pool = BufferPool::new(pm, 64);
         let mut wal_writer = WalWriter::new("test_search_tree_with_internal_nodes").unwrap();
-        let mut btree = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+        let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
         let rows = get_rows(15);
         let keys = get_integer_keys(15);
@@ -900,7 +916,7 @@ mod tests {
         let pm = PageManager::new("test_load_node").unwrap();
         let mut buffer_pool = BufferPool::new(pm, 64);
         let mut wal_writer = WalWriter::new("test_load_node").unwrap();
-        let mut btree = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+        let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
         let node = Node::Leaf(LeafNode::new());
         let key = IndexKey::Integer(5);
         let row = RowLocation::new(99, 99);
@@ -945,7 +961,8 @@ mod tests {
             let pm = PageManager::new("test_load_b_plus_tree").unwrap();
             let mut buffer_pool = BufferPool::new(pm, 64);
             let mut wal_writer = WalWriter::new("test_load_b_plus_tree").unwrap();
-            let mut btree = BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+            let (mut btree, _) =
+                BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
             btree
                 .insert(key.clone(), row, &mut buffer_pool, &mut wal_writer, 1)
@@ -983,7 +1000,8 @@ mod tests {
             let mut buffer_pool = BufferPool::new(pm, 64);
             let mut wal_writer =
                 WalWriter::new("test_load_b_plus_tree_internal_node_integer").unwrap();
-            let mut btree = BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+            let (mut btree, _) =
+                BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
             let keys = get_integer_keys(15);
             let rows = get_rows(15);
@@ -1036,7 +1054,8 @@ mod tests {
             let mut buffer_pool = BufferPool::new(pm, 64);
             let mut wal_writer =
                 WalWriter::new("test_load_b_plus_tree_internal_node_text").unwrap();
-            let mut btree = BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+            let (mut btree, _) =
+                BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
             let rows = get_rows(15);
             for (i, row) in rows.iter().enumerate() {
@@ -1094,7 +1113,8 @@ mod tests {
             let pm = PageManager::new("test_delete_persistence_round_trip").unwrap();
             let mut buffer_pool = BufferPool::new(pm, 64);
             let mut wal_writer = WalWriter::new("test_delete_persistence_round_trip").unwrap();
-            let mut btree = BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+            let (mut btree, _) =
+                BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
             btree
                 .insert(key_1.clone(), row_1, &mut buffer_pool, &mut wal_writer, 1)
@@ -1160,7 +1180,8 @@ mod tests {
             let pm = PageManager::new("test_create_new_root_persistence").unwrap();
             let mut buffer_pool = BufferPool::new(pm, 64);
             let mut wal_writer = WalWriter::new("test_create_new_root_persistence").unwrap();
-            let mut btree = BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+            let (mut btree, _) =
+                BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
             for (key, row) in keys.iter().zip(rows.iter()) {
                 btree
@@ -1222,7 +1243,8 @@ mod tests {
             let pm = PageManager::new("test_root_changes_multiple_times").unwrap();
             let mut buffer_pool = BufferPool::new(pm, 64);
             let mut wal_writer = WalWriter::new("test_root_changes_multiple_times").unwrap();
-            let mut btree = BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+            let (mut btree, _) =
+                BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
             for (key, row) in keys.iter().zip(rows.iter()) {
                 let root_before = btree.root;
@@ -1443,7 +1465,7 @@ mod tests {
         let pm = PageManager::new(name).unwrap();
         let mut buffer_pool = BufferPool::new(pm, 64);
         let mut wal_writer = WalWriter::new(name).unwrap();
-        let mut btree = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
+        let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
         for i in 1..=15 {
             btree

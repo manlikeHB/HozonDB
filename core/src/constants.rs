@@ -24,3 +24,6 @@ pub const WAL_RECORD_RAW_TYPE: u8 = 2;
 pub const WAL_RECORD_CHECKPOINT_TYPE: u8 = 3;
 pub const WAL_RECORD_LINK_PAGE_TYPE: u8 = 4;
 pub const WAL_RECORD_ALLOCATE_PAGE_TYPE: u8 = 5;
+
+pub type Lsn = u64;
+pub type TxnId = u64;
