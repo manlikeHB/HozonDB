@@ -152,3 +152,137 @@ impl Executor {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        catalog::row::Value,
+        catalog::schema::{Column, DataType},
+        sql::parser::Statement,
+        test_helpers::*,
+    };
+
+    #[test]
+    fn test_explicit_txn_commit_clears_txn() {
+        cleanup("test_exec_explicit_commit");
+        let mut executor = create_test_executor("test_exec_explicit_commit");
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+        assert!(executor.database.txn_is_active());
+
+        executor.execute(Statement::Commit, &mut None).unwrap();
+        assert!(!executor.database.txn_is_active());
+
+        cleanup("test_exec_explicit_commit");
+    }
+
+    #[test]
+    fn test_implicit_txn_cleared_after_statement() {
+        cleanup("test_exec_implicit_cleared");
+        let mut executor = create_test_executor("test_exec_implicit_cleared");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer, true)],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // implicit txn should be committed and cleared
+        assert!(!executor.database.txn_is_active());
+
+        cleanup("test_exec_implicit_cleared");
+    }
+
+    #[test]
+    fn test_double_begin_errors() {
+        cleanup("test_exec_double_begin");
+        let mut executor = create_test_executor("test_exec_double_begin");
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+        let result = executor.execute(Statement::Begin, &mut None);
+        assert!(result.is_err());
+
+        cleanup("test_exec_double_begin");
+    }
+
+    #[test]
+    fn test_commit_no_txn_errors() {
+        cleanup("test_exec_commit_no_txn");
+        let mut executor = create_test_executor("test_exec_commit_no_txn");
+
+        let result = executor.execute(Statement::Commit, &mut None);
+        assert!(result.is_err());
+
+        cleanup("test_exec_commit_no_txn");
+    }
+
+    #[test]
+    fn test_lsns_collected_on_insert() {
+        cleanup("test_exec_lsns_insert");
+        let mut executor = create_test_executor("test_exec_lsns_insert");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer, true)],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1)],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // txn should have collected lsns before commit
+        let lsn_count = executor.database.txn_lsns().unwrap().len();
+        assert!(lsn_count > 0, "expected LSNs to be tracked on active txn");
+
+        executor.execute(Statement::Commit, &mut None).unwrap();
+
+        cleanup("test_exec_lsns_insert");
+    }
+
+    #[test]
+    fn test_lsns_collected_on_create_table() {
+        cleanup("test_exec_lsns_create");
+        let mut executor = create_test_executor("test_exec_lsns_create");
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer, true)],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        // create table generates at least 2 lsns: AllocatePage + CreateTable WAL record
+        let lsn_count = executor.database.txn_lsns().unwrap().len();
+        assert!(
+            lsn_count >= 2,
+            "expected at least 2 LSNs for CREATE TABLE, got {}",
+            lsn_count
+        );
+
+        executor.execute(Statement::Commit, &mut None).unwrap();
+
+        cleanup("test_exec_lsns_create");
+    }
+}

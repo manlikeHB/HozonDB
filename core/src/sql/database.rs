@@ -420,7 +420,7 @@ impl Database {
         old_data: &[u8],
     ) -> io::Result<u64> {
         let txn_id = self.cur_txn_id()?;
-        Ok(self.wal_writer.append_slotted(
+        let lsn = self.wal_writer.append_slotted(
             record_type,
             table_name,
             page_id,
@@ -428,7 +428,9 @@ impl Database {
             new_data,
             old_data,
             txn_id,
-        )?)
+        )?;
+        self.add_lsn_to_txn(lsn)?;
+        Ok(lsn)
     }
 
     pub fn wal_append_raw(
@@ -439,9 +441,11 @@ impl Database {
         old_data: &[u8],
     ) -> io::Result<u64> {
         let txn_id = self.cur_txn_id()?;
-        Ok(self
+        let lsn = self
             .wal_writer
-            .append_raw(record_type, page_id, new_data, old_data, txn_id)?)
+            .append_raw(record_type, page_id, new_data, old_data, txn_id)?;
+        self.add_lsn_to_txn(lsn)?;
+        Ok(lsn)
     }
 
     // Transaction
@@ -455,6 +459,13 @@ impl Database {
         match &self.txn {
             Some(txn) => Ok(txn.id()),
             None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
+        }
+    }
+
+    pub fn txn_is_active(&self) -> bool {
+        match &self.txn {
+            Some(_) => true,
+            None => false,
         }
     }
 
@@ -530,5 +541,139 @@ impl Database {
             }
             None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
         }
+    }
+
+    pub fn txn_lsns(&self) -> io::Result<&[Lsn]> {
+        match &self.txn {
+            Some(txn) => Ok(txn.lsns()),
+            None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
+        }
+    }
+
+    pub fn rollback_txn(&mut self) -> io::Result<()> {
+        match &self.txn {
+            Some(_) => Ok(()), // TODO
+            None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::*;
+
+    #[test]
+    fn test_begin_explicit_sets_txn() {
+        cleanup("test_db_begin_explicit");
+        let mut db = Database::new("test_db_begin_explicit").unwrap();
+
+        db.begin_explicit_txn().unwrap();
+        assert!(db.txn.is_some());
+        assert!(!db.txn.as_ref().unwrap().is_implicit());
+
+        cleanup("test_db_begin_explicit");
+    }
+
+    #[test]
+    fn test_begin_implicit_sets_txn() {
+        cleanup("test_db_begin_implicit");
+        let mut db = Database::new("test_db_begin_implicit").unwrap();
+
+        db.begin_implicit_txn().unwrap();
+        assert!(db.txn.is_some());
+        assert!(db.txn.as_ref().unwrap().is_implicit());
+
+        cleanup("test_db_begin_implicit");
+    }
+
+    #[test]
+    fn test_begin_when_txn_already_active_errors() {
+        cleanup("test_db_double_begin");
+        let mut db = Database::new("test_db_double_begin").unwrap();
+
+        db.begin_explicit_txn().unwrap();
+        let result = db.begin_explicit_txn();
+        assert!(result.is_err());
+
+        cleanup("test_db_double_begin");
+    }
+
+    #[test]
+    fn test_begin_implicit_noop_when_txn_active() {
+        cleanup("test_db_implicit_noop");
+        let mut db = Database::new("test_db_implicit_noop").unwrap();
+
+        db.begin_explicit_txn().unwrap();
+        let txn_id_before = db.cur_txn_id().unwrap();
+
+        // should not error or replace the existing txn
+        db.begin_implicit_txn().unwrap();
+        assert_eq!(db.cur_txn_id().unwrap(), txn_id_before);
+
+        cleanup("test_db_implicit_noop");
+    }
+
+    #[test]
+    fn test_commit_clears_txn() {
+        cleanup("test_db_commit");
+        let mut db = Database::new("test_db_commit").unwrap();
+
+        db.begin_explicit_txn().unwrap();
+        db.commit_txn().unwrap();
+        assert!(db.txn.is_none());
+
+        cleanup("test_db_commit");
+    }
+
+    #[test]
+    fn test_commit_with_no_txn_errors() {
+        cleanup("test_db_commit_no_txn");
+        let mut db = Database::new("test_db_commit_no_txn").unwrap();
+
+        let result = db.commit_txn();
+        assert!(result.is_err());
+
+        cleanup("test_db_commit_no_txn");
+    }
+
+    #[test]
+    fn test_rollback_with_no_txn_errors() {
+        cleanup("test_db_rollback_no_txn");
+        let mut db = Database::new("test_db_rollback_no_txn").unwrap();
+
+        let result = db.rollback_txn();
+        assert!(result.is_err());
+
+        cleanup("test_db_rollback_no_txn");
+    }
+
+    #[test]
+    fn test_cur_txn_id_with_no_txn_errors() {
+        cleanup("test_db_cur_txn_id");
+        let db = Database::new("test_db_cur_txn_id").unwrap();
+
+        let result = db.cur_txn_id();
+        assert!(result.is_err());
+
+        cleanup("test_db_cur_txn_id");
+    }
+
+    #[test]
+    fn test_txn_id_increments() {
+        cleanup("test_db_txn_id_inc");
+        let mut db = Database::new("test_db_txn_id_inc").unwrap();
+
+        db.begin_explicit_txn().unwrap();
+        let id1 = db.cur_txn_id().unwrap();
+        db.commit_txn().unwrap();
+
+        db.begin_explicit_txn().unwrap();
+        let id2 = db.cur_txn_id().unwrap();
+        db.commit_txn().unwrap();
+
+        assert!(id2 > id1);
+
+        cleanup("test_db_txn_id_inc");
     }
 }
