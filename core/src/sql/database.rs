@@ -111,10 +111,10 @@ impl Database {
 
     pub fn free_page(&mut self, page_id: PageId) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
-        let lsn = self
-            .buffer_pool
-            .free_page(page_id, &mut self.wal_writer, txn_id)?;
-        self.add_lsn_to_txn(lsn)
+        let (lsn, wal_offset) =
+            self.buffer_pool
+                .free_page(page_id, &mut self.wal_writer, txn_id)?;
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)
     }
 
     pub fn is_page_cached(&self, page_id: PageId) -> bool {
@@ -123,10 +123,10 @@ impl Database {
 
     pub fn allocate_slotted_page(&mut self) -> io::Result<PageId> {
         let txn_id = self.cur_txn_id()?;
-        let (page_id, lsn) = self
+        let (page_id, lsn, wal_offset) = self
             .buffer_pool
             .allocate_slotted_page(&mut self.wal_writer, txn_id)?;
-        self.add_lsn_to_txn(lsn)?;
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)?;
         Ok(page_id)
     }
 
@@ -136,13 +136,13 @@ impl Database {
         next_page: PageId,
     ) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
-        let lsn = self.buffer_pool.update_next_page_in_page_metadata(
+        let (lsn, wal_offset) = self.buffer_pool.update_next_page_in_page_metadata(
             page_id,
             next_page,
             &mut self.wal_writer,
             txn_id,
         )?;
-        self.add_lsn_to_txn(lsn)
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)
     }
 
     /// Check if page is cached in buffer pool (frames)
@@ -160,7 +160,7 @@ impl Database {
             txn_id,
         )?;
 
-        self.add_lsns_to_txn(&lsns)?;
+        self.add_lsns_and_wal_offsets_to_txn(&lsns)?;
 
         if let Some(pk_col) = schema.columns().iter().find(|c| c.is_primary_key()) {
             let column_type = IndexColumnType::try_from(*pk_col.data_type())?;
@@ -170,7 +170,7 @@ impl Database {
                 &mut self.wal_writer,
                 txn_id,
             )?;
-            self.add_lsns_to_txn(&lsns)?;
+            self.add_lsns_and_wal_offsets_to_txn(&lsns)?;
             let root_page_id = btree.root().ok_or_else(|| {
                 return Error::new(ErrorKind::InvalidData, "b+ tree root page id not set");
             })?;
@@ -230,13 +230,13 @@ impl Database {
 
         // remove catalog entry
         let txn_id = self.cur_txn_id()?;
-        let lsn = self.table_catalog.drop_table(
+        let (lsn, wal_offset) = self.table_catalog.drop_table(
             table_name,
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
         )?;
-        self.add_lsn_to_txn(lsn)?;
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)?;
 
         // free pages
         let txn_id = self.cur_txn_id()?;
@@ -247,7 +247,7 @@ impl Database {
                 .free_page(page_id, &mut self.wal_writer, txn_id)?;
             lsns.push(lsn);
         }
-        self.add_lsns_to_txn(&lsns)?;
+        self.add_lsns_and_wal_offsets_to_txn(&lsns)?;
 
         // drop indexes
         self.drop_table_indexes(table_name)?;
@@ -261,13 +261,13 @@ impl Database {
         let index_name = entry.index_name().to_owned();
 
         let txn_id = self.cur_txn_id()?;
-        let lsn = self.index_catalog.add_index(
+        let (lsn, wal_offset) = self.index_catalog.add_index(
             &mut self.buffer_pool,
             &mut self.wal_writer,
             entry,
             txn_id,
         )?;
-        self.add_lsn_to_txn(lsn)?;
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)?;
         self.indexes.insert(index_name, btree);
 
         Ok(())
@@ -284,14 +284,14 @@ impl Database {
     pub fn remove_index(&mut self, table_name: &str, index_name: &str) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
 
-        let lsn = self.index_catalog.remove_index(
+        let (lsn, wal_offset) = self.index_catalog.remove_index(
             table_name,
             index_name,
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
         )?;
-        self.add_lsn_to_txn(lsn)?;
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)?;
         Ok(())
     }
 
@@ -301,13 +301,13 @@ impl Database {
 
     pub fn drop_table_indexes(&mut self, table_name: &str) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
-        let lsn = self.index_catalog.remove_table_indexes(
+        let (lsn, wal_offset) = self.index_catalog.remove_table_indexes(
             table_name,
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
         )?;
-        self.add_lsn_to_txn(lsn)
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)
     }
 
     pub fn get_table_last_page(&self, table_name: &str) -> Option<PageId> {
@@ -316,14 +316,14 @@ impl Database {
 
     pub fn update_table_last_page(&mut self, table_name: &str, page_id: PageId) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
-        let lsn = self.table_catalog.update_last_page(
+        let (lsn, wal_offset) = self.table_catalog.update_last_page(
             table_name,
             page_id,
             &mut self.buffer_pool,
             &mut self.wal_writer,
             txn_id,
         )?;
-        self.add_lsn_to_txn(lsn)
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)
     }
 
     // Indexes
@@ -348,7 +348,7 @@ impl Database {
             &mut self.wal_writer,
             txn_id,
         )?;
-        self.add_lsns_to_txn(&lsns)?;
+        self.add_lsns_and_wal_offsets_to_txn(&lsns)?;
         Ok(())
     }
 
@@ -376,8 +376,9 @@ impl Database {
             .get_mut(index_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index not found"))?;
 
-        let lsn = btree.delete(key, &mut self.buffer_pool, &mut self.wal_writer, txn_id)?;
-        self.add_lsn_to_txn(lsn)
+        let (lsn, wal_offset) =
+            btree.delete(key, &mut self.buffer_pool, &mut self.wal_writer, txn_id)?;
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)
     }
 
     pub fn range_index_scan(
@@ -420,7 +421,7 @@ impl Database {
         old_data: &[u8],
     ) -> io::Result<u64> {
         let txn_id = self.cur_txn_id()?;
-        let lsn = self.wal_writer.append_slotted(
+        let (lsn, wal_offset) = self.wal_writer.append_slotted(
             record_type,
             table_name,
             page_id,
@@ -429,7 +430,7 @@ impl Database {
             old_data,
             txn_id,
         )?;
-        self.add_lsn_to_txn(lsn)?;
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)?;
         Ok(lsn)
     }
 
@@ -441,10 +442,10 @@ impl Database {
         old_data: &[u8],
     ) -> io::Result<u64> {
         let txn_id = self.cur_txn_id()?;
-        let lsn = self
-            .wal_writer
-            .append_raw(record_type, page_id, new_data, old_data, txn_id)?;
-        self.add_lsn_to_txn(lsn)?;
+        let (lsn, wal_offset) =
+            self.wal_writer
+                .append_raw(record_type, page_id, new_data, old_data, txn_id)?;
+        self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)?;
         Ok(lsn)
     }
 
@@ -524,18 +525,21 @@ impl Database {
         }
     }
 
-    pub fn add_lsn_to_txn(&mut self, lsn: Lsn) -> io::Result<()> {
+    pub fn add_lsn_and_wal_offset_to_txn(&mut self, lsn: u64, wal_offset: u64) -> io::Result<()> {
         match &mut self.txn {
-            Some(txn) => Ok(txn.add_lsn(lsn)),
+            Some(txn) => Ok(txn.add_lsns_and_wal_offsets(lsn, wal_offset)),
             None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
         }
     }
 
-    pub fn add_lsns_to_txn(&mut self, lsns: &[Lsn]) -> io::Result<()> {
+    pub fn add_lsns_and_wal_offsets_to_txn(
+        &mut self,
+        lsns_and_wal_offsets: &[(Lsn, u64)],
+    ) -> io::Result<()> {
         match &mut self.txn {
             Some(txn) => {
-                for lsn in lsns {
-                    txn.add_lsn(*lsn);
+                for (lsn, wal_offset) in lsns_and_wal_offsets {
+                    txn.add_lsns_and_wal_offsets(*lsn, *wal_offset);
                 }
                 Ok(())
             }
@@ -543,9 +547,9 @@ impl Database {
         }
     }
 
-    pub fn txn_lsns(&self) -> io::Result<&[Lsn]> {
+    pub fn txn_lsns_and_wal_offset(&self) -> io::Result<&[(Lsn, u64)]> {
         match &self.txn {
-            Some(txn) => Ok(txn.lsns()),
+            Some(txn) => Ok(txn.lsns_and_wal_offsets()),
             None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
         }
     }
@@ -555,6 +559,16 @@ impl Database {
             Some(_) => Ok(()), // TODO
             None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
         }
+    }
+
+    pub fn txn_lsns(&self) -> io::Result<Vec<Lsn>> {
+        let lsn_wal_offset = self.txn_lsns_and_wal_offset()?;
+        Ok(lsn_wal_offset.iter().map(|(lsn, _)| *lsn).collect())
+    }
+
+    pub fn txn_wal_offsets(&self) -> io::Result<Vec<Lsn>> {
+        let lsn_wal_offset = self.txn_lsns_and_wal_offset()?;
+        Ok(lsn_wal_offset.iter().map(|(_, wo)| *wo).collect())
     }
 }
 

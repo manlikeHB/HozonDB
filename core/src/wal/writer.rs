@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::{fs::File, path::Path};
 
@@ -12,6 +13,7 @@ pub struct WalWriter {
     lsn: u64,
     file: File,
     checkpoint: u64,
+    txn_last_lsn_and_offsets: HashMap<u64, (u64, u64)>, // txn_id -> (last record lsn, last record offset)
 }
 
 impl WalWriter {
@@ -54,6 +56,7 @@ impl WalWriter {
                     lsn: 1,
                     file,
                     checkpoint,
+                    txn_last_lsn_and_offsets: HashMap::new(),
                 });
             } else {
                 file.seek(SeekFrom::Start(checkpoint))?;
@@ -91,6 +94,7 @@ impl WalWriter {
                     lsn,
                     file,
                     checkpoint,
+                    txn_last_lsn_and_offsets: HashMap::new(),
                 })
             }
         } else {
@@ -112,10 +116,13 @@ impl WalWriter {
                 lsn: 1,
                 file,
                 checkpoint: WAL_RECORD_START as u64,
+                txn_last_lsn_and_offsets: HashMap::new(),
             })
         }
     }
 
+    /// Append a Slotted WAL record
+    /// returns the records LSN and WAL offset
     pub fn append_slotted(
         &mut self,
         record_type: WalRecordType,
@@ -125,13 +132,13 @@ impl WalWriter {
         new_data: &[u8],
         old_data: &[u8],
         txn_id: u64,
-    ) -> io::Result<u64> {
+    ) -> io::Result<(u64, u64)> {
         // read current lsn and increment
         let lsn = self.lsn;
         self.lsn += 1;
 
         // create new record
-        let record = WalRecord::new_slotted(
+        let mut record = WalRecord::new_slotted(
             lsn,
             record_type,
             table_name,
@@ -142,10 +149,12 @@ impl WalWriter {
             txn_id,
         );
 
-        self.append(&record)?;
-        Ok(lsn)
+        let offset = self.append(&mut record)?;
+        Ok((lsn, offset))
     }
 
+    /// Append a Raw WAL record
+    /// returns the records LSN and WAL offset
     pub fn append_raw(
         &mut self,
         record_type: WalRecordType,
@@ -153,65 +162,89 @@ impl WalWriter {
         new_data: &[u8],
         old_data: &[u8],
         txn_id: u64,
-    ) -> io::Result<u64> {
+    ) -> io::Result<(u64, u64)> {
         // read current lsn and increment
         let lsn = self.lsn;
         self.lsn += 1;
 
         // create new record
-        let record = WalRecord::new_raw(lsn, record_type, page_id, new_data, old_data, txn_id);
+        let mut record = WalRecord::new_raw(lsn, record_type, page_id, new_data, old_data, txn_id);
 
-        self.append(&record)?;
-        Ok(lsn)
+        let offset = self.append(&mut record)?;
+        Ok((lsn, offset))
     }
 
+    /// Append a Checkpoint WAL record
+    /// returns the records LSN and WAL offset
     fn append_checkpoint(&mut self) -> io::Result<u64> {
         // read current lsn and increment
         let lsn = self.lsn;
         self.lsn += 1;
 
         // create new record
-        let record = WalRecord::new_checkpoint(lsn);
+        let mut record = WalRecord::new_checkpoint(lsn);
 
-        self.append(&record)?;
+        self.append(&mut record)?;
         Ok(lsn)
     }
 
+    /// Append a Link page WAL record
+    /// returns the records LSN and WAL offset
     pub fn append_link_page(
         &mut self,
         page_id: PageId,
         next_page: PageId,
         txn_id: u64,
-    ) -> io::Result<u64> {
+    ) -> io::Result<(u64, u64)> {
         // read current lsn and increment
         let lsn = self.lsn;
         self.lsn += 1;
 
         // create new record
-        let record = WalRecord::new_link_page(lsn, page_id, next_page, txn_id);
+        let mut record = WalRecord::new_link_page(lsn, page_id, next_page, txn_id);
 
-        self.append(&record)?;
-        Ok(lsn)
+        let offset = self.append(&mut record)?;
+        Ok((lsn, offset))
     }
 
+    /// Append a Allocate page WAL record
+    /// returns the records LSN and WAL offset
     pub fn append_allocate_page(
         &mut self,
         page_id: PageId,
         page_type: u8,
         txn_id: u64,
-    ) -> io::Result<u64> {
+    ) -> io::Result<(u64, u64)> {
         let lsn = self.lsn;
-        let record = WalRecord::new_allocate_page(lsn, page_id, page_type, txn_id);
-        self.append(&record)?;
+        let mut record = WalRecord::new_allocate_page(lsn, page_id, page_type, txn_id);
+        let offset = self.append(&mut record)?;
+        self.lsn += 1;
+        Ok((lsn, offset))
+    }
+
+    /// Append a abort transaction WAL record
+    /// returns the LSN
+    pub fn append_abort_txn(&mut self, txn_id: u64) -> io::Result<u64> {
+        let lsn = self.lsn;
+        let mut record = WalRecord::new_abort(lsn, txn_id);
+        self.append(&mut record)?;
         self.lsn += 1;
         Ok(lsn)
     }
 
-    // Each WAL append syncs to disk immediately — O(n) fsyncs for bulk operations.
-    // TODO: implement group commit once transactions are supported.
-    // With transactions, sync_all moves to commit time, amortizing the cost
-    // across all operations in a transaction.
-    fn append(&mut self, record: &WalRecord) -> io::Result<()> {
+    // WAL is synced to disk at commit time (group commit) for explicit transactions.
+    // Implicit single-statement transactions sync immediately after each operation.
+    fn append(&mut self, record: &mut WalRecord) -> io::Result<u64> {
+        // offset for current record ( new prev offset)
+        let record_offset = self.file.seek(SeekFrom::Current(0))?;
+
+        // set prev lsn and prev offset in record
+        if let Some(txn_id) = record.txn_id() {
+            if let Some((pl, po)) = self.txn_last_lsn_and_offsets.get(&txn_id) {
+                record.set_prev_link(*pl, *po);
+            }
+        }
+
         let record_byte = record.to_bytes();
 
         // append new record (record len + record)
@@ -220,7 +253,14 @@ impl WalWriter {
         record_data.extend_from_slice(&record_byte);
 
         self.file.write_all(&record_data)?;
-        Ok(())
+
+        // update prev offset
+        if let Some(txn_id) = record.txn_id() {
+            self.txn_last_lsn_and_offsets
+                .insert(txn_id, (record.lsn(), record_offset));
+        }
+
+        Ok(record_offset)
     }
 
     pub fn sync(&mut self) -> io::Result<()> {
@@ -270,7 +310,7 @@ mod tests {
     fn test_append_single_record() {
         let _ = fs::remove_file("test_append.wal");
         let mut wal = WalWriter::new("test_append").unwrap();
-        let lsn = wal
+        let (lsn, _) = wal
             .append_slotted(WalRecordType::Insert, "users", 1, 0, b"data", &[], 234)
             .unwrap();
         assert_eq!(lsn, 1);
@@ -326,17 +366,17 @@ mod tests {
 
         {
             let mut wal = WalWriter::new("test_persist").unwrap();
-            let lsn = wal
+            let (lsn, _) = wal
                 .append_slotted(WalRecordType::Insert, "users", 1, 0, b"alice", &[], 2345)
                 .unwrap();
             assert_eq!(lsn, 1);
 
-            let lsn = wal
+            let (lsn, _) = wal
                 .append_slotted(WalRecordType::Insert, "users", 1, 1, b"bob", &[], 2345)
                 .unwrap();
             assert_eq!(lsn, 2);
 
-            let lsn = wal
+            let (lsn, _) = wal
                 .append_slotted(
                     WalRecordType::Update,
                     "users",
@@ -365,7 +405,7 @@ mod tests {
             assert_eq!(wal.checkpoint, WAL_RECORD_START as u64);
 
             // should still be able to append
-            let lsn = wal
+            let (lsn, _) = wal
                 .append_slotted(WalRecordType::Delete, "users", 1, 1, &[], b"bob", 52)
                 .unwrap();
             assert_eq!(lsn, 4);
@@ -391,7 +431,7 @@ mod tests {
         let _ = fs::remove_file("test_append_raw.wal");
         let mut wal = WalWriter::new("test_append_raw").unwrap();
 
-        let lsn = wal
+        let (lsn, _) = wal
             .append_raw(
                 WalRecordType::CreateTable,
                 1,
@@ -412,13 +452,13 @@ mod tests {
         let _ = fs::remove_file("test_lsn_mixed.wal");
         let mut wal = WalWriter::new("test_lsn_mixed").unwrap();
 
-        let lsn1 = wal
+        let (lsn1, _) = wal
             .append_slotted(WalRecordType::Insert, "users", 1, 0, b"row", &[], 654)
             .unwrap();
-        let lsn2 = wal
+        let (lsn2, _) = wal
             .append_raw(WalRecordType::IndexNode, 2, b"node", b"old", 86)
             .unwrap();
-        let lsn3 = wal
+        let (lsn3, _) = wal
             .append_slotted(WalRecordType::Delete, "users", 1, 0, &[], b"row", 124)
             .unwrap();
 
@@ -492,7 +532,7 @@ mod tests {
         let _ = fs::remove_file("test_link_page.wal");
         let mut wal = WalWriter::new("test_link_page").unwrap();
 
-        let lsn = wal.append_link_page(3, 7, 234).unwrap(); // page_id=3, next_page=7
+        let (lsn, _) = wal.append_link_page(3, 7, 234).unwrap(); // page_id=3, next_page=7
         assert_eq!(lsn, 1);
         assert_eq!(wal.lsn, 2);
 
@@ -504,11 +544,11 @@ mod tests {
         let _ = fs::remove_file("test_link_lsn.wal");
         let mut wal = WalWriter::new("test_link_lsn").unwrap();
 
-        let lsn1 = wal
+        let (lsn1, _) = wal
             .append_slotted(WalRecordType::Insert, "users", 3, 0, b"row", &[], 234)
             .unwrap();
-        let lsn2 = wal.append_link_page(3, 4, 6543).unwrap();
-        let lsn3 = wal
+        let (lsn2, _) = wal.append_link_page(3, 4, 6543).unwrap();
+        let (lsn3, _) = wal
             .append_slotted(WalRecordType::Insert, "users", 4, 0, b"row2", &[], 6543)
             .unwrap();
 

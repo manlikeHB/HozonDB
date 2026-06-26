@@ -7,6 +7,7 @@ use crate::{
     wal::{constants::MAGIC_NUMBER, record::WalRecord, record_type::WalRecordType},
 };
 use std::{
+    collections::HashSet,
     fs::File,
     io::{self, Error, ErrorKind, Read, Seek, SeekFrom},
     path::Path,
@@ -56,7 +57,11 @@ impl WalReader {
 
     pub fn recover(mut self, buffer_pool: &mut BufferPool) -> io::Result<u64> {
         let mut last_txn_id = 0;
-        // walk the records and re apply changes
+
+        // collect all wal records and aborted txn ids
+        let mut records = Vec::new();
+        let mut aborted_txns = HashSet::new();
+
         loop {
             let mut record_len_bytes = [0u8; 4];
             match self.file.read_exact(&mut record_len_bytes) {
@@ -75,14 +80,31 @@ impl WalReader {
             let record = WalRecord::from_bytes(&record_bytes)?;
 
             match record {
+                WalRecord::Abort { txn_id, .. } => {
+                    aborted_txns.insert(txn_id);
+                }
+                _ => {}
+            }
+
+            if let Some(txn_id) = record.txn_id() {
+                last_txn_id = txn_id
+            }
+
+            records.push(record);
+        }
+
+        // walk the records and re apply changes
+        for record in records {
+            // skip records with Aborted txn_id
+            if let Some(txn_id) = record.txn_id() {
+                if aborted_txns.contains(&txn_id) {
+                    continue;
+                }
+            }
+
+            match record {
                 WalRecord::Checkpoint { .. } => {}
                 WalRecord::Slotted { record_type, .. } => {
-                    last_txn_id = record.txn_id().ok_or_else(|| {
-                        io::Error::new(
-                            ErrorKind::InvalidData,
-                            "Slotted WAL record type should contain a tnx_id",
-                        )
-                    })?;
                     match record_type {
                         WalRecordType::Insert => recover_insert(&record, buffer_pool)?,
                         WalRecordType::Update => recover_update(&record, buffer_pool)?,
@@ -90,15 +112,7 @@ impl WalReader {
                         _ => {} // other slotted types don't need recovery
                     }
                 }
-                WalRecord::Raw { .. } => {
-                    last_txn_id = record.txn_id().ok_or_else(|| {
-                        io::Error::new(
-                            ErrorKind::InvalidData,
-                            "Raw WAL record type should contain a tnx_id",
-                        )
-                    })?;
-                    replay_raw_page_new_data(&record, buffer_pool)?
-                }
+                WalRecord::Raw { .. } => replay_raw_page_new_data(&record, buffer_pool)?,
                 WalRecord::LinkPage { .. } => {
                     last_txn_id = record.txn_id().ok_or_else(|| {
                         io::Error::new(
@@ -111,13 +125,13 @@ impl WalReader {
                 WalRecord::AllocatePage {
                     page_id, page_type, ..
                 } => {
-                    last_txn_id = record.txn_id().ok_or_else(|| {
-                        io::Error::new(
-                            ErrorKind::InvalidData,
-                            "AllocatePage WAL record type should contain a tnx_id",
-                        )
-                    })?;
                     recover_allocate_page(page_id, page_type, buffer_pool)?;
+                }
+                WalRecord::Abort { txn_id, .. } => {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("Abort Wal record type with txn_id:{} not skipped", txn_id),
+                    ));
                 }
             }
         }
@@ -401,7 +415,7 @@ mod tests {
 
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
-        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
@@ -446,10 +460,10 @@ mod tests {
 
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
-        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let row_bytes = b"row data";
 
-        let lsn = wal
+        let (lsn, _) = wal
             .append_slotted(
                 WalRecordType::Insert,
                 "users",
@@ -498,11 +512,11 @@ mod tests {
 
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
-        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         let row_bytes = b"some row data";
 
-        let insert_lsn = wal
+        let (insert_lsn, _) = wal
             .append_slotted(
                 WalRecordType::Insert,
                 "users",
@@ -567,11 +581,11 @@ mod tests {
 
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
-        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         let row_bytes = b"some row data";
 
-        let insert_lsn = wal
+        let (insert_lsn, _) = wal
             .append_slotted(
                 WalRecordType::Insert,
                 "users",
@@ -598,7 +612,7 @@ mod tests {
             offset
         };
 
-        let delete_lsn = wal
+        let (delete_lsn, _) = wal
             .append_slotted(
                 WalRecordType::Delete,
                 "users",
@@ -644,8 +658,8 @@ mod tests {
 
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
-        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
-        let (next_page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (next_page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
@@ -675,10 +689,10 @@ mod tests {
 
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
-        let (page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
-        let (next_page_id, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let (next_page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
-        let lsn = wal.append_link_page(page_id, next_page_id, 432).unwrap();
+        let (lsn, _) = wal.append_link_page(page_id, next_page_id, 432).unwrap();
 
         // apply link to frame — simulates link + checkpoint
         {
@@ -710,7 +724,7 @@ mod tests {
         cleanup("test_rec_raw");
         let (mut bp, mut wal) = setup("test_rec_raw");
 
-        let (page_id, _) = bp.allocate_raw_page(&mut wal, 1).unwrap();
+        let (page_id, _, _) = bp.allocate_raw_page(&mut wal, 1).unwrap();
 
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
@@ -742,14 +756,14 @@ mod tests {
         cleanup("test_rec_raw_skip");
         let (mut bp, mut wal) = setup("test_rec_raw_skip");
 
-        let (page_id, _) = bp.allocate_raw_page(&mut wal, 1).unwrap();
+        let (page_id, _, _) = bp.allocate_raw_page(&mut wal, 1).unwrap();
 
         // build new page with distinctive data
         let mut new_page = [0u8; PAGE_SIZE];
         new_page[OFFSET_RAW_PAGE_START + 1] = 0xBB;
 
         let old_page = bp.read_page(page_id).unwrap().clone();
-        let lsn = wal
+        let (lsn, _) = wal
             .append_raw(WalRecordType::IndexNode, page_id, &new_page, &old_page, 234)
             .unwrap();
 
@@ -770,5 +784,154 @@ mod tests {
         assert_eq!(page[OFFSET_RAW_PAGE_START + 1], 0xBB);
 
         cleanup("test_rec_raw_skip");
+    }
+
+    #[test]
+    fn test_recover_skips_aborted_txn() {
+        cleanup("test_rec_abort_skip");
+        let (mut bp, mut wal) = setup("test_rec_abort_skip");
+
+        let _ = bp.allocate_slotted_page(&mut wal, 0).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 0).unwrap();
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+
+        bp.flush_dirty().unwrap();
+        wal.checkpoint().unwrap();
+
+        let row_bytes = b"should not survive rollback";
+        let aborted_txn_id = 99;
+
+        // log an insert under an aborted txn
+        wal.append_slotted(
+            WalRecordType::Insert,
+            "users",
+            page_id,
+            0,
+            row_bytes,
+            &[],
+            aborted_txn_id,
+        )
+        .unwrap();
+
+        // log the abort record
+        wal.append_abort_txn(aborted_txn_id).unwrap();
+
+        WalReader::new("test_rec_abort_skip")
+            .unwrap()
+            .recover(&mut bp)
+            .unwrap();
+
+        // slot should not have been applied
+        let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
+        assert_eq!(meta.slot_count().unwrap(), 0);
+
+        cleanup("test_rec_abort_skip");
+    }
+
+    #[test]
+    fn test_recover_replays_committed_skips_aborted() {
+        cleanup("test_rec_mixed_txns");
+        let (mut bp, mut wal) = setup("test_rec_mixed_txns");
+
+        let _ = bp.allocate_slotted_page(&mut wal, 0).unwrap();
+        let _ = bp.allocate_slotted_page(&mut wal, 0).unwrap();
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+
+        bp.flush_dirty().unwrap();
+        wal.checkpoint().unwrap();
+
+        let committed_row = b"committed row";
+        let aborted_row = b"aborted row";
+        let committed_txn_id = 2;
+        let aborted_txn_id = 3;
+
+        // committed txn write
+        wal.append_slotted(
+            WalRecordType::Insert,
+            "users",
+            page_id,
+            0,
+            committed_row,
+            &[],
+            committed_txn_id,
+        )
+        .unwrap();
+
+        // aborted txn write
+        wal.append_slotted(
+            WalRecordType::Insert,
+            "users",
+            page_id,
+            1,
+            aborted_row,
+            &[],
+            aborted_txn_id,
+        )
+        .unwrap();
+
+        // only txn 2 aborted
+        wal.append_abort_txn(aborted_txn_id).unwrap();
+
+        WalReader::new("test_rec_mixed_txns")
+            .unwrap()
+            .recover(&mut bp)
+            .unwrap();
+
+        // slot 0 (committed) should exist
+        let page = bp.read_page(page_id).unwrap();
+        let (_, len0) = PageManager::read_slot(page, 0);
+        assert_eq!(len0 as usize, committed_row.len());
+
+        // slot 1 (aborted) should not have been applied
+        let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
+        assert_eq!(meta.slot_count().unwrap(), 1);
+
+        cleanup("test_rec_mixed_txns");
+    }
+
+    #[test]
+    fn test_recover_abort_before_write_has_no_effect() {
+        cleanup("test_rec_abort_no_writes");
+        let (mut bp, mut wal) = setup("test_rec_abort_no_writes");
+
+        bp.flush_dirty().unwrap();
+        wal.checkpoint().unwrap();
+
+        // abort a txn that never wrote anything
+        wal.append_abort_txn(42).unwrap();
+
+        // should not error
+        WalReader::new("test_rec_abort_no_writes")
+            .unwrap()
+            .recover(&mut bp)
+            .unwrap();
+
+        cleanup("test_rec_abort_no_writes");
+    }
+
+    #[test]
+    fn test_recover_returns_correct_last_txn_id_with_abort() {
+        cleanup("test_rec_abort_txn_id");
+        let (mut bp, mut wal) = setup("test_rec_abort_txn_id");
+
+        bp.flush_dirty().unwrap();
+        wal.checkpoint().unwrap();
+
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+
+        wal.append_slotted(WalRecordType::Insert, "users", page_id, 0, b"row", &[], 5)
+            .unwrap();
+
+        wal.append_abort_txn(5).unwrap();
+
+        let last_txn_id = WalReader::new("test_rec_abort_txn_id")
+            .unwrap()
+            .recover(&mut bp)
+            .unwrap();
+
+        // last seen txn id should be 5
+        assert_eq!(last_txn_id, 5);
+
+        cleanup("test_rec_abort_txn_id");
     }
 }

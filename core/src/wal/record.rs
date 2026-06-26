@@ -2,11 +2,11 @@ use std::io::{Error, ErrorKind};
 
 use crate::{
     constants::{
-        PageId, WAL_RECORD_ALLOCATE_PAGE_TYPE, WAL_RECORD_CHECKPOINT_TYPE,
+        PageId, WAL_RECORD_ABORT_TYPE, WAL_RECORD_ALLOCATE_PAGE_TYPE, WAL_RECORD_CHECKPOINT_TYPE,
         WAL_RECORD_LINK_PAGE_TYPE, WAL_RECORD_RAW_TYPE, WAL_RECORD_SLOTTED_TYPE,
     },
     storage::page::PageType,
-    wal::record_type::WalRecordType,
+    wal::{constants::NO_PREV_WAL_LINK, record_type::WalRecordType},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20,6 +20,8 @@ pub enum WalRecord {
         new_data: Vec<u8>,
         old_data: Vec<u8>,
         txn_id: u64,
+        prev_lsn: Option<u64>,    // LSN of previous record in same txn
+        prev_offset: Option<u64>, // byte offset of that record in the WAL file
     },
     Raw {
         lsn: u64,
@@ -28,6 +30,8 @@ pub enum WalRecord {
         new_data: Vec<u8>,
         old_data: Vec<u8>,
         txn_id: u64,
+        prev_lsn: Option<u64>,    // LSN of previous record in same txn
+        prev_offset: Option<u64>, // byte offset of that record in the WAL file
     },
     Checkpoint {
         lsn: u64,
@@ -37,11 +41,19 @@ pub enum WalRecord {
         page_id: PageId,
         next_page: PageId,
         txn_id: u64,
+        prev_lsn: Option<u64>,    // LSN of previous record in same txn
+        prev_offset: Option<u64>, // byte offset of that record in the WAL file
     },
     AllocatePage {
         lsn: u64,
         page_id: PageId,
         page_type: u8, // serialized as u8
+        txn_id: u64,
+        prev_lsn: Option<u64>,    // LSN of previous record in same txn
+        prev_offset: Option<u64>, // byte offset of that record in the WAL file
+    },
+    Abort {
+        lsn: u64,
         txn_id: u64,
     },
 }
@@ -66,6 +78,8 @@ impl WalRecord {
             new_data: new_data.to_vec(),
             old_data: old_data.to_vec(),
             txn_id,
+            prev_lsn: None,
+            prev_offset: None,
         }
     }
 
@@ -84,6 +98,8 @@ impl WalRecord {
             new_data: new_data.to_vec(),
             old_data: old_data.to_vec(),
             txn_id,
+            prev_lsn: None,
+            prev_offset: None,
         }
     }
 
@@ -97,6 +113,8 @@ impl WalRecord {
             page_id,
             next_page,
             txn_id,
+            prev_lsn: None,
+            prev_offset: None,
         }
     }
 
@@ -106,7 +124,13 @@ impl WalRecord {
             page_id,
             page_type,
             txn_id,
+            prev_lsn: None,
+            prev_offset: None,
         }
+    }
+
+    pub fn new_abort(lsn: u64, txn_id: u64) -> Self {
+        WalRecord::Abort { lsn, txn_id }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -128,6 +152,8 @@ impl WalRecord {
                 new_data,
                 old_data,
                 txn_id,
+                prev_lsn,
+                prev_offset,
             } => {
                 // add record type
                 buf.push(WAL_RECORD_SLOTTED_TYPE);
@@ -151,6 +177,18 @@ impl WalRecord {
                 buf.extend_from_slice(&old_data);
                 // add txn_id
                 buf.extend_from_slice(&txn_id.to_le_bytes());
+                // add prev lsn
+                if let Some(lsn) = prev_lsn {
+                    buf.extend_from_slice(&lsn.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                }
+                // add prev offset
+                if let Some(offset) = prev_offset {
+                    buf.extend_from_slice(&offset.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                }
             }
             WalRecord::Raw {
                 lsn,
@@ -159,6 +197,8 @@ impl WalRecord {
                 new_data,
                 old_data,
                 txn_id,
+                prev_lsn,
+                prev_offset,
             } => {
                 // add record type
                 buf.push(WAL_RECORD_RAW_TYPE);
@@ -176,6 +216,18 @@ impl WalRecord {
                 buf.extend_from_slice(&old_data);
                 // add txn_id
                 buf.extend_from_slice(&txn_id.to_le_bytes());
+                // add prev lsn
+                if let Some(lsn) = prev_lsn {
+                    buf.extend_from_slice(&lsn.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                }
+                // add prev offset
+                if let Some(offset) = prev_offset {
+                    buf.extend_from_slice(&offset.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                }
             }
             WalRecord::Checkpoint { lsn } => {
                 // add record type
@@ -188,6 +240,8 @@ impl WalRecord {
                 page_id,
                 next_page,
                 txn_id,
+                prev_lsn,
+                prev_offset,
             } => {
                 // add record type
                 buf.push(WAL_RECORD_LINK_PAGE_TYPE);
@@ -199,17 +253,49 @@ impl WalRecord {
                 buf.extend_from_slice(&next_page.to_le_bytes());
                 // add txn_id
                 buf.extend_from_slice(&txn_id.to_le_bytes());
+                // add prev lsn
+                if let Some(lsn) = prev_lsn {
+                    buf.extend_from_slice(&lsn.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                }
+                // add prev offset
+                if let Some(offset) = prev_offset {
+                    buf.extend_from_slice(&offset.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                }
             }
             WalRecord::AllocatePage {
                 lsn,
                 page_id,
                 page_type,
                 txn_id,
+                prev_lsn,
+                prev_offset,
             } => {
                 buf.push(WAL_RECORD_ALLOCATE_PAGE_TYPE);
                 buf.extend_from_slice(&lsn.to_le_bytes());
                 buf.extend_from_slice(&page_id.to_le_bytes());
                 buf.push(*page_type);
+                // add txn_id
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                // add prev lsn
+                if let Some(lsn) = prev_lsn {
+                    buf.extend_from_slice(&lsn.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                }
+                // add prev offset
+                if let Some(offset) = prev_offset {
+                    buf.extend_from_slice(&offset.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                }
+            }
+            WalRecord::Abort { lsn, txn_id } => {
+                buf.push(WAL_RECORD_ABORT_TYPE);
+                buf.extend_from_slice(&lsn.to_le_bytes());
                 // add txn_id
                 buf.extend_from_slice(&txn_id.to_le_bytes());
             }
@@ -378,6 +464,42 @@ impl WalRecord {
                 ]);
                 offset += 8;
 
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for prev_lsn",
+                    ));
+                }
+                let prev_lsn = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for prev_offset",
+                    ));
+                }
+                let prev_offset = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
                 if bytes.len() < offset + 4 {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -392,16 +514,26 @@ impl WalRecord {
                     bytes[offset + 3],
                 ]);
 
-                let record = Self::new_slotted(
+                let record = WalRecord::Slotted {
                     lsn,
                     record_type,
-                    &table_name,
+                    table_name,
                     page_id,
                     slot,
-                    &new_data,
-                    &old_data,
+                    new_data,
+                    old_data,
                     txn_id,
-                );
+                    prev_lsn: if prev_lsn == NO_PREV_WAL_LINK {
+                        None
+                    } else {
+                        Some(prev_lsn)
+                    },
+                    prev_offset: if prev_offset == NO_PREV_WAL_LINK {
+                        None
+                    } else {
+                        Some(prev_offset)
+                    },
+                };
 
                 (record, stored_checksum)
             }
@@ -518,6 +650,42 @@ impl WalRecord {
                 ]);
                 offset += 8;
 
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for prev_lsn",
+                    ));
+                }
+                let prev_lsn = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for prev_offset",
+                    ));
+                }
+                let prev_offset = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
                 if bytes.len() < offset + 4 {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -531,7 +699,24 @@ impl WalRecord {
                     bytes[offset + 3],
                 ]);
 
-                let record = Self::new_raw(lsn, record_type, page_id, &new_data, &old_data, txn_id);
+                let record = WalRecord::Raw {
+                    lsn,
+                    record_type,
+                    page_id,
+                    new_data,
+                    old_data,
+                    txn_id,
+                    prev_lsn: if prev_lsn == NO_PREV_WAL_LINK {
+                        None
+                    } else {
+                        Some(prev_lsn)
+                    },
+                    prev_offset: if prev_offset == NO_PREV_WAL_LINK {
+                        None
+                    } else {
+                        Some(prev_offset)
+                    },
+                };
 
                 (record, stored_checksum)
             }
@@ -645,6 +830,42 @@ impl WalRecord {
                 ]);
                 offset += 8;
 
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for prev_lsn",
+                    ));
+                }
+                let prev_lsn = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for prev_offset",
+                    ));
+                }
+                let prev_offset = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
                 if bytes.len() < offset + 4 {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -658,7 +879,22 @@ impl WalRecord {
                     bytes[offset + 3],
                 ]);
 
-                let record = Self::new_link_page(lsn, page_id, next_page, txn_id);
+                let record = WalRecord::LinkPage {
+                    lsn,
+                    page_id,
+                    txn_id,
+                    next_page,
+                    prev_lsn: if prev_lsn == NO_PREV_WAL_LINK {
+                        None
+                    } else {
+                        Some(prev_lsn)
+                    },
+                    prev_offset: if prev_offset == NO_PREV_WAL_LINK {
+                        None
+                    } else {
+                        Some(prev_offset)
+                    },
+                };
 
                 (record, stored_checksum)
             }
@@ -712,6 +948,42 @@ impl WalRecord {
                 ]);
                 offset += 8;
 
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for prev_lsn",
+                    ));
+                }
+                let prev_lsn = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for prev_offset",
+                    ));
+                }
+                let prev_offset = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
                 if bytes.len() < offset + 4 {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -721,15 +993,67 @@ impl WalRecord {
 
                 let stored_checksum =
                     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+
                 (
                     WalRecord::AllocatePage {
                         lsn,
                         page_id,
                         page_type,
                         txn_id,
+                        prev_lsn: if prev_lsn == NO_PREV_WAL_LINK {
+                            None
+                        } else {
+                            Some(prev_lsn)
+                        },
+                        prev_offset: if prev_offset == NO_PREV_WAL_LINK {
+                            None
+                        } else {
+                            Some(prev_offset)
+                        },
                     },
                     stored_checksum,
                 )
+            }
+            WAL_RECORD_ABORT_TYPE => {
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for lsn",
+                    ));
+                }
+
+                let lsn = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for txn_id",
+                    ));
+                }
+
+                let txn_id = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
+                if bytes.len() < offset + 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for stored checksum",
+                    ));
+                }
+
+                let stored_checksum =
+                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                (WalRecord::Abort { lsn, txn_id }, stored_checksum)
             }
             other => {
                 return Err(Error::new(
@@ -759,6 +1083,7 @@ impl WalRecord {
             WalRecord::Checkpoint { lsn } => *lsn,
             WalRecord::LinkPage { lsn, .. } => *lsn,
             WalRecord::AllocatePage { lsn, .. } => *lsn,
+            WalRecord::Abort { lsn, .. } => *lsn,
         }
     }
 
@@ -785,6 +1110,7 @@ impl WalRecord {
             WalRecord::Checkpoint { .. } => None,
             WalRecord::LinkPage { page_id, .. } => Some(*page_id),
             WalRecord::AllocatePage { page_id, .. } => Some(*page_id),
+            _ => None,
         }
     }
 
@@ -833,6 +1159,65 @@ impl WalRecord {
             WalRecord::Checkpoint { .. } => None,
             WalRecord::LinkPage { txn_id, .. } => Some(*txn_id),
             WalRecord::AllocatePage { txn_id, .. } => Some(*txn_id),
+            WalRecord::Abort { txn_id, .. } => Some(*txn_id),
+        }
+    }
+
+    pub fn prev_lsn(&self) -> Option<u64> {
+        match self {
+            WalRecord::Slotted { prev_lsn, .. } => *prev_lsn,
+            WalRecord::Raw { prev_lsn, .. } => *prev_lsn,
+            WalRecord::LinkPage { prev_lsn, .. } => *prev_lsn,
+            WalRecord::AllocatePage { prev_lsn, .. } => *prev_lsn,
+            _ => None,
+        }
+    }
+
+    pub fn prev_offset(&self) -> Option<u64> {
+        match self {
+            WalRecord::Slotted { prev_offset, .. } => *prev_offset,
+            WalRecord::Raw { prev_offset, .. } => *prev_offset,
+            WalRecord::LinkPage { prev_offset, .. } => *prev_offset,
+            WalRecord::AllocatePage { prev_offset, .. } => *prev_offset,
+            _ => None,
+        }
+    }
+
+    pub fn set_prev_link(&mut self, prev_lsn: u64, prev_offset: u64) {
+        match self {
+            WalRecord::Slotted {
+                prev_lsn: pl,
+                prev_offset: po,
+                ..
+            } => {
+                *pl = Some(prev_lsn);
+                *po = Some(prev_offset);
+            }
+            WalRecord::Raw {
+                prev_lsn: pl,
+                prev_offset: po,
+                ..
+            } => {
+                *pl = Some(prev_lsn);
+                *po = Some(prev_offset);
+            }
+            WalRecord::AllocatePage {
+                prev_lsn: pl,
+                prev_offset: po,
+                ..
+            } => {
+                *pl = Some(prev_lsn);
+                *po = Some(prev_offset);
+            }
+            WalRecord::LinkPage {
+                prev_lsn: pl,
+                prev_offset: po,
+                ..
+            } => {
+                *pl = Some(prev_lsn);
+                *po = Some(prev_offset);
+            }
+            _ => {} // Checkpoint, Abort — no back-links
         }
     }
 }
@@ -899,6 +1284,7 @@ mod tests {
             WalRecordType::CreateIndex,
             WalRecordType::DropIndex,
             WalRecordType::Checkpoint,
+            WalRecordType::AllocatePage,
         ];
         for rt in types {
             let record = WalRecord::new_slotted(1, rt, "t", 1, 0, b"new", b"old", 14);
@@ -995,5 +1381,96 @@ mod tests {
         for len in 0..bytes.len() {
             assert!(WalRecord::from_bytes(&bytes[..len]).is_err());
         }
+    }
+
+    // TODO: test for corrupted instances
+
+    #[test]
+    fn test_wal_record_checkpoint() {
+        let record = WalRecord::new_checkpoint(1);
+        let bytes = record.to_bytes();
+        assert_eq!(WalRecord::from_bytes(&bytes).unwrap(), record);
+    }
+
+    #[test]
+    fn test_wal_record_allocate_page() {
+        let record = WalRecord::new_allocate_page(1, 5, PageType::Slotted.to_u8(), 15);
+        let bytes = record.to_bytes();
+        assert_eq!(WalRecord::from_bytes(&bytes).unwrap(), record);
+    }
+
+    #[test]
+    fn test_wal_record_abort() {
+        let record = WalRecord::new_abort(1, 14);
+        let bytes = record.to_bytes();
+        assert_eq!(WalRecord::from_bytes(&bytes).unwrap(), record);
+    }
+
+    #[test]
+    fn test_wal_record_set_prev_link_slotted() {
+        let new_data = "Welcome".as_bytes();
+        let old_data = "Hello world".as_bytes();
+        let mut record = WalRecord::new_slotted(
+            120,
+            WalRecordType::Insert,
+            "users",
+            5,
+            17,
+            new_data,
+            old_data,
+            25,
+        );
+
+        let record_bytes = record.to_bytes();
+        assert_eq!(WalRecord::from_bytes(&record_bytes).unwrap(), record);
+        assert_eq!(record.prev_lsn(), None);
+        assert_eq!(record.prev_offset(), None);
+
+        record.set_prev_link(23, 9872);
+        assert_eq!(record.prev_lsn().unwrap(), 23);
+        assert_eq!(record.prev_offset().unwrap(), 9872);
+    }
+
+    #[test]
+    fn test_wal_record_set_prev_link_raw() {
+        let new_data = "Welcome".as_bytes();
+        let old_data = "Hello world".as_bytes();
+        let mut record = WalRecord::new_raw(120, WalRecordType::Insert, 5, new_data, old_data, 25);
+
+        let record_bytes = record.to_bytes();
+        assert_eq!(WalRecord::from_bytes(&record_bytes).unwrap(), record);
+        assert_eq!(record.prev_lsn(), None);
+        assert_eq!(record.prev_offset(), None);
+
+        record.set_prev_link(23, 9872);
+        assert_eq!(record.prev_lsn().unwrap(), 23);
+        assert_eq!(record.prev_offset().unwrap(), 9872);
+    }
+
+    #[test]
+    fn test_wal_record_link_page_slotted() {
+        let mut record = WalRecord::new_link_page(120, 5, 17, 25);
+
+        let record_bytes = record.to_bytes();
+        assert_eq!(WalRecord::from_bytes(&record_bytes).unwrap(), record);
+        assert_eq!(record.prev_lsn(), None);
+        assert_eq!(record.prev_offset(), None);
+
+        record.set_prev_link(23, 9872);
+        assert_eq!(record.prev_lsn().unwrap(), 23);
+        assert_eq!(record.prev_offset().unwrap(), 9872);
+    }
+    #[test]
+    fn test_wal_record_allocate_page_slotted() {
+        let mut record = WalRecord::new_allocate_page(120, 5, 17, 25);
+
+        let record_bytes = record.to_bytes();
+        assert_eq!(WalRecord::from_bytes(&record_bytes).unwrap(), record);
+        assert_eq!(record.prev_lsn(), None);
+        assert_eq!(record.prev_offset(), None);
+
+        record.set_prev_link(23, 9872);
+        assert_eq!(record.prev_lsn().unwrap(), 23);
+        assert_eq!(record.prev_offset().unwrap(), 9872);
     }
 }

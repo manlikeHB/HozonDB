@@ -31,8 +31,9 @@ impl BPlusTree {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: TxnId,
-    ) -> io::Result<(Self, Vec<Lsn>)> {
-        let (root_page_id, lsn1) = buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
+    ) -> io::Result<(Self, Vec<(Lsn, u64)>)> {
+        let (root_page_id, lsn1, wal_offset1) =
+            buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
         let root_leaf = Node::Leaf(LeafNode::new());
 
         let mut b_plus_tree = BPlusTree {
@@ -41,7 +42,7 @@ impl BPlusTree {
             cache: HashMap::new(),
         };
 
-        let lsn2 = b_plus_tree.write_node(
+        let (lsn2, wal_offset2) = b_plus_tree.write_node(
             buffer_pool,
             wal_writer,
             root_page_id,
@@ -50,7 +51,7 @@ impl BPlusTree {
             txn_id,
         )?;
 
-        Ok((b_plus_tree, vec![lsn1, lsn2]))
+        Ok((b_plus_tree, vec![(lsn1, wal_offset1), (lsn2, wal_offset2)]))
     }
 
     /// Opens existing tree with empty cache (lazy loading)
@@ -72,9 +73,9 @@ impl BPlusTree {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<Vec<Lsn>> {
+    ) -> io::Result<Vec<(Lsn, u64)>> {
         // collect lsns
-        let mut lsns = vec![];
+        let mut lsns: Vec<(u64, u64)> = Vec::new();
 
         if let Some(page_id) = self.root {
             let (leaf_page_id, mut path) = self.find_leaf(&key, page_id, buffer_pool)?;
@@ -99,9 +100,9 @@ impl BPlusTree {
 
                             if leaf.is_full(self.order) {
                                 // assign new page
-                                let (new_page, lsn) =
+                                let (new_page, lsn, wal_offset) =
                                     buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
-                                lsns.push(lsn);
+                                lsns.push((lsn, wal_offset));
 
                                 // split leaf
                                 let (k, new_leaf) = leaf.split(new_page);
@@ -179,9 +180,9 @@ impl BPlusTree {
                             );
 
                             if internal.is_full(self.order) {
-                                let (new_page, lsn) =
+                                let (new_page, lsn, wal_offset) =
                                     buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
-                                lsns.push(lsn);
+                                lsns.push((lsn, wal_offset));
 
                                 // split internal node
                                 let (k, new_internal) = internal.split();
@@ -263,8 +264,8 @@ impl BPlusTree {
             // create new leaf node since root is None
             let mut leaf = LeafNode::new();
             leaf.insert(LeafEntry::new(key, row_location)); // insert new index
-            let (new_page, lsn) = buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
-            lsns.push(lsn);
+            let (new_page, lsn, wal_offset) = buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
+            lsns.push((lsn, wal_offset));
 
             // add the new leaf to nodes
             self.cache.insert(new_page, Node::Leaf(leaf));
@@ -310,11 +311,12 @@ impl BPlusTree {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<Vec<Lsn>> {
-        let (new_root_page, lsn1) = buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
+    ) -> io::Result<Vec<(Lsn, u64)>> {
+        let (new_root_page, lsn1, wal_offset1) =
+            buffer_pool.allocate_raw_page(wal_writer, txn_id)?;
         let new_root = InternalNode::new(vec![key], vec![left, right]);
 
-        let lsn2 = self.write_node(
+        let (lsn2, wal_offset2) = self.write_node(
             buffer_pool,
             wal_writer,
             new_root_page,
@@ -324,7 +326,7 @@ impl BPlusTree {
         )?;
 
         self.root = Some(new_root_page);
-        Ok(vec![lsn1, lsn2])
+        Ok(vec![(lsn1, wal_offset1), (lsn2, wal_offset2)])
     }
 
     pub fn search(
@@ -372,7 +374,7 @@ impl BPlusTree {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<Lsn> {
+    ) -> io::Result<(Lsn, u64)> {
         if let Some(root_page_id) = self.root {
             let (leaf_page_id, _) = self.find_leaf(key, root_page_id, buffer_pool)?;
 
@@ -386,7 +388,7 @@ impl BPlusTree {
                             leaf.write_to(&mut buf);
 
                             // log + write page
-                            let lsn = Self::update_node(
+                            let (lsn, wal_offset) = Self::update_node(
                                 buffer_pool,
                                 wal_writer,
                                 leaf_page_id,
@@ -395,7 +397,7 @@ impl BPlusTree {
                                 txn_id,
                             )?;
 
-                            Ok(lsn)
+                            Ok((lsn, wal_offset))
                         }
                         false => Err(Error::new(ErrorKind::NotFound, "key doesn't exist")),
                     },
@@ -451,7 +453,7 @@ impl BPlusTree {
         node: Node,
         record_type: WalRecordType,
         txn_id: u64,
-    ) -> io::Result<Lsn> {
+    ) -> io::Result<(Lsn, u64)> {
         let node_bytes = node.to_bytes();
         let old_data = buffer_pool.read_page(page_id)?;
 
@@ -460,12 +462,13 @@ impl BPlusTree {
             [constants::OFFSET_RAW_PAGE_START..constants::OFFSET_RAW_PAGE_START + node_bytes.len()]
             .copy_from_slice(&node_bytes);
 
-        let lsn = wal_writer.append_raw(record_type, page_id, &new_data, old_data, txn_id)?;
+        let (lsn, wal_offset) =
+            wal_writer.append_raw(record_type, page_id, &new_data, old_data, txn_id)?;
 
         buffer_pool.write_raw_page(page_id, &new_data, lsn)?;
 
         self.cache.insert(page_id, node);
-        Ok(lsn)
+        Ok((lsn, wal_offset))
     }
 
     pub fn root(&self) -> Option<PageId> {
@@ -581,7 +584,7 @@ impl BPlusTree {
         node_bytes: &[u8],
         record_type: WalRecordType,
         txn_id: u64,
-    ) -> io::Result<Lsn> {
+    ) -> io::Result<(Lsn, u64)> {
         let old_data = buffer_pool.read_page(page_id)?;
 
         let mut new_data = old_data.clone();
@@ -589,10 +592,11 @@ impl BPlusTree {
             [constants::OFFSET_RAW_PAGE_START..constants::OFFSET_RAW_PAGE_START + node_bytes.len()]
             .copy_from_slice(node_bytes);
 
-        let lsn = wal_writer.append_raw(record_type, page_id, &new_data, old_data, txn_id)?;
+        let (lsn, wal_offset) =
+            wal_writer.append_raw(record_type, page_id, &new_data, old_data, txn_id)?;
 
         buffer_pool.write_raw_page(page_id, &new_data, lsn)?;
-        Ok(lsn)
+        Ok((lsn, wal_offset))
     }
 }
 

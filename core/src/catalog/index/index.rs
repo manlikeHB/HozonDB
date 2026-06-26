@@ -93,7 +93,7 @@ impl IndexCatalog {
         wal_writer: &mut WalWriter,
         entry: IndexEntry,
         txn_id: u64,
-    ) -> io::Result<Lsn> {
+    ) -> io::Result<(Lsn, u64)> {
         let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
         self.indexes
@@ -119,7 +119,7 @@ impl IndexCatalog {
             .copy_from_slice(&catalog_bytes);
         new_page[constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()..].fill(0);
 
-        let lsn = wal_writer.append_raw(
+        let (lsn, wal_offset) = wal_writer.append_raw(
             WalRecordType::AddIndex,
             constants::INDEX_CATALOG_PAGE_ID,
             &new_page,
@@ -128,7 +128,7 @@ impl IndexCatalog {
         )?;
 
         self.save(buffer_pool, &new_page, lsn)?;
-        Ok(lsn)
+        Ok((lsn, wal_offset))
     }
 
     fn save(
@@ -163,7 +163,7 @@ impl IndexCatalog {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<Lsn> {
+    ) -> io::Result<(Lsn, u64)> {
         let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
         self.indexes
@@ -191,7 +191,7 @@ impl IndexCatalog {
             .copy_from_slice(&catalog_bytes);
         new_page[constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()..].fill(0);
 
-        let lsn = wal_writer.append_raw(
+        let (lsn, wal_offset) = wal_writer.append_raw(
             WalRecordType::RemoveIndex,
             constants::INDEX_CATALOG_PAGE_ID,
             &new_page,
@@ -200,7 +200,7 @@ impl IndexCatalog {
         )?;
 
         self.save(buffer_pool, &new_page, lsn)?;
-        Ok(lsn)
+        Ok((lsn, wal_offset))
     }
 
     pub fn total_count(&self) -> usize {
@@ -213,7 +213,7 @@ impl IndexCatalog {
         buffer_pool: &mut BufferPool,
         wal_writer: &mut WalWriter,
         txn_id: u64,
-    ) -> io::Result<Lsn> {
+    ) -> io::Result<(Lsn, u64)> {
         let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
         self.indexes.remove(table_name);
@@ -236,7 +236,7 @@ impl IndexCatalog {
             .copy_from_slice(&catalog_bytes);
         new_page[constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()..].fill(0);
 
-        let lsn = wal_writer.append_raw(
+        let (lsn, wal_offset) = wal_writer.append_raw(
             WalRecordType::RemoveIndex,
             constants::INDEX_CATALOG_PAGE_ID,
             &new_page,
@@ -245,7 +245,7 @@ impl IndexCatalog {
         )?;
 
         self.save(buffer_pool, &new_page, lsn)?;
-        Ok(lsn)
+        Ok((lsn, wal_offset))
     }
 
     pub fn all_indexes(&self) -> Vec<&IndexEntry> {

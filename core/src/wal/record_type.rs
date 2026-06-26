@@ -1,5 +1,6 @@
 use std::io::{self, Error, ErrorKind};
 
+// TODO: Clean up, there are some unused types here
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalRecordType {
     // Slotted variants (DML)
@@ -28,6 +29,8 @@ pub enum WalRecordType {
 
     FreePage,
     AllocatePage,
+
+    Abort, // for transaction roll back
 
     // Checkpoint
     Checkpoint,
@@ -61,6 +64,7 @@ impl From<WalRecordType> for u8 {
             WalRecordType::FreePage => 17,
             WalRecordType::LinkPage => 18,
             WalRecordType::AllocatePage => 19,
+            WalRecordType::Abort => 20,
         }
     }
 }
@@ -89,6 +93,7 @@ impl TryFrom<u8> for WalRecordType {
             17 => Ok(WalRecordType::FreePage),
             18 => Ok(WalRecordType::LinkPage),
             19 => Ok(WalRecordType::AllocatePage),
+            20 => Ok(WalRecordType::Abort),
             other => Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!("Unknown value for WAL record type: {}", other),
@@ -122,6 +127,7 @@ mod tests {
         assert_eq!(WalRecordType::FreePage.to_u8(), 17);
         assert_eq!(WalRecordType::LinkPage.to_u8(), 18);
         assert_eq!(WalRecordType::AllocatePage.to_u8(), 19);
+        assert_eq!(WalRecordType::Abort.to_u8(), 20);
     }
 
     #[test]
@@ -190,11 +196,12 @@ mod tests {
             WalRecordType::try_from(19).unwrap(),
             WalRecordType::AllocatePage
         );
+        assert_eq!(WalRecordType::try_from(20).unwrap(), WalRecordType::Abort);
     }
 
     #[test]
     fn test_wal_record_type_conversion_from_unsupported_u8() {
-        for i in 20..255 {
+        for i in 21..255 {
             assert!(WalRecordType::try_from(i).is_err());
         }
     }
