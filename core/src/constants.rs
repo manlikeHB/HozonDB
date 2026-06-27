@@ -28,3 +28,7 @@ pub const WAL_RECORD_ABORT_TYPE: u8 = 6;
 
 pub type Lsn = u64;
 pub type TxnId = u64;
+
+// Sentinel value for Option::None
+pub const NONE_U32: u32 = u32::MAX;
+pub const NONE_U64: u64 = u64::MAX;

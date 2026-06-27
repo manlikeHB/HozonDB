@@ -2,11 +2,12 @@ use std::io::{Error, ErrorKind};
 
 use crate::{
     constants::{
-        PageId, WAL_RECORD_ABORT_TYPE, WAL_RECORD_ALLOCATE_PAGE_TYPE, WAL_RECORD_CHECKPOINT_TYPE,
-        WAL_RECORD_LINK_PAGE_TYPE, WAL_RECORD_RAW_TYPE, WAL_RECORD_SLOTTED_TYPE,
+        NONE_U32, NONE_U64, PageId, WAL_RECORD_ABORT_TYPE, WAL_RECORD_ALLOCATE_PAGE_TYPE,
+        WAL_RECORD_CHECKPOINT_TYPE, WAL_RECORD_LINK_PAGE_TYPE, WAL_RECORD_RAW_TYPE,
+        WAL_RECORD_SLOTTED_TYPE,
     },
     storage::page::PageType,
-    wal::{constants::NO_PREV_WAL_LINK, record_type::WalRecordType},
+    wal::record_type::WalRecordType,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +44,7 @@ pub enum WalRecord {
         txn_id: u64,
         prev_lsn: Option<u64>,    // LSN of previous record in same txn
         prev_offset: Option<u64>, // byte offset of that record in the WAL file
+        old_next_page: Option<PageId>,
     },
     AllocatePage {
         lsn: u64,
@@ -107,7 +109,13 @@ impl WalRecord {
         WalRecord::Checkpoint { lsn }
     }
 
-    pub fn new_link_page(lsn: u64, page_id: PageId, next_page: PageId, txn_id: u64) -> Self {
+    pub fn new_link_page(
+        lsn: u64,
+        page_id: PageId,
+        next_page: PageId,
+        txn_id: u64,
+        old_next_page: Option<PageId>,
+    ) -> Self {
         WalRecord::LinkPage {
             lsn,
             page_id,
@@ -115,6 +123,7 @@ impl WalRecord {
             txn_id,
             prev_lsn: None,
             prev_offset: None,
+            old_next_page,
         }
     }
 
@@ -181,13 +190,13 @@ impl WalRecord {
                 if let Some(lsn) = prev_lsn {
                     buf.extend_from_slice(&lsn.to_le_bytes());
                 } else {
-                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                    buf.extend_from_slice(&NONE_U64.to_le_bytes());
                 }
                 // add prev offset
                 if let Some(offset) = prev_offset {
                     buf.extend_from_slice(&offset.to_le_bytes());
                 } else {
-                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                    buf.extend_from_slice(&NONE_U64.to_le_bytes());
                 }
             }
             WalRecord::Raw {
@@ -220,13 +229,13 @@ impl WalRecord {
                 if let Some(lsn) = prev_lsn {
                     buf.extend_from_slice(&lsn.to_le_bytes());
                 } else {
-                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                    buf.extend_from_slice(&NONE_U64.to_le_bytes());
                 }
                 // add prev offset
                 if let Some(offset) = prev_offset {
                     buf.extend_from_slice(&offset.to_le_bytes());
                 } else {
-                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                    buf.extend_from_slice(&NONE_U64.to_le_bytes());
                 }
             }
             WalRecord::Checkpoint { lsn } => {
@@ -242,6 +251,7 @@ impl WalRecord {
                 txn_id,
                 prev_lsn,
                 prev_offset,
+                old_next_page,
             } => {
                 // add record type
                 buf.push(WAL_RECORD_LINK_PAGE_TYPE);
@@ -257,13 +267,19 @@ impl WalRecord {
                 if let Some(lsn) = prev_lsn {
                     buf.extend_from_slice(&lsn.to_le_bytes());
                 } else {
-                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                    buf.extend_from_slice(&NONE_U64.to_le_bytes());
                 }
                 // add prev offset
                 if let Some(offset) = prev_offset {
                     buf.extend_from_slice(&offset.to_le_bytes());
                 } else {
-                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                    buf.extend_from_slice(&NONE_U64.to_le_bytes());
+                }
+                // add old_next_page
+                if let Some(page_id) = old_next_page {
+                    buf.extend_from_slice(&page_id.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&NONE_U32.to_le_bytes());
                 }
             }
             WalRecord::AllocatePage {
@@ -284,13 +300,13 @@ impl WalRecord {
                 if let Some(lsn) = prev_lsn {
                     buf.extend_from_slice(&lsn.to_le_bytes());
                 } else {
-                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                    buf.extend_from_slice(&NONE_U64.to_le_bytes());
                 }
                 // add prev offset
                 if let Some(offset) = prev_offset {
                     buf.extend_from_slice(&offset.to_le_bytes());
                 } else {
-                    buf.extend_from_slice(&NO_PREV_WAL_LINK.to_le_bytes());
+                    buf.extend_from_slice(&NONE_U64.to_le_bytes());
                 }
             }
             WalRecord::Abort { lsn, txn_id } => {
@@ -523,12 +539,12 @@ impl WalRecord {
                     new_data,
                     old_data,
                     txn_id,
-                    prev_lsn: if prev_lsn == NO_PREV_WAL_LINK {
+                    prev_lsn: if prev_lsn == NONE_U64 {
                         None
                     } else {
                         Some(prev_lsn)
                     },
-                    prev_offset: if prev_offset == NO_PREV_WAL_LINK {
+                    prev_offset: if prev_offset == NONE_U64 {
                         None
                     } else {
                         Some(prev_offset)
@@ -706,12 +722,12 @@ impl WalRecord {
                     new_data,
                     old_data,
                     txn_id,
-                    prev_lsn: if prev_lsn == NO_PREV_WAL_LINK {
+                    prev_lsn: if prev_lsn == NONE_U64 {
                         None
                     } else {
                         Some(prev_lsn)
                     },
-                    prev_offset: if prev_offset == NO_PREV_WAL_LINK {
+                    prev_offset: if prev_offset == NONE_U64 {
                         None
                     } else {
                         Some(prev_offset)
@@ -805,13 +821,6 @@ impl WalRecord {
                 ]);
                 offset += 4;
 
-                if bytes.len() < offset + 4 {
-                    return Err(Error::new(
-                        ErrorKind::InvalidData,
-                        "Not enough bytes for stored checksum",
-                    ));
-                }
-
                 if bytes.len() < offset + 8 {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -869,6 +878,20 @@ impl WalRecord {
                 if bytes.len() < offset + 4 {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
+                        "Not enough bytes for old next page",
+                    ));
+                }
+                let old_next_page = u32::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]);
+                offset += 4;
+
+                if bytes.len() < offset + 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
                         "Not enough bytes for stored_checksum",
                     ));
                 }
@@ -884,15 +907,20 @@ impl WalRecord {
                     page_id,
                     txn_id,
                     next_page,
-                    prev_lsn: if prev_lsn == NO_PREV_WAL_LINK {
+                    prev_lsn: if prev_lsn == NONE_U64 {
                         None
                     } else {
                         Some(prev_lsn)
                     },
-                    prev_offset: if prev_offset == NO_PREV_WAL_LINK {
+                    prev_offset: if prev_offset == NONE_U64 {
                         None
                     } else {
                         Some(prev_offset)
+                    },
+                    old_next_page: if old_next_page == NONE_U32 {
+                        None
+                    } else {
+                        Some(old_next_page)
                     },
                 };
 
@@ -1000,12 +1028,12 @@ impl WalRecord {
                         page_id,
                         page_type,
                         txn_id,
-                        prev_lsn: if prev_lsn == NO_PREV_WAL_LINK {
+                        prev_lsn: if prev_lsn == NONE_U64 {
                             None
                         } else {
                             Some(prev_lsn)
                         },
-                        prev_offset: if prev_offset == NO_PREV_WAL_LINK {
+                        prev_offset: if prev_offset == NONE_U64 {
                             None
                         } else {
                             Some(prev_offset)
@@ -1220,6 +1248,13 @@ impl WalRecord {
             _ => {} // Checkpoint, Abort — no back-links
         }
     }
+
+    pub fn old_next_page(&self) -> Option<u32> {
+        match self {
+            WalRecord::LinkPage { old_next_page, .. } => *old_next_page,
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1307,14 +1342,14 @@ mod tests {
 
     #[test]
     fn test_wal_record_serialization_link_page() {
-        let record = WalRecord::new_link_page(5, 3, 7, 345); // lsn=5, page_id=3, next_page=7
+        let record = WalRecord::new_link_page(5, 3, 7, 345, None); // lsn=5, page_id=3, next_page=7
         let bytes = record.to_bytes();
         assert_eq!(WalRecord::from_bytes(&bytes).unwrap(), record);
     }
 
     #[test]
     fn test_wal_record_link_page_accessors() {
-        let record = WalRecord::new_link_page(1, 4, 9, 2445);
+        let record = WalRecord::new_link_page(1, 4, 9, 2445, Some(8));
         assert_eq!(record.lsn(), 1);
         assert_eq!(record.page_id(), Some(4));
         assert_eq!(record.next_page(), Some(9));
@@ -1325,7 +1360,7 @@ mod tests {
 
     #[test]
     fn test_wal_record_link_page_checksum_mismatch() {
-        let record = WalRecord::new_link_page(1, 3, 7, 6542);
+        let record = WalRecord::new_link_page(1, 3, 7, 6542, None);
         let mut bytes = record.to_bytes();
         bytes[4] ^= 0xFF; // corrupt a byte
         assert!(WalRecord::from_bytes(&bytes).is_err());
@@ -1333,7 +1368,7 @@ mod tests {
 
     #[test]
     fn test_wal_record_link_page_truncated() {
-        let record = WalRecord::new_link_page(1, 3, 7, 346);
+        let record = WalRecord::new_link_page(1, 3, 7, 346, None);
         let bytes = record.to_bytes();
         for len in 0..bytes.len() {
             assert!(WalRecord::from_bytes(&bytes[..len]).is_err());
@@ -1449,7 +1484,7 @@ mod tests {
 
     #[test]
     fn test_wal_record_link_page_slotted() {
-        let mut record = WalRecord::new_link_page(120, 5, 17, 25);
+        let mut record = WalRecord::new_link_page(120, 5, 17, 25, None);
 
         let record_bytes = record.to_bytes();
         assert_eq!(WalRecord::from_bytes(&record_bytes).unwrap(), record);

@@ -195,13 +195,14 @@ impl WalWriter {
         page_id: PageId,
         next_page: PageId,
         txn_id: u64,
+        old_next_page: Option<PageId>,
     ) -> io::Result<(u64, u64)> {
         // read current lsn and increment
         let lsn = self.lsn;
         self.lsn += 1;
 
         // create new record
-        let mut record = WalRecord::new_link_page(lsn, page_id, next_page, txn_id);
+        let mut record = WalRecord::new_link_page(lsn, page_id, next_page, txn_id, old_next_page);
 
         let offset = self.append(&mut record)?;
         Ok((lsn, offset))
@@ -532,7 +533,7 @@ mod tests {
         let _ = fs::remove_file("test_link_page.wal");
         let mut wal = WalWriter::new("test_link_page").unwrap();
 
-        let (lsn, _) = wal.append_link_page(3, 7, 234).unwrap(); // page_id=3, next_page=7
+        let (lsn, _) = wal.append_link_page(3, 7, 234, None).unwrap(); // page_id=3, next_page=7
         assert_eq!(lsn, 1);
         assert_eq!(wal.lsn, 2);
 
@@ -547,7 +548,7 @@ mod tests {
         let (lsn1, _) = wal
             .append_slotted(WalRecordType::Insert, "users", 3, 0, b"row", &[], 234)
             .unwrap();
-        let (lsn2, _) = wal.append_link_page(3, 4, 6543).unwrap();
+        let (lsn2, _) = wal.append_link_page(3, 4, 6543, None).unwrap();
         let (lsn3, _) = wal
             .append_slotted(WalRecordType::Insert, "users", 4, 0, b"row2", &[], 6543)
             .unwrap();
@@ -565,8 +566,8 @@ mod tests {
 
         {
             let mut wal = WalWriter::new("test_link_persist").unwrap();
-            wal.append_link_page(3, 4, 1234).unwrap();
-            wal.append_link_page(4, 5, 5421).unwrap();
+            wal.append_link_page(3, 4, 1234, None).unwrap();
+            wal.append_link_page(4, 5, 5421, None).unwrap();
         }
 
         {

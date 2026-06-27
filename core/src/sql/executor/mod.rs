@@ -13,7 +13,7 @@ use crate::{
     catalog::row::Row,
     sql::{database::Database, parser::Statement},
 };
-use std::io;
+use std::io::{self, ErrorKind};
 
 pub struct Executor {
     database: Database,
@@ -120,6 +120,12 @@ impl Executor {
                 res
             }
             Statement::Checkpoint => {
+                if self.database.txn_is_active() {
+                    return Err(io::Error::new(
+                        ErrorKind::Other,
+                        "cannot checkpoint during an active transaction",
+                    ));
+                }
                 self.database.checkpoint()?;
                 Ok(ExecutionResult::Success {
                     message: "Checkpoint complete.".to_string(),

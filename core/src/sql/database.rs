@@ -27,6 +27,7 @@ pub struct Database {
     indexes: HashMap<String, BPlusTree>, // index name -> B+ tree
     buffer_pool: BufferPool,
     wal_writer: WalWriter,
+    wal_reader: WalReader,
     // represents the current transaction
     // HozonDB is single threaded so there could only be an instance of a Txn at a time
     txn: Option<Txn>,
@@ -58,13 +59,22 @@ impl Database {
         let page_manager = PageManager::new(db_name)?;
         let mut buffer_pool = BufferPool::new(page_manager, capacity);
         let mut txn_id = 0;
+        let mut wal_reader_opt = None;
 
         // recover FIRST — before anything reads from buffer pool
         if Path::new(&format!("{}.wal", db_name)).exists() {
-            txn_id = WalReader::new(db_name)?.recover(&mut buffer_pool)?;
+            let mut wal_reader = WalReader::new(db_name)?;
+            txn_id = wal_reader.recover(&mut buffer_pool)?;
+            wal_reader_opt = Some(wal_reader);
         }
 
         let mut wal_writer = WalWriter::new(db_name)?;
+
+        // if no WAL file existed, create a fresh WalReader after WalWriter initializes it
+        let wal_reader = match wal_reader_opt {
+            Some(r) => r,
+            None => WalReader::new(db_name)?,
+        };
 
         // now safe to load catalogs — pages reflect recovered state
         let table_catalog = TableCatalog::new(&mut buffer_pool, &mut wal_writer)?;
@@ -83,6 +93,7 @@ impl Database {
             indexes,
             buffer_pool,
             wal_writer,
+            wal_reader,
             txn: None,
             next_txn_id: txn_id + 1,
         })
@@ -134,6 +145,7 @@ impl Database {
         &mut self,
         page_id: PageId,
         next_page: PageId,
+        old_next_page: Option<PageId>,
     ) -> io::Result<()> {
         let txn_id = self.cur_txn_id()?;
         let (lsn, wal_offset) = self.buffer_pool.update_next_page_in_page_metadata(
@@ -141,6 +153,7 @@ impl Database {
             next_page,
             &mut self.wal_writer,
             txn_id,
+            old_next_page,
         )?;
         self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)
     }
@@ -463,6 +476,13 @@ impl Database {
         }
     }
 
+    pub fn cur_txn(&self) -> io::Result<&Txn> {
+        match &self.txn {
+            Some(txn) => Ok(txn),
+            None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
+        }
+    }
+
     pub fn txn_is_active(&self) -> bool {
         match &self.txn {
             Some(_) => true,
@@ -528,7 +548,10 @@ impl Database {
     pub fn add_lsn_and_wal_offset_to_txn(&mut self, lsn: u64, wal_offset: u64) -> io::Result<()> {
         match &mut self.txn {
             Some(txn) => Ok(txn.add_lsns_and_wal_offsets(lsn, wal_offset)),
-            None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
+            None => Err(io::Error::new(
+                ErrorKind::Other,
+                "No active transaction to add lsn and wal offset to",
+            )),
         }
     }
 
@@ -543,7 +566,10 @@ impl Database {
                 }
                 Ok(())
             }
-            None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
+            None => Err(io::Error::new(
+                ErrorKind::Other,
+                "No active transaction to add lsns and wal offsets to",
+            )),
         }
     }
 
@@ -555,10 +581,23 @@ impl Database {
     }
 
     pub fn rollback_txn(&mut self) -> io::Result<()> {
-        match &self.txn {
-            Some(_) => Ok(()), // TODO
-            None => Err(io::Error::new(ErrorKind::Other, "No active transaction")),
+        let txn = self.txn.as_mut().ok_or_else(|| {
+            io::Error::new(ErrorKind::Other, "no active transaction to roll back")
+        })?;
+
+        // write abort record
+        let abort_lsn = self.wal_writer.append_abort_txn(txn.id())?;
+        self.wal_writer.sync()?;
+
+        // get txn lsn and wal offsets in reverse
+        for (lsn, wal_offset) in txn.lsns_and_wal_offsets().iter().rev() {
+            // undo using WAL records
+            self.wal_reader
+                .undo_record_at(*lsn, *wal_offset, &mut self.buffer_pool, abort_lsn)?;
         }
+
+        self.txn = None;
+        Ok(())
     }
 
     pub fn txn_lsns(&self) -> io::Result<Vec<Lsn>> {

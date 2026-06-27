@@ -227,7 +227,7 @@ pub fn insert_row_into_page(
         }
 
         // Update the previous page's metadata to point to the new page
-        db.update_next_page_in_page_metadata(last_page, new_page)?;
+        db.update_next_page_in_page_metadata(last_page, new_page, last_page_meta.next_page()?)?;
 
         if let Some(m) = metrics.as_mut() {
             m.pages_dirtied.insert(last_page);

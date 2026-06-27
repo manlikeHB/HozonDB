@@ -4,145 +4,11 @@ use crate::{
         buffer_pool::BufferPool,
         page::{PAGE_SIZE, PageManager, PageMetadata, PageType},
     },
-    wal::{constants::MAGIC_NUMBER, record::WalRecord, record_type::WalRecordType},
+    wal::{record::WalRecord, record_type::WalRecordType},
 };
-use std::{
-    collections::HashSet,
-    fs::File,
-    io::{self, Error, ErrorKind, Read, Seek, SeekFrom},
-    path::Path,
-};
+use std::io::{self, ErrorKind};
 
-pub struct WalReader {
-    file: File,
-}
-
-impl WalReader {
-    pub fn new(db_name: &str) -> io::Result<Self> {
-        let path = format!("{db_name}.wal");
-
-        if Path::new(&path).exists() {
-            let mut file = File::options().read(true).open(path)?;
-
-            file.seek(SeekFrom::Start(0))?;
-
-            // verify Magic
-            let mut magic_bytes = [0u8; 4];
-            file.read_exact(&mut magic_bytes)?;
-            let magic = u32::from_le_bytes(magic_bytes);
-
-            if magic != MAGIC_NUMBER {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid magic number",
-                ));
-            }
-
-            // get checkpoint
-            let mut checkpoint_bytes = [0u8; 8];
-            file.read_exact(&mut checkpoint_bytes)?;
-            let checkpoint = u64::from_le_bytes(checkpoint_bytes);
-
-            // set cursor at checkpoint
-            file.seek(SeekFrom::Start(checkpoint))?;
-
-            return Ok(WalReader { file });
-        } else {
-            return Err(Error::new(
-                io::ErrorKind::InvalidData,
-                "Every database should have a `.wal` file",
-            ));
-        }
-    }
-
-    pub fn recover(mut self, buffer_pool: &mut BufferPool) -> io::Result<u64> {
-        let mut last_txn_id = 0;
-
-        // collect all wal records and aborted txn ids
-        let mut records = Vec::new();
-        let mut aborted_txns = HashSet::new();
-
-        loop {
-            let mut record_len_bytes = [0u8; 4];
-            match self.file.read_exact(&mut record_len_bytes) {
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-            let record_len = u32::from_le_bytes(record_len_bytes);
-
-            let mut record_bytes = vec![0u8; record_len as usize];
-            match self.file.read_exact(&mut record_bytes) {
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-            let record = WalRecord::from_bytes(&record_bytes)?;
-
-            match record {
-                WalRecord::Abort { txn_id, .. } => {
-                    aborted_txns.insert(txn_id);
-                }
-                _ => {}
-            }
-
-            if let Some(txn_id) = record.txn_id() {
-                last_txn_id = txn_id
-            }
-
-            records.push(record);
-        }
-
-        // walk the records and re apply changes
-        for record in records {
-            // skip records with Aborted txn_id
-            if let Some(txn_id) = record.txn_id() {
-                if aborted_txns.contains(&txn_id) {
-                    continue;
-                }
-            }
-
-            match record {
-                WalRecord::Checkpoint { .. } => {}
-                WalRecord::Slotted { record_type, .. } => {
-                    match record_type {
-                        WalRecordType::Insert => recover_insert(&record, buffer_pool)?,
-                        WalRecordType::Update => recover_update(&record, buffer_pool)?,
-                        WalRecordType::Delete => recover_delete(&record, buffer_pool)?,
-                        _ => {} // other slotted types don't need recovery
-                    }
-                }
-                WalRecord::Raw { .. } => replay_raw_page_new_data(&record, buffer_pool)?,
-                WalRecord::LinkPage { .. } => {
-                    last_txn_id = record.txn_id().ok_or_else(|| {
-                        io::Error::new(
-                            ErrorKind::InvalidData,
-                            "LinkPage WAL record type should contain a tnx_id",
-                        )
-                    })?;
-                    recover_page_link(&record, buffer_pool)?
-                }
-                WalRecord::AllocatePage {
-                    page_id, page_type, ..
-                } => {
-                    recover_allocate_page(page_id, page_type, buffer_pool)?;
-                }
-                WalRecord::Abort { txn_id, .. } => {
-                    return Err(io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("Abort Wal record type with txn_id:{} not skipped", txn_id),
-                    ));
-                }
-            }
-        }
-
-        // flush all replayed changes to disk
-        buffer_pool.flush_dirty()?;
-        Ok(last_txn_id)
-    }
-}
-
-fn recover_insert(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Result<()> {
+pub fn recover_insert(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Result<()> {
     let page_id = record.page_id().ok_or_else(|| {
         io::Error::new(
             ErrorKind::InvalidData,
@@ -201,7 +67,7 @@ fn recover_insert(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Resul
     }
 }
 
-fn recover_update(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Result<()> {
+pub fn recover_update(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Result<()> {
     let page_id = record.page_id().ok_or_else(|| {
         io::Error::new(
             ErrorKind::InvalidData,
@@ -248,7 +114,7 @@ fn recover_update(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Resul
     Ok(())
 }
 
-fn recover_delete(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Result<()> {
+pub fn recover_delete(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Result<()> {
     let page_id = record.page_id().ok_or_else(|| {
         io::Error::new(
             ErrorKind::InvalidData,
@@ -283,7 +149,10 @@ fn recover_delete(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Resul
     Ok(())
 }
 
-fn replay_raw_page_new_data(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Result<()> {
+pub fn replay_raw_page_new_data(
+    record: &WalRecord,
+    buffer_pool: &mut BufferPool,
+) -> io::Result<()> {
     let record_type = record.record_type().ok_or_else(|| {
         io::Error::new(ErrorKind::InvalidData, "Raw WAL record missing record type")
     })?;
@@ -329,7 +198,7 @@ fn replay_raw_page_new_data(record: &WalRecord, buffer_pool: &mut BufferPool) ->
     Ok(())
 }
 
-fn recover_page_link(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Result<()> {
+pub fn recover_page_link(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Result<()> {
     let page_id = record.page_id().ok_or_else(|| {
         io::Error::new(
             ErrorKind::InvalidData,
@@ -362,7 +231,7 @@ fn recover_page_link(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::Re
     Ok(())
 }
 
-fn recover_allocate_page(
+pub fn recover_allocate_page(
     page_id: PageId,
     page_type_u8: u8,
     buffer_pool: &mut BufferPool,
@@ -388,7 +257,6 @@ fn recover_allocate_page(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{
         constants::OFFSET_RAW_PAGE_START,
         storage::{
@@ -396,7 +264,7 @@ mod tests {
             page::{PAGE_SIZE, PageManager, PageType},
         },
         test_helpers::*,
-        wal::{record_type::WalRecordType, writer::WalWriter},
+        wal::{reader::WalReader, record_type::WalRecordType, writer::WalWriter},
     };
 
     fn setup(name: &str) -> (BufferPool, WalWriter) {
@@ -665,7 +533,8 @@ mod tests {
         wal.checkpoint().unwrap();
 
         // log link page — what recovery will replay
-        wal.append_link_page(page_id, next_page_id, 543).unwrap();
+        wal.append_link_page(page_id, next_page_id, 543, None)
+            .unwrap();
 
         // verify next_page is None before recovery
         let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
@@ -692,7 +561,9 @@ mod tests {
         let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let (next_page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
-        let (lsn, _) = wal.append_link_page(page_id, next_page_id, 432).unwrap();
+        let (lsn, _) = wal
+            .append_link_page(page_id, next_page_id, 432, None)
+            .unwrap();
 
         // apply link to frame — simulates link + checkpoint
         {

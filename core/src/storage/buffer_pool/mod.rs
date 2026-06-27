@@ -214,9 +214,11 @@ impl BufferPool {
         next_page: PageId,
         wal_writer: &mut WalWriter,
         txn_id: u64,
+        old_next_page: Option<PageId>,
     ) -> io::Result<(Lsn, u64)> {
         // log to WAL
-        let (lsn, wal_offset) = wal_writer.append_link_page(page_id, next_page, txn_id)?;
+        let (lsn, wal_offset) =
+            wal_writer.append_link_page(page_id, next_page, txn_id, old_next_page)?;
 
         // get page data
         let idx = self.get_frame_idx(page_id)?;
@@ -903,7 +905,7 @@ mod tests {
         assert_eq!(meta.next_page().unwrap(), None);
 
         // link pages
-        bp.update_next_page_in_page_metadata(page_id, next_page_id, &mut wal, 4)
+        bp.update_next_page_in_page_metadata(page_id, next_page_id, &mut wal, 4, None)
             .unwrap();
 
         // verify next_page updated
@@ -930,7 +932,7 @@ mod tests {
             (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
             (next_page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
-            bp.update_next_page_in_page_metadata(page_id, next_page_id, &mut wal, 5)
+            bp.update_next_page_in_page_metadata(page_id, next_page_id, &mut wal, 5, None)
                 .unwrap();
             bp.flush_dirty().unwrap();
         }
