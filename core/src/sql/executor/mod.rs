@@ -144,7 +144,7 @@ impl Executor {
                 })
             }
             Statement::RollBack => {
-                // TODO: roll back txn
+                self.database.rollback_txn()?;
                 Ok(ExecutionResult::Success {
                     message: "Transaction rolled back".to_string(),
                 })

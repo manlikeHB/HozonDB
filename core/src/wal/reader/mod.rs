@@ -158,7 +158,7 @@ impl WalReader {
         let record = self.read_record_at(wal_offset)?;
 
         // Validate record through it's LSN against expected LSN
-        if record.lsn() == expected_lsn {
+        if record.lsn() != expected_lsn {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "Record lsn doesn't match expected lsn",
@@ -189,22 +189,29 @@ impl WalReader {
         match record {
             WalRecord::AllocatePage { .. } => undo_allocate_page(&record, buffer_pool, abort_lsn),
             WalRecord::LinkPage { .. } => undo_link_page(&record, buffer_pool, abort_lsn),
-            WalRecord::Raw { .. } => undo_raw(&record, buffer_pool, abort_lsn),
-            WalRecord::Slotted { record_type, .. } => {
-                match record_type {
-                    WalRecordType::Insert => undo_insert(&record, buffer_pool, abort_lsn),
-                    WalRecordType::Update => undo_update(&record, buffer_pool, abort_lsn),
-                    WalRecordType::Delete => undo_delete(&record, buffer_pool, abort_lsn),
-                    WalRecordType::FreePage => undo_free_page(&record, buffer_pool, abort_lsn),
-                    _ => {
-                        todo!()
-                    } // other slotted types don't need undo
-                }
-            }
 
-            _ => {
-                todo!()
-            } // TODO: throw error?
+            WalRecord::Slotted { record_type, .. } => match record_type {
+                WalRecordType::Insert => undo_insert(&record, buffer_pool, abort_lsn),
+                WalRecordType::Update => undo_update(&record, buffer_pool, abort_lsn),
+                WalRecordType::Delete => undo_delete(&record, buffer_pool, abort_lsn),
+                other => Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "no undo implemented for Slotted WAL record type {:?}",
+                        other
+                    ),
+                )),
+            },
+
+            WalRecord::Raw { record_type, .. } => match record_type {
+                WalRecordType::FreePage => undo_free_page(&record, buffer_pool, abort_lsn),
+                _ => undo_raw(&record, buffer_pool, abort_lsn),
+            },
+
+            WalRecord::Checkpoint { .. } | WalRecord::Abort { .. } => Err(Error::new(
+                ErrorKind::InvalidData,
+                "attempted to undo a Checkpoint/Abort record — these should never appear in a txn's undo chain",
+            )),
         }
     }
 }
