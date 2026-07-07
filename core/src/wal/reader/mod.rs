@@ -187,9 +187,7 @@ impl WalReader {
         abort_lsn: u64,
     ) -> io::Result<()> {
         match record {
-            WalRecord::AllocatePage { .. } => {
-                todo!()
-            }
+            WalRecord::AllocatePage { .. } => undo_allocate_page(&record, buffer_pool, abort_lsn),
             WalRecord::LinkPage { .. } => undo_link_page(&record, buffer_pool, abort_lsn),
             WalRecord::Raw { .. } => undo_raw(&record, buffer_pool, abort_lsn),
             WalRecord::Slotted { record_type, .. } => {
@@ -197,11 +195,13 @@ impl WalReader {
                     WalRecordType::Insert => undo_insert(&record, buffer_pool, abort_lsn),
                     WalRecordType::Update => undo_update(&record, buffer_pool, abort_lsn),
                     WalRecordType::Delete => undo_delete(&record, buffer_pool, abort_lsn),
+                    WalRecordType::FreePage => undo_free_page(&record, buffer_pool, abort_lsn),
                     _ => {
                         todo!()
                     } // other slotted types don't need undo
                 }
             }
+
             _ => {
                 todo!()
             } // TODO: throw error?
