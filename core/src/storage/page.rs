@@ -1,11 +1,11 @@
-use crate::constants::{OFFSET_RAW_PAGE_START, PageId};
+use crate::constants::{DB_HEADER_PAGE_ID, NONE_U32, OFFSET_RAW_PAGE_START, PageId};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub const PAGE_SIZE: usize = 4096;
-const HEADER_SIZE: usize = 12;
+// const HEADER_SIZE: usize = 12;
 const MAGIC_NUMBER: u32 = 0x484F5A4E; // HOZN
 
 const PAGE_METADATA_SIZE: usize = 18;
@@ -24,8 +24,6 @@ const OFFSET_LSN: usize = 10;
 pub struct PageManager {
     file: Mutex<File>,
     lock_path: PathBuf,
-    num_pages: u32,
-    first_free_page: Option<PageId>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -33,6 +31,7 @@ pub enum PageType {
     Slotted,
     Raw,
     Free,
+    Header,
 }
 
 impl PageType {
@@ -41,6 +40,7 @@ impl PageType {
             PageType::Slotted => 1,
             PageType::Raw => 2,
             PageType::Free => 3,
+            PageType::Header => 4,
         }
     }
 
@@ -49,6 +49,7 @@ impl PageType {
             1 => Ok(PageType::Slotted),
             2 => Ok(PageType::Raw),
             3 => Ok(PageType::Free),
+            4 => Ok(PageType::Header),
             other => Err(Error::new(
                 ErrorKind::InvalidData,
                 format!("Unknown PageType: {}", other),
@@ -73,14 +74,21 @@ pub enum PageMetadata {
         next_page: Option<u32>,
         lsn: u64,
     },
+    Header {
+        magic: u32,
+        num_pages: u32,
+        first_free_page: Option<PageId>,
+    },
 }
 
 impl PageMetadata {
+    // Setters
     pub fn set_lsn(&mut self, new_lsn: u64) {
         match self {
             Self::Raw { lsn } | Self::Slotted { lsn, .. } | Self::Free { lsn, .. } => {
                 *lsn = new_lsn
             }
+            _ => {}
         }
     }
 
@@ -116,11 +124,30 @@ impl PageMetadata {
         }
     }
 
-    pub fn lsn(&self) -> u64 {
+    pub fn set_num_pages(&mut self, num_pages: u32) {
         match self {
-            Self::Raw { lsn } => *lsn,
-            Self::Slotted { lsn, .. } => *lsn,
-            Self::Free { lsn, .. } => *lsn,
+            Self::Header { num_pages: np, .. } => *np = num_pages,
+            _ => {}
+        }
+    }
+
+    pub fn set_first_free_page(&mut self, first_free_page: Option<u32>) {
+        match self {
+            Self::Header {
+                first_free_page: ffp,
+                ..
+            } => *ffp = first_free_page,
+            _ => {}
+        }
+    }
+
+    // Getters
+    pub fn lsn(&self) -> Option<u64> {
+        match self {
+            Self::Raw { lsn } => Some(*lsn),
+            Self::Slotted { lsn, .. } => Some(*lsn),
+            Self::Free { lsn, .. } => Some(*lsn),
+            Self::Header { .. } => None,
         }
     }
 
@@ -166,6 +193,38 @@ impl PageMetadata {
             )),
         }
     }
+
+    pub fn magic_number(&self) -> io::Result<u32> {
+        match self {
+            Self::Header { magic, .. } => Ok(*magic),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Only Header page metadata contain magic number",
+            )),
+        }
+    }
+
+    pub fn num_pages(&self) -> io::Result<u32> {
+        match self {
+            Self::Header { num_pages, .. } => Ok(*num_pages),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Only Header page metadata contain total number of pages",
+            )),
+        }
+    }
+
+    pub fn first_free_page(&self) -> io::Result<Option<u32>> {
+        match self {
+            Self::Header {
+                first_free_page, ..
+            } => Ok(*first_free_page),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Only Header page metadata contain first free page",
+            )),
+        }
+    }
 }
 
 impl PageManager {
@@ -194,25 +253,9 @@ impl PageManager {
                 ));
             }
 
-            // Read number of pages
-            let mut num_pages_bytes = [0u8; 4];
-            file.read_exact(&mut num_pages_bytes)?;
-            let num_pages = u32::from_le_bytes(num_pages_bytes);
-
-            // Read first free page id
-            let mut f_f_page_bytes = [0u8; 4];
-            file.read_exact(&mut f_f_page_bytes)?;
-            let first_free_page = u32::from_le_bytes(f_f_page_bytes);
-
             Ok(PageManager {
                 file: Mutex::new(file),
-                num_pages: num_pages,
                 lock_path,
-                first_free_page: if first_free_page == NULL_PAGE {
-                    None
-                } else {
-                    Some(first_free_page)
-                },
             })
         } else {
             let mut file = OpenOptions::new()
@@ -229,33 +272,9 @@ impl PageManager {
 
             Ok(PageManager {
                 file: Mutex::new(file),
-                num_pages: 1,
                 lock_path,
-                first_free_page: None,
             })
         }
-    }
-
-    /// Write header (magic, num_pages, first_free_page) to page 0 (header)
-    fn write_header(&mut self) -> io::Result<()> {
-        let mut headers = [0u8; HEADER_SIZE];
-        headers[0..4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes()); // magic number
-        headers[4..8].copy_from_slice(&self.num_pages().to_le_bytes()); // number of pages
-        headers[8..12].copy_from_slice(&self.first_free_page.unwrap_or(NULL_PAGE).to_le_bytes()); // free pages linked list first page
-
-        let mut file = self.file.lock().unwrap();
-        file.seek(SeekFrom::Start(0))?; // go to start
-        file.write_all(&headers)?;
-
-        Ok(())
-    }
-
-    /// Add a page to the free list
-    pub(crate) fn set_first_free_page(&mut self, next_free: Option<PageId>) -> io::Result<()> {
-        // update head to new free page
-        self.first_free_page = next_free;
-        self.write_header()?; // update header
-        Ok(())
     }
 
     /// Try to acquire the lock file
@@ -297,20 +316,16 @@ impl PageManager {
     ///
     /// Note: Page 0 is reserved for database header and created in new().
     /// This method allocates pages starting from page 1 with initialized metadata.
-    pub fn allocate_page(&mut self, page_type: PageType) -> io::Result<PageId> {
-        // No free pages - extend database
-        let page_id: PageId = self.num_pages;
-        self.num_pages += 1;
-
-        let new_size = (self.num_pages as u64) * (PAGE_SIZE as u64);
-        let num_pages_bytes = self.num_pages.to_le_bytes();
+    pub fn allocate_page(&mut self, page_type: PageType, page_id: PageId) -> io::Result<PageId> {
+        // extend database
+        // new size is page ID + 1 * 4096 because page ID start from zero
+        // meaning total number of pages is always page ID + 1
+        let new_size = ((page_id + 1) as u64) * (PAGE_SIZE as u64);
 
         // Extend db file size and set new number of pages
         {
-            let mut file = self.file.lock().unwrap();
+            let file = self.file.lock().unwrap();
             file.set_len(new_size)?;
-            file.seek(SeekFrom::Start(4))?;
-            file.write_all(&num_pages_bytes)?; // update number of pages in header
         };
 
         let mut page_data = [0u8; PAGE_SIZE];
@@ -324,9 +339,6 @@ impl PageManager {
             Self::init_page_metadata_buffer(&mut page_data, page_type);
         }
 
-        // update header on disk!
-        self.write_header()?; // TODO: check if this necessary
-
         // Write initialized page
         self.write_page(page_id, &page_data)?;
 
@@ -334,15 +346,10 @@ impl PageManager {
     }
 
     /// Write data to a specific page
-    pub fn write_page(&mut self, page_id: PageId, data: &[u8]) -> io::Result<()> {
-        // Check page ID validity
-        if page_id >= self.num_pages {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid page ID: {} (max: {})", page_id, self.num_pages - 1),
-            ));
-        }
-
+    ///
+    /// `pub(crate)` only — does not enforce page ID validity.
+    /// Callers should use `BufferPool::write_page_to_disk` instead.
+    pub(crate) fn write_page(&mut self, page_id: PageId, data: &[u8]) -> io::Result<()> {
         // Check that data is not longer than PAGE_SIZE
         if data.len() > PAGE_SIZE {
             return Err(io::Error::new(
@@ -375,14 +382,6 @@ impl PageManager {
 
     /// Read data from a specific page
     pub fn read_page(&self, page_id: PageId) -> io::Result<[u8; PAGE_SIZE]> {
-        // Check page ID validity
-        if page_id >= self.num_pages {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid page ID: {} (max: {})", page_id, self.num_pages - 1),
-            ));
-        }
-
         let offset = (page_id as u64) * (PAGE_SIZE as u64);
         let mut buf = [0u8; PAGE_SIZE];
         {
@@ -392,11 +391,6 @@ impl PageManager {
         };
 
         Ok(buf)
-    }
-
-    /// Get total number of pages
-    pub fn num_pages(&self) -> u32 {
-        self.num_pages
     }
 
     pub fn init_page_metadata_buffer(page_data: &mut [u8; PAGE_SIZE], page_type: PageType) {
@@ -418,6 +412,12 @@ impl PageManager {
             PageType::Free => {
                 page_data[0..4].copy_from_slice(&NULL_PAGE.to_le_bytes());
                 page_data[4..12].copy_from_slice(&0u64.to_le_bytes());
+            }
+            PageType::Header => {
+                // Write header (magic, num_pages, first_free_page) to page 0 (header)
+                page_data[0..4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes()); // magic number
+                page_data[4..8].copy_from_slice(&1u32.to_le_bytes()); // number of pages
+                page_data[8..12].copy_from_slice(&NONE_U32.to_le_bytes()); // free pages linked list first page
             }
         }
     }
@@ -533,6 +533,24 @@ impl PageManager {
                     lsn,
                 }
             }
+            PageType::Header => {
+                let magic =
+                    u32::from_le_bytes([page_data[0], page_data[1], page_data[2], page_data[3]]);
+                let num_pages =
+                    u32::from_le_bytes([page_data[4], page_data[5], page_data[6], page_data[7]]);
+                let first_free_page =
+                    u32::from_le_bytes([page_data[8], page_data[9], page_data[10], page_data[11]]);
+
+                PageMetadata::Header {
+                    magic,
+                    num_pages,
+                    first_free_page: if first_free_page == NONE_U32 {
+                        None
+                    } else {
+                        Some(first_free_page)
+                    },
+                }
+            }
         }
     }
 
@@ -564,11 +582,18 @@ impl PageManager {
                 page_data[0..4].copy_from_slice(&next_page.to_le_bytes());
                 page_data[4..12].copy_from_slice(&lsn.to_le_bytes());
             }
-        }
-    }
+            PageMetadata::Header {
+                magic,
+                num_pages,
+                first_free_page,
+            } => {
+                page_data[0..4].copy_from_slice(&magic.to_le_bytes());
+                page_data[4..8].copy_from_slice(&num_pages.to_le_bytes());
 
-    pub fn first_free_page(&self) -> Option<PageId> {
-        self.first_free_page
+                let first_free_page = first_free_page.unwrap_or(NONE_U32);
+                page_data[8..12].copy_from_slice(&first_free_page.to_le_bytes());
+            }
+        }
     }
 
     pub fn read_slot(page_data: &[u8; PAGE_SIZE], slot_index: u16) -> (u16, u16) {
@@ -603,6 +628,11 @@ impl PageManager {
         // set row length to zero
         page_data[offset..offset + 2].copy_from_slice(&0u16.to_le_bytes());
     }
+
+    pub fn num_pages(&self) -> io::Result<u32> {
+        let meta = self.read_page_metadata(DB_HEADER_PAGE_ID, PageType::Header)?;
+        meta.num_pages()
+    }
 }
 
 impl Drop for PageManager {
@@ -618,17 +648,21 @@ mod tests {
     use super::*;
     use crate::test_helpers::*;
 
+    const PAGE_ID_1: u32 = 1;
+    const PAGE_ID_2: u32 = 2;
+    const PAGE_ID_3: u32 = 3;
+
     #[test]
     fn test_page_manager_new() {
         cleanup("test");
 
         let pm = PageManager::new("test");
         assert!(pm.is_ok());
-        assert_eq!(pm.unwrap().num_pages(), 1);
+
+        drop(pm);
 
         let pm2 = PageManager::new("test");
         assert!(pm2.is_ok());
-        assert_eq!(pm2.unwrap().num_pages(), 1);
 
         cleanup("test");
     }
@@ -638,19 +672,12 @@ mod tests {
         cleanup("test_alloc");
 
         let mut pm = PageManager::new("test_alloc").unwrap();
-        assert_eq!(pm.num_pages(), 1);
 
-        let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
         assert_eq!(page_id, 1);
-        assert_eq!(pm.num_pages(), 2);
 
-        let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_2).unwrap();
         assert_eq!(page_id, 2);
-        assert_eq!(pm.num_pages(), 3);
-
-        drop(pm);
-        let pm = PageManager::new("test_alloc").unwrap();
-        assert_eq!(pm.num_pages(), 3);
 
         cleanup("test_alloc");
     }
@@ -684,7 +711,7 @@ mod tests {
         let mut pm = PageManager::new("test_rw").unwrap();
 
         // Allocate a page
-        let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
         assert_eq!(page_id, 1);
 
         // Write data to the page
@@ -708,7 +735,7 @@ mod tests {
         cleanup("test_full");
 
         let mut pm = PageManager::new("test_full").unwrap();
-        let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
 
         // Write exactly PAGE_SIZE bytes
         let data = [42u8; PAGE_SIZE];
@@ -722,24 +749,11 @@ mod tests {
     }
 
     #[test]
-    fn test_write_invalid_page() {
-        cleanup("test_invalid");
-
-        let mut pm = PageManager::new("test_invalid").unwrap();
-
-        // Try to write to non-existent page
-        let result = pm.write_page(999, b"data");
-        assert!(result.is_err());
-
-        cleanup("test_invalid");
-    }
-
-    #[test]
     fn test_write_oversized_data() {
         cleanup("test_oversize");
 
         let mut pm = PageManager::new("test_oversize").unwrap();
-        let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
 
         // Try to write more than PAGE_SIZE
         let data = vec![1u8; PAGE_SIZE + 1];
@@ -755,12 +769,12 @@ mod tests {
 
         let mut pm = PageManager::new("test_metadata_init").unwrap();
 
-        let page_id_1 = pm.allocate_page(PageType::Slotted).unwrap(); // page id 1 is for table catalog
+        let page_id_1 = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap(); // page id 1 is for table catalog
         assert_eq!(page_id_1, 1);
-        let page_id_2 = pm.allocate_page(PageType::Slotted).unwrap(); // page id 2 is for index catalog
+        let page_id_2 = pm.allocate_page(PageType::Slotted, PAGE_ID_2).unwrap(); // page id 2 is for index catalog
         assert_eq!(page_id_2, 2);
         // Allocate page 3 (should have initialized metadata)
-        let page_id_3 = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id_3 = pm.allocate_page(PageType::Slotted, PAGE_ID_3).unwrap();
         assert_eq!(page_id_3, 3);
 
         // Read metadata
@@ -792,7 +806,7 @@ mod tests {
         cleanup("test_metadata_update");
 
         let mut pm = PageManager::new("test_metadata_update").unwrap();
-        let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
 
         // Update metadata
         let new_metadata = PageMetadata::Slotted {
@@ -833,7 +847,7 @@ mod tests {
 
         {
             let mut pm = PageManager::new("test_metadata_persist").unwrap();
-            let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+            let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
 
             // Update metadata
             let metadata = PageMetadata::Slotted {
@@ -880,9 +894,9 @@ mod tests {
         let mut pm = PageManager::new("test_multi_meta").unwrap();
 
         // Allocate two pages
-        let page1 = pm.allocate_page(PageType::Slotted).unwrap();
-        let page2 = pm.allocate_page(PageType::Slotted).unwrap();
-        let page3 = pm.allocate_page(PageType::Raw).unwrap();
+        let page1 = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
+        let page2 = pm.allocate_page(PageType::Slotted, PAGE_ID_2).unwrap();
+        let page3 = pm.allocate_page(PageType::Raw, PAGE_ID_3).unwrap();
 
         // Update page1 metadata
         let meta1 = PageMetadata::Slotted {
@@ -956,66 +970,12 @@ mod tests {
     }
 
     #[test]
-    fn test_header_with_free_list() {
-        cleanup("test_header_free");
-
-        // Create new database
-        let pm = PageManager::new("test_header_free").unwrap();
-
-        // Verify initial state
-        assert_eq!(pm.num_pages(), 1);
-        assert_eq!(pm.first_free_page, None);
-
-        drop(pm);
-
-        // Reopen and verify header persisted
-        let pm = PageManager::new("test_header_free").unwrap();
-        assert_eq!(pm.num_pages(), 1);
-        assert_eq!(pm.first_free_page, None);
-
-        cleanup("test_header_free");
-    }
-
-    #[test]
-    fn test_allocate_when_free_list_empty() {
-        cleanup("test_empty_free");
-        let mut pm = PageManager::new("test_empty_free").unwrap();
-
-        // Free list is empty initially
-        assert_eq!(pm.first_free_page, None);
-
-        // Allocate should extend database
-        let page1 = pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(page1, 1);
-        assert_eq!(pm.num_pages(), 2);
-
-        cleanup("test_empty_free");
-    }
-
-    #[test]
-    fn test_write_header_updates_num_pages() {
-        cleanup("test_header_update");
-        let mut pm = PageManager::new("test_header_update").unwrap();
-
-        // Allocate page (increases num_pages)
-        pm.allocate_page(PageType::Slotted).unwrap();
-        assert_eq!(pm.num_pages(), 2);
-
-        // Manually verify header on disk
-        drop(pm);
-        let pm = PageManager::new("test_header_update").unwrap();
-        assert_eq!(pm.num_pages(), 2); // Should persist
-
-        cleanup("test_header_update");
-    }
-
-    #[test]
     fn test_write_and_read_slot() {
         cleanup("test_write_and_read_slot");
         let mut pm = PageManager::new("test_write_and_read_slot").unwrap();
 
         // allocate new page
-        let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
         let row_offset = 300u16;
         let row_length = 35u16;
         let slot_index = 0;
@@ -1043,7 +1003,7 @@ mod tests {
         cleanup("test_multiple_slots_independent");
         let mut pm = PageManager::new("test_multiple_slots_independent").unwrap();
 
-        let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
         let mut page_data = pm.read_page(page_id).unwrap();
 
         PageManager::write_slot(&mut page_data, 0, 4000u16, 50u16);
@@ -1065,7 +1025,7 @@ mod tests {
         cleanup("test_mark_slot_dead");
         let mut pm = PageManager::new("test_mark_slot_dead").unwrap();
 
-        let page_id = pm.allocate_page(PageType::Slotted).unwrap();
+        let page_id = pm.allocate_page(PageType::Slotted, PAGE_ID_1).unwrap();
         let mut page_data = pm.read_page(page_id).unwrap();
 
         PageManager::write_slot(&mut page_data, 0, 4000u16, 50u16);
@@ -1090,18 +1050,18 @@ mod tests {
             lsn: 0,
         };
         meta.set_lsn(42);
-        assert_eq!(meta.lsn(), 42);
+        assert_eq!(meta.lsn(), Some(42));
 
         let mut meta = PageMetadata::Raw { lsn: 0 };
         meta.set_lsn(99);
-        assert_eq!(meta.lsn(), 99);
+        assert_eq!(meta.lsn(), Some(99));
 
         let mut meta = PageMetadata::Free {
             next_page: None,
             lsn: 0,
         };
         meta.set_lsn(7);
-        assert_eq!(meta.lsn(), 7);
+        assert_eq!(meta.lsn(), Some(7));
     }
 
     #[test]
@@ -1267,7 +1227,7 @@ mod tests {
         cleanup("test_raw_meta_init");
         let mut pm = PageManager::new("test_raw_meta_init").unwrap();
 
-        let page_id = pm.allocate_page(PageType::Raw).unwrap();
+        let page_id = pm.allocate_page(PageType::Raw, PAGE_ID_1).unwrap();
         let meta = pm.read_page_metadata(page_id, PageType::Raw).unwrap();
 
         match meta {
@@ -1284,7 +1244,7 @@ mod tests {
 
         {
             let mut pm = PageManager::new("test_raw_meta_persist").unwrap();
-            let page_id = pm.allocate_page(PageType::Raw).unwrap();
+            let page_id = pm.allocate_page(PageType::Raw, PAGE_ID_1).unwrap();
             pm.update_page_metadata(page_id, &PageMetadata::Raw { lsn: 55 })
                 .unwrap();
         }

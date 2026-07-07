@@ -3,7 +3,7 @@ pub mod frame;
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 
-use crate::constants::{Lsn, TxnId};
+use crate::constants::{DB_HEADER_PAGE_ID, Lsn, TxnId};
 use crate::storage::buffer_pool::frame::Frame;
 use crate::storage::page::{PageMetadata, PageType};
 use crate::wal::record_type::WalRecordType;
@@ -18,16 +18,22 @@ pub struct BufferPool {
     frames: Vec<Frame>,
     page_table: HashMap<PageId, usize>,
     clock_hand: usize,
+    num_pages: u32,
 }
 
 impl BufferPool {
-    pub fn new(page_manager: PageManager, capacity: usize) -> Self {
-        BufferPool {
+    pub fn new(page_manager: PageManager, capacity: usize) -> io::Result<Self> {
+        // Read total number of pages from disk
+        let num_pages = page_manager.num_pages()?;
+
+        let bp = BufferPool {
             page_manager,
             frames: vec![Frame::default(); capacity],
             page_table: HashMap::new(),
             clock_hand: 0,
-        }
+            num_pages,
+        };
+        Ok(bp)
     }
 
     pub fn read_page(&mut self, page_id: PageId) -> io::Result<&[u8; PAGE_SIZE]> {
@@ -64,7 +70,7 @@ impl BufferPool {
         page_type: PageType,
         txn_id: TxnId,
     ) -> io::Result<(PageId, Lsn, u64)> {
-        if let Some(free_page_id) = self.page_manager.first_free_page() {
+        if let Some(free_page_id) = self.first_free_page()? {
             // read next free pointer from buffer pool frame
             let next_free = self.read_next_free(free_page_id)?;
 
@@ -73,7 +79,7 @@ impl BufferPool {
                 wal_writer.append_allocate_page(free_page_id, page_type.to_u8(), txn_id)?;
 
             // update free list head
-            self.page_manager.set_first_free_page(next_free)?;
+            self.set_first_free_page(next_free, lsn)?;
 
             // reset page metadata of free page for reuse
             let page_data = self.get_page_mut(free_page_id)?;
@@ -85,18 +91,59 @@ impl BufferPool {
             return Ok((free_page_id, lsn, wal_offset));
         }
 
-        // no free pages — delegate extension to PageManager
-        let page_id = self.page_manager.allocate_page(page_type)?;
+        // get next page id
+        let page_id: PageId = self.num_pages;
 
         // log
         let (lsn, wal_offset) =
             wal_writer.append_allocate_page(page_id, page_type.to_u8(), txn_id)?;
 
+        // update total number of pages
+        self.num_pages += 1;
+
+        // no free pages — delegate extension to PageManager
+        let page_id = self.page_manager.allocate_page(page_type, page_id)?;
+
+        // update number of pages in header
+        self.update_header_num_pages(self.num_pages, lsn)?;
+
         Ok((page_id, lsn, wal_offset))
+    }
+
+    fn update_header_num_pages(&mut self, num_pages: u32, lsn: Lsn) -> io::Result<()> {
+        let page_data = self.get_page_mut(DB_HEADER_PAGE_ID)?;
+        let mut meta = PageManager::read_metadata_from_buffer(page_data, PageType::Header);
+        meta.set_num_pages(num_pages);
+        PageManager::update_metadata_in_buffer(page_data, &meta);
+        self.mark_dirty(DB_HEADER_PAGE_ID, lsn)?;
+        Ok(())
+    }
+
+    fn write_page_to_disk(
+        page_manager: &mut PageManager,
+        page_id: PageId,
+        data: &[u8],
+        total_num_pages: u32,
+    ) -> io::Result<()> {
+        // Check page ID validity
+        if page_id >= total_num_pages {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid page ID: {} (max: {})",
+                    page_id,
+                    total_num_pages - 1
+                ),
+            ));
+        }
+
+        page_manager.write_page(page_id, data)
     }
 
     // flush all dirty frames to disk — called at checkpoint
     pub(crate) fn flush_dirty(&mut self) -> io::Result<()> {
+        let total_num_pages = self.total_num_of_db_pages();
+
         for frame in self.frames.iter_mut() {
             if frame.is_empty() || !frame.dirty() {
                 continue;
@@ -109,7 +156,12 @@ impl BufferPool {
                 )
             })?;
 
-            self.page_manager.write_page(page_id, frame.data())?;
+            Self::write_page_to_disk(
+                &mut self.page_manager,
+                page_id,
+                frame.data(),
+                total_num_pages,
+            )?;
             frame.mark_clean();
         }
 
@@ -128,7 +180,7 @@ impl BufferPool {
     /// Get frame index of a page or assign new frame
     fn get_frame_idx(&mut self, page_id: PageId) -> io::Result<usize> {
         if !self.page_table.contains_key(&page_id) {
-            let page_data = self.page_manager.read_page(page_id)?;
+            let page_data = self.read_page_from_disk(page_id)?;
 
             // check for empty frame
             if let Some(idx) = self.frames.iter().position(|frame| frame.is_empty()) {
@@ -143,6 +195,7 @@ impl BufferPool {
             self.page_table.insert(page_id, idx);
             return Ok(idx);
         }
+
         Ok(self.page_table[&page_id])
     }
 
@@ -170,8 +223,12 @@ impl BufferPool {
                 // Write is not synced here — durability for this page is guaranteed by
                 // the next checkpoint's sync_all, backed by WAL replay if it doesn't
                 // make it to disk before a crash.
-                self.page_manager
-                    .write_page(page_id, self.frames[idx].data())?;
+                Self::write_page_to_disk(
+                    &mut self.page_manager,
+                    page_id,
+                    self.frames[idx].data(),
+                    self.num_pages,
+                )?;
             }
 
             if let Some(page_id) = self.frames[idx].page_id() {
@@ -195,6 +252,22 @@ impl BufferPool {
         })?;
         self.frames[*idx].mark_dirty(lsn);
         Ok(())
+    }
+
+    fn read_page_from_disk(&mut self, page_id: PageId) -> io::Result<[u8; PAGE_SIZE]> {
+        // Check page ID validity
+        if page_id >= self.total_num_of_db_pages() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid page ID: {} (max: {})",
+                    page_id,
+                    self.total_num_of_db_pages() - 1
+                ),
+            ));
+        }
+
+        self.page_manager.read_page(page_id)
     }
 
     pub fn read_page_metadata(
@@ -236,8 +309,8 @@ impl BufferPool {
         Ok((lsn, wal_offset))
     }
 
-    pub fn total_num_of_db_pages(&self) -> u32 {
-        self.page_manager.num_pages()
+    pub fn total_num_of_db_pages(&mut self) -> u32 {
+        self.num_pages
     }
 
     /// Writes the full 4kb raw page and marks page dirty
@@ -247,7 +320,7 @@ impl BufferPool {
         new_data: &[u8; PAGE_SIZE],
         lsn: u64,
     ) -> io::Result<()> {
-        self.write_page(page_id, new_data, lsn, PageType::Raw)
+        self.write_page_to_buffer_pool(page_id, new_data, lsn, PageType::Raw)
     }
 
     fn write_free_page(
@@ -256,10 +329,10 @@ impl BufferPool {
         new_data: &[u8; PAGE_SIZE],
         lsn: u64,
     ) -> io::Result<()> {
-        self.write_page(page_id, new_data, lsn, PageType::Free)
+        self.write_page_to_buffer_pool(page_id, new_data, lsn, PageType::Free)
     }
 
-    fn write_page(
+    fn write_page_to_buffer_pool(
         &mut self,
         page_id: PageId,
         new_data: &[u8; PAGE_SIZE],
@@ -291,7 +364,7 @@ impl BufferPool {
         txn_id: u64,
     ) -> io::Result<(Lsn, u64)> {
         // build new free page content
-        let next_free = self.page_manager.first_free_page();
+        let next_free = self.first_free_page()?;
         let mut new_page = [0u8; PAGE_SIZE];
         let page_meta = PageMetadata::Free {
             next_page: next_free,
@@ -312,7 +385,7 @@ impl BufferPool {
         self.write_free_page(page_id, &new_page, lsn)?;
 
         // update free list head and persist header
-        self.page_manager.set_first_free_page(Some(page_id))?;
+        self.set_first_free_page(Some(page_id), lsn)?;
 
         Ok((lsn, wal_offset))
     }
@@ -324,16 +397,35 @@ impl BufferPool {
         page_meta.next_page()
     }
 
-    pub fn first_free_page(&self) -> Option<PageId> {
-        self.page_manager.first_free_page()
+    pub fn first_free_page(&mut self) -> io::Result<Option<PageId>> {
+        let page_data = self.read_page(DB_HEADER_PAGE_ID)?;
+        let meta = PageManager::read_metadata_from_buffer(page_data, PageType::Header);
+        meta.first_free_page()
     }
 
-    pub(crate) fn set_first_free_page(&mut self, next_free: Option<PageId>) -> io::Result<()> {
-        self.page_manager.set_first_free_page(next_free)
+    pub(crate) fn set_first_free_page(
+        &mut self,
+        next_free: Option<PageId>,
+        lsn: u64,
+    ) -> io::Result<()> {
+        // get Header page (page 0) data
+        let page_data = self.get_page_mut(DB_HEADER_PAGE_ID)?;
+        let mut meta = PageManager::read_metadata_from_buffer(page_data, PageType::Header);
+
+        meta.set_first_free_page(next_free);
+
+        PageManager::update_metadata_in_buffer(page_data, &meta);
+
+        self.mark_dirty(DB_HEADER_PAGE_ID, lsn)
     }
 
     pub fn is_cached(&self, page_id: PageId) -> bool {
         self.page_table.contains_key(&page_id)
+    }
+
+    pub(crate) fn set_num_pages(&mut self, num_pages: u32) -> io::Result<()> {
+        self.num_pages = num_pages;
+        Ok(())
     }
 }
 
@@ -348,7 +440,7 @@ mod tests {
 
     fn setup(basename: &str) -> (BufferPool, WalWriter) {
         let pm = PageManager::new(basename).unwrap();
-        let bp = BufferPool::new(pm, 64);
+        let bp = BufferPool::new(pm, 64).unwrap();
         let wal = WalWriter::new(basename).unwrap();
         (bp, wal)
     }
@@ -360,10 +452,10 @@ mod tests {
 
         let (page1, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         assert_eq!(page1, 1);
-        assert_eq!(bp.page_manager.first_free_page(), None);
+        assert_eq!(bp.first_free_page().unwrap(), None);
 
         bp.free_page(page1, &mut wal, 2).unwrap();
-        assert_eq!(bp.page_manager.first_free_page(), Some(1));
+        assert_eq!(bp.first_free_page().unwrap(), Some(1));
 
         cleanup("test_free_add");
     }
@@ -380,15 +472,15 @@ mod tests {
         assert_eq!(page1, 1);
         assert_eq!(page2, 2);
         assert_eq!(page3, 3);
-        assert_eq!(bp.page_manager.num_pages(), 4);
+        assert_eq!(bp.total_num_of_db_pages(), 4);
 
         bp.free_page(page2, &mut wal, 2).unwrap();
-        assert_eq!(bp.page_manager.first_free_page(), Some(2));
+        assert_eq!(bp.first_free_page().unwrap(), Some(2));
 
         let (page4, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         assert_eq!(page4, 2);
-        assert_eq!(bp.page_manager.first_free_page(), None);
-        assert_eq!(bp.page_manager.num_pages(), 4);
+        assert_eq!(bp.first_free_page().unwrap(), None);
+        assert_eq!(bp.total_num_of_db_pages(), 4);
 
         cleanup("test_reuse");
     }
@@ -406,7 +498,7 @@ mod tests {
         bp.free_page(page2, &mut wal, 3).unwrap();
         bp.free_page(page3, &mut wal, 4).unwrap();
 
-        assert_eq!(bp.page_manager.first_free_page(), Some(3));
+        assert_eq!(bp.first_free_page().unwrap(), Some(3));
 
         let (realloc1, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         assert_eq!(realloc1, 3);
@@ -417,7 +509,7 @@ mod tests {
         let (realloc3, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         assert_eq!(realloc3, 1);
 
-        assert_eq!(bp.page_manager.first_free_page(), None);
+        assert_eq!(bp.first_free_page().unwrap(), None);
 
         cleanup("test_lifo");
     }
@@ -436,12 +528,13 @@ mod tests {
             bp.free_page(page2, &mut wal, 1).unwrap();
             bp.free_page(page3, &mut wal, 2).unwrap();
 
-            assert_eq!(bp.page_manager.first_free_page(), Some(3));
+            assert_eq!(bp.first_free_page().unwrap(), Some(3));
+            bp.flush_dirty().unwrap();
         }
 
         {
-            let (bp, _) = setup("test_free_persist");
-            assert_eq!(bp.page_manager.first_free_page(), Some(3));
+            let (mut bp, _) = setup("test_free_persist");
+            assert_eq!(bp.first_free_page().unwrap(), Some(3));
         }
 
         cleanup("test_free_persist");
@@ -455,7 +548,7 @@ mod tests {
         for _ in 0..5 {
             bp.allocate_slotted_page(&mut wal, 1).unwrap();
         }
-        assert_eq!(bp.page_manager.num_pages(), 6);
+        assert_eq!(bp.total_num_of_db_pages(), 6);
 
         bp.free_page(2, &mut wal, 2).unwrap();
         bp.free_page(3, &mut wal, 3).unwrap();
@@ -465,10 +558,10 @@ mod tests {
         let (p2, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         assert_eq!(p1, 4);
         assert_eq!(p2, 3);
-        assert_eq!(bp.page_manager.first_free_page(), Some(2));
+        assert_eq!(bp.first_free_page().unwrap(), Some(2));
 
         bp.free_page(5, &mut wal, 5).unwrap();
-        assert_eq!(bp.page_manager.first_free_page(), Some(5));
+        assert_eq!(bp.first_free_page().unwrap(), Some(5));
 
         let (p3, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let (p4, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
@@ -478,8 +571,8 @@ mod tests {
         assert_eq!(p4, 2);
         assert_eq!(p5, 6);
 
-        assert_eq!(bp.page_manager.first_free_page(), None);
-        assert_eq!(bp.page_manager.num_pages(), 7);
+        assert_eq!(bp.first_free_page().unwrap(), None);
+        assert_eq!(bp.total_num_of_db_pages(), 7);
 
         cleanup("test_cycles");
     }
@@ -494,10 +587,10 @@ mod tests {
         let (page1, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
 
         bp.free_page(page1, &mut wal, 1).unwrap();
-        assert_eq!(bp.page_manager.first_free_page(), Some(1));
+        assert_eq!(bp.first_free_page().unwrap(), Some(1));
 
         bp.free_page(page1, &mut wal, 2).unwrap();
-        assert_eq!(bp.page_manager.first_free_page(), Some(1));
+        assert_eq!(bp.first_free_page().unwrap(), Some(1));
 
         let (p1, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let (p2, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
@@ -514,12 +607,13 @@ mod tests {
 
         let (page1, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         bp.free_page(page1, &mut wal, 4).unwrap();
-        assert_eq!(bp.page_manager.first_free_page(), Some(1));
+        assert_eq!(bp.first_free_page().unwrap(), Some(1));
+        bp.flush_dirty().unwrap();
 
         drop(bp);
 
-        let (bp, _) = setup("test_header_first_free");
-        assert_eq!(bp.page_manager.first_free_page(), Some(1));
+        let (mut bp, _) = setup("test_header_first_free");
+        assert_eq!(bp.first_free_page().unwrap(), Some(1));
 
         cleanup("test_header_first_free");
     }
@@ -538,7 +632,7 @@ mod tests {
         bp.free_page(4, &mut wal, 4).unwrap();
         bp.free_page(6, &mut wal, 6).unwrap();
 
-        assert_eq!(bp.page_manager.first_free_page(), Some(6));
+        assert_eq!(bp.first_free_page().unwrap(), Some(6));
 
         let next1 = bp.read_next_free(6).unwrap();
         assert_eq!(next1, Some(4));
@@ -569,7 +663,7 @@ mod tests {
             bp.allocate_page(&mut wal, PageType::Raw, 1).unwrap();
         }
 
-        assert_eq!(bp.page_manager.first_free_page(), None);
+        assert_eq!(bp.first_free_page().unwrap(), None);
 
         let (new_page, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         assert_eq!(new_page, 11);
@@ -774,7 +868,7 @@ mod tests {
         bp.write_raw_page(page_id, &new_data, 99).unwrap();
 
         let meta = bp.read_page_metadata(page_id, PageType::Raw).unwrap();
-        assert_eq!(meta.lsn(), 99);
+        assert_eq!(meta.lsn(), Some(99));
 
         cleanup("test_bp_raw_lsn");
     }
@@ -785,7 +879,7 @@ mod tests {
     fn test_eviction_when_pool_full() {
         cleanup("test_bp_evict");
         let pm = PageManager::new("test_bp_evict").unwrap();
-        let mut bp = BufferPool::new(pm, 3); // tiny pool — 3 frames
+        let mut bp = BufferPool::new(pm, 3).unwrap(); // tiny pool — 3 frames
         let mut wal = WalWriter::new("test_bp_evict").unwrap();
 
         // allocate 4 pages — one more than pool capacity
@@ -818,7 +912,7 @@ mod tests {
     fn test_eviction_flushes_dirty_frame() {
         cleanup("test_bp_evict_dirty");
         let pm = PageManager::new("test_bp_evict_dirty").unwrap();
-        let mut bp = BufferPool::new(pm, 2); // 2 frames only
+        let mut bp = BufferPool::new(pm, 2).unwrap(); // 2 frames only
         let mut wal = WalWriter::new("test_bp_evict_dirty").unwrap();
 
         let (p1, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
@@ -857,7 +951,7 @@ mod tests {
     fn test_eviction_clock_hand_advances() {
         cleanup("test_bp_clock");
         let pm = PageManager::new("test_bp_clock").unwrap();
-        let mut bp = BufferPool::new(pm, 2);
+        let mut bp = BufferPool::new(pm, 2).unwrap();
         let mut wal = WalWriter::new("test_bp_clock").unwrap();
 
         let (p1, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
@@ -975,5 +1069,68 @@ mod tests {
         );
 
         cleanup("test_alloc_reuse_lsn");
+    }
+
+    #[test]
+    fn test_free_list_persists_after_flush_and_reopen() {
+        cleanup("test_free_list_persists_after_flush_and_reopen");
+
+        {
+            let (mut bp, mut wal) = setup("test_free_list_persists_after_flush_and_reopen");
+            let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+            let (page2, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+            let (page3, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+
+            bp.free_page(page2, &mut wal, 1).unwrap();
+            bp.free_page(page3, &mut wal, 2).unwrap();
+
+            assert_eq!(bp.first_free_page().unwrap(), Some(3));
+            bp.flush_dirty().unwrap();
+        }
+
+        {
+            let (mut bp, _) = setup("test_free_list_persists_after_flush_and_reopen");
+            assert_eq!(bp.first_free_page().unwrap(), Some(3));
+        }
+
+        cleanup("test_free_list_persists_after_flush_and_reopen");
+    }
+
+    #[test]
+    fn test_header_first_free_persists_after_reopen() {
+        cleanup("test_header_first_free");
+        let (mut bp, mut wal) = setup("test_header_first_free");
+
+        let (page1, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        bp.free_page(page1, &mut wal, 4).unwrap();
+        assert_eq!(bp.first_free_page().unwrap(), Some(1));
+
+        bp.flush_dirty().unwrap();
+        drop(bp);
+
+        let (mut bp, _) = setup("test_header_first_free");
+        assert_eq!(bp.first_free_page().unwrap(), Some(1));
+
+        cleanup("test_header_first_free");
+    }
+
+    #[test]
+    fn test_num_pages_persists_after_reopen() {
+        cleanup("test_num_pages_persist");
+
+        {
+            let (mut bp, mut wal) = setup("test_num_pages_persist");
+            bp.allocate_slotted_page(&mut wal, 1).unwrap();
+            bp.allocate_slotted_page(&mut wal, 1).unwrap();
+            assert_eq!(bp.total_num_of_db_pages(), 3);
+            bp.flush_dirty().unwrap();
+        }
+
+        {
+            let (mut bp, _) = setup("test_num_pages_persist");
+            assert_eq!(bp.total_num_of_db_pages(), 3);
+        }
+
+        cleanup("test_num_pages_persist");
     }
 }

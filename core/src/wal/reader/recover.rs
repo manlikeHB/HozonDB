@@ -19,9 +19,16 @@ pub fn recover_insert(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::R
     let page_data = buffer_pool.get_page_mut(page_id)?;
 
     // compare lsn
-    if page_meta.lsn() >= record.lsn() {
-        // changes must have been applied
-        return Ok(());
+    if let Some(lsn) = page_meta.lsn() {
+        if lsn >= record.lsn() {
+            // changes must have been applied
+            return Ok(());
+        }
+    } else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Slotted page metadata should have LSN",
+        ));
     }
 
     if let PageMetadata::Slotted {
@@ -78,9 +85,16 @@ pub fn recover_update(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::R
     let page_data = buffer_pool.get_page_mut(page_id)?;
 
     // compare lsn
-    if page_meta.lsn() >= record.lsn() {
-        // changes must have been applied
-        return Ok(());
+    if let Some(lsn) = page_meta.lsn() {
+        if lsn >= record.lsn() {
+            // changes must have been applied
+            return Ok(());
+        }
+    } else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Slotted page metadata should have LSN",
+        ));
     }
 
     // insert row
@@ -125,9 +139,16 @@ pub fn recover_delete(record: &WalRecord, buffer_pool: &mut BufferPool) -> io::R
     let page_data = buffer_pool.get_page_mut(page_id)?;
 
     // compare lsn
-    if page_meta.lsn() >= record.lsn() {
-        // changes must have been applied
-        return Ok(());
+    if let Some(lsn) = page_meta.lsn() {
+        if lsn >= record.lsn() {
+            // changes must have been applied
+            return Ok(());
+        }
+    } else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Slotted page metadata should have LSN",
+        ));
     }
 
     // mark slot dead
@@ -177,11 +198,19 @@ pub fn replay_raw_page_new_data(
 
     // FreePage is always applied — LSN comparison is unreliable because
     // the page type on disk may differ from what the record expects
+    // TODO
     if record_type != WalRecordType::FreePage {
         let page_meta = buffer_pool.read_page_metadata(page_id, PageType::Raw)?;
 
-        if page_meta.lsn() >= record.lsn() {
-            return Ok(());
+        if let Some(lsn) = page_meta.lsn() {
+            if lsn >= record.lsn() {
+                return Ok(());
+            }
+        } else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "Raw page metadata should have LSN",
+            ));
         }
     }
 
@@ -209,9 +238,16 @@ pub fn recover_page_link(record: &WalRecord, buffer_pool: &mut BufferPool) -> io
     let page_data = buffer_pool.get_page_mut(page_id)?;
 
     // compare lsn
-    if page_meta.lsn() >= record.lsn() {
-        // changes must have been applied
-        return Ok(());
+    if let Some(lsn) = page_meta.lsn() {
+        if lsn >= record.lsn() {
+            // changes must have been applied
+            return Ok(());
+        }
+    } else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Slotted page metadata should have LSN",
+        ));
     }
 
     // update page meta
@@ -235,23 +271,33 @@ pub fn recover_allocate_page(
     page_id: PageId,
     page_type_u8: u8,
     buffer_pool: &mut BufferPool,
+    lsn: u64,
 ) -> io::Result<()> {
     let page_type = PageType::from_u8(page_type_u8)?;
+
+    // extend num_pages first so get_page_mut can load the page from disk
+    if page_id >= buffer_pool.total_num_of_db_pages() {
+        buffer_pool.set_num_pages(page_id + 1)?;
+    }
+
+    // read next_free BEFORE reinitializing — the page still has free page metadata
+    let next_free = if buffer_pool.first_free_page()? == Some(page_id) {
+        buffer_pool.read_next_free(page_id)?
+    } else {
+        None
+    };
 
     // reinitialize the page with clean metadata
     let page_data = buffer_pool.get_page_mut(page_id)?;
     *page_data = [0u8; PAGE_SIZE];
     PageManager::init_page_metadata_buffer(page_data, page_type);
 
-    // update free list head — this page was allocated so it should no
-    // longer be the free list head. read_next_free gives us what the
-    // head should point to after this allocation.
-    let next_free = buffer_pool.read_next_free(page_id)?;
-    if buffer_pool.first_free_page() == Some(page_id) {
-        buffer_pool.set_first_free_page(next_free)?;
+    // update free list head
+    if buffer_pool.first_free_page()? == Some(page_id) {
+        buffer_pool.set_first_free_page(next_free, lsn)?;
     }
 
-    buffer_pool.mark_dirty(page_id, 0)?;
+    buffer_pool.mark_dirty(page_id, lsn)?;
     Ok(())
 }
 
@@ -269,7 +315,7 @@ mod tests {
 
     fn setup(name: &str) -> (BufferPool, WalWriter) {
         let pm = PageManager::new(name).unwrap();
-        let bp = BufferPool::new(pm, 64);
+        let bp = BufferPool::new(pm, 64).unwrap();
         let wal = WalWriter::new(name).unwrap();
         (bp, wal)
     }
@@ -437,7 +483,7 @@ mod tests {
         assert_eq!(offset as usize, row_offset);
 
         let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
-        assert!(meta.lsn() > insert_lsn);
+        assert!(meta.lsn() > Some(insert_lsn));
 
         cleanup("test_rec_delete");
     }
@@ -617,7 +663,7 @@ mod tests {
         assert_eq!(page[OFFSET_RAW_PAGE_START + 1], 0xAB);
 
         let meta = bp.read_page_metadata(page_id, PageType::Raw).unwrap();
-        assert!(meta.lsn() > 0);
+        assert!(meta.lsn() > Some(0));
 
         cleanup("test_rec_raw");
     }

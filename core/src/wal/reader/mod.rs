@@ -127,9 +127,12 @@ impl WalReader {
                     recover_page_link(&record, buffer_pool)?
                 }
                 WalRecord::AllocatePage {
-                    page_id, page_type, ..
+                    page_id,
+                    page_type,
+                    lsn,
+                    ..
                 } => {
-                    recover_allocate_page(page_id, page_type, buffer_pool)?;
+                    recover_allocate_page(page_id, page_type, buffer_pool, lsn)?;
                 }
                 WalRecord::Abort { txn_id, .. } => {
                     return Err(io::Error::new(

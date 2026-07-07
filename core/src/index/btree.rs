@@ -621,7 +621,7 @@ mod tests {
 
     fn setup_tree(name: &str, count: i32) -> (BPlusTree, BufferPool, WalWriter) {
         let pm = PageManager::new(name).unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 64);
+        let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
         let mut wal_writer = WalWriter::new(name).unwrap();
         let (mut btree, _) = BPlusTree::new(4, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
@@ -645,7 +645,7 @@ mod tests {
         cleanup("test_insert_before_split");
 
         let pm = PageManager::new("test_insert_before_split").unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 64);
+        let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
         let mut wal_writer = WalWriter::new("test_insert_before_split").unwrap();
         let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
         let rows = get_rows(btree.order);
@@ -690,7 +690,7 @@ mod tests {
         cleanup("test_insert_till_leaf_split");
 
         let pm = PageManager::new("test_insert_till_leaf_split").unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 64);
+        let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
         let mut wal_writer = WalWriter::new("test_insert_till_leaf_split").unwrap();
         let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
         let rows = get_rows(btree.order);
@@ -728,7 +728,7 @@ mod tests {
         cleanup("test_insert_till_internal_node_split");
 
         let pm = PageManager::new("test_insert_till_internal_node_split").unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 64);
+        let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
         let mut wal_writer = WalWriter::new("test_insert_till_internal_node_split").unwrap();
         let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
         let rows = get_rows(btree.order);
@@ -789,7 +789,7 @@ mod tests {
         cleanup("test_search_empty_tree");
 
         let pm = PageManager::new("test_search_empty_tree").unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 64);
+        let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
         let mut wal_writer = WalWriter::new("test_search_empty_tree").unwrap();
         let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
@@ -806,7 +806,7 @@ mod tests {
         cleanup("test_search_tree_with_leaf_nodes");
 
         let pm = PageManager::new("test_search_tree_with_leaf_nodes").unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 64);
+        let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
         let mut wal_writer = WalWriter::new("test_search_tree_with_leaf_nodes").unwrap();
         let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
@@ -836,7 +836,7 @@ mod tests {
         cleanup("test_search_tree_with_internal_nodes");
 
         let pm = PageManager::new("test_search_tree_with_internal_nodes").unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 64);
+        let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
         let mut wal_writer = WalWriter::new("test_search_tree_with_internal_nodes").unwrap();
         let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 
@@ -918,7 +918,7 @@ mod tests {
         cleanup("test_load_node");
 
         let pm = PageManager::new("test_load_node").unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 64);
+        let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
         let mut wal_writer = WalWriter::new("test_load_node").unwrap();
         let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
         let node = Node::Leaf(LeafNode::new());
@@ -963,7 +963,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_load_b_plus_tree").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut wal_writer = WalWriter::new("test_load_b_plus_tree").unwrap();
             let (mut btree, _) =
                 BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
@@ -978,7 +978,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_load_b_plus_tree").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0);
 
@@ -1001,7 +1001,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_load_b_plus_tree_internal_node_integer").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut wal_writer =
                 WalWriter::new("test_load_b_plus_tree_internal_node_integer").unwrap();
             let (mut btree, _) =
@@ -1032,7 +1032,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_load_b_plus_tree_internal_node_integer").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0);
 
@@ -1055,7 +1055,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_load_b_plus_tree_internal_node_text").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut wal_writer =
                 WalWriter::new("test_load_b_plus_tree_internal_node_text").unwrap();
             let (mut btree, _) =
@@ -1090,7 +1090,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_load_b_plus_tree_internal_node_text").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0);
 
@@ -1115,7 +1115,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_delete_persistence_round_trip").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut wal_writer = WalWriter::new("test_delete_persistence_round_trip").unwrap();
             let (mut btree, _) =
                 BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
@@ -1155,7 +1155,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_delete_persistence_round_trip").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
 
             assert!(btree.search(&key_1, &mut buffer_pool).unwrap().is_none());
@@ -1182,7 +1182,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_create_new_root_persistence").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut wal_writer = WalWriter::new("test_create_new_root_persistence").unwrap();
             let (mut btree, _) =
                 BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
@@ -1205,7 +1205,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_create_new_root_persistence").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0);
 
@@ -1245,7 +1245,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_root_changes_multiple_times").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut wal_writer = WalWriter::new("test_root_changes_multiple_times").unwrap();
             let (mut btree, _) =
                 BPlusTree::new(order, &mut buffer_pool, &mut wal_writer, 1).unwrap();
@@ -1275,7 +1275,7 @@ mod tests {
 
         {
             let pm = PageManager::new("test_root_changes_multiple_times").unwrap();
-            let mut buffer_pool = BufferPool::new(pm, 64);
+            let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
             let mut btree = BPlusTree::load(_root_page_id, order);
             assert_eq!(btree.cache.len(), 0);
 
@@ -1467,7 +1467,7 @@ mod tests {
         cleanup(name);
 
         let pm = PageManager::new(name).unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 64);
+        let mut buffer_pool = BufferPool::new(pm, 64).unwrap();
         let mut wal_writer = WalWriter::new(name).unwrap();
         let (mut btree, _) = BPlusTree::new(3, &mut buffer_pool, &mut wal_writer, 1).unwrap();
 

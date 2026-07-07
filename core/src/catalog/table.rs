@@ -299,7 +299,7 @@ mod tests {
 
     fn setup(db_name: &str) -> (TableCatalog, BufferPool, WalWriter) {
         let pm = PageManager::new(db_name).unwrap();
-        let mut buffer_pool = BufferPool::new(pm, 5);
+        let mut buffer_pool = BufferPool::new(pm, 5).unwrap();
         let mut wal_writer = WalWriter::new(db_name).unwrap();
         let catalog = TableCatalog::new(&mut buffer_pool, &mut wal_writer).unwrap();
         (catalog, buffer_pool, wal_writer)

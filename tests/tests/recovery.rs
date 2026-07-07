@@ -693,7 +693,6 @@ fn test_recovery_free_list_head_not_stale_after_alloc() {
 
     {
         let mut ex = create_executor("rec_free_list_stale");
-
         // create and populate a table
         ex.execute(
             Statement::CreateTable {

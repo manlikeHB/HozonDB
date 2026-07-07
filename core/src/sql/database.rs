@@ -57,7 +57,7 @@ impl Database {
     // support online resizing — shrinking evicts frames, growing allocates more.
     pub fn with_capacity(db_name: &str, capacity: usize) -> io::Result<Self> {
         let page_manager = PageManager::new(db_name)?;
-        let mut buffer_pool = BufferPool::new(page_manager, capacity);
+        let mut buffer_pool = BufferPool::new(page_manager, capacity)?;
         let mut txn_id = 0;
         let mut wal_reader_opt = None;
 
@@ -213,7 +213,7 @@ impl Database {
         self.table_catalog.list_tables()
     }
 
-    pub fn first_free_page(&self) -> Option<PageId> {
+    pub fn first_free_page(&mut self) -> io::Result<Option<PageId>> {
         self.buffer_pool.first_free_page()
     }
 
@@ -414,7 +414,7 @@ impl Database {
         btree.range_scan(start, end, op, buffer_pool)
     }
 
-    pub fn total_num_of_db_pages(&self) -> u32 {
+    pub fn total_num_of_db_pages(&mut self) -> u32 {
         self.buffer_pool.total_num_of_db_pages()
     }
 
