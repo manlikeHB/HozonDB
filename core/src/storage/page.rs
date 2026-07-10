@@ -115,10 +115,10 @@ impl PageMetadata {
         }
     }
 
-    pub fn set_next_page(&mut self, page_id: PageId) {
+    pub fn set_next_page(&mut self, next_page: Option<PageId>) {
         match self {
-            Self::Slotted { next_page, .. } | Self::Free { next_page, .. } => {
-                *next_page = Some(page_id)
+            Self::Slotted { next_page: np, .. } | Self::Free { next_page: np, .. } => {
+                *np = next_page
             }
             _ => {}
         }
@@ -330,14 +330,18 @@ impl PageManager {
 
         let mut page_data = [0u8; PAGE_SIZE];
 
-        // page 0 = headers, page 1 = tables catalog, page 2 = index catalog
-        if page_id > 0 && page_id < 3 {
-            // Create raw page buffer with metadata
-            Self::init_page_metadata_buffer(&mut page_data, PageType::Raw);
-        } else if page_id >= 3 {
-            // Create page buffer with metadata
-            Self::init_page_metadata_buffer(&mut page_data, page_type);
-        }
+        // Create page buffer with metadata
+        // Page content lsn always starts at 0 here, never the AllocatePage WAL
+        // record's own lsn. recover_allocate_page (crash recovery for this same
+        // record) does the identical unconditional re-zero with no lsn guard,
+        // since allocation is idempotent by construction — replaying it twice
+        // always yields the same blank page. Stamping the record's lsn here
+        // instead would make live allocation and recovered allocation diverge
+        // for the same operation, which is exactly what page-lsn tracking exists
+        // to prevent. mark_dirty(lsn), used by callers of this fn, is a separate,
+        // frame-level concept — WAL-durability-before-flush ordering — not a
+        // claim about what this page's content reflects.
+        Self::init_page_metadata_buffer(&mut page_data, page_type);
 
         // Write initialized page
         self.write_page(page_id, &page_data)?;
@@ -1102,14 +1106,14 @@ mod tests {
             next_page: None,
             lsn: 0,
         };
-        meta.set_next_page(5);
+        meta.set_next_page(Some(5));
         assert_eq!(meta.next_page().unwrap(), Some(5));
 
         let mut meta = PageMetadata::Free {
             next_page: None,
             lsn: 0,
         };
-        meta.set_next_page(3);
+        meta.set_next_page(Some(3));
         assert_eq!(meta.next_page().unwrap(), Some(3));
     }
 

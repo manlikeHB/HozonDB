@@ -83,6 +83,9 @@ impl BufferPool {
 
             // reset page metadata of free page for reuse
             let page_data = self.get_page_mut(free_page_id)?;
+            // Same invariant as the brand-new-page path in PageManager::allocate_page:
+            // content lsn resets to 0 here too, not the AllocatePage record's lsn.
+            // See the comment there for why.
             PageManager::init_page_metadata_buffer(page_data, page_type);
 
             // mark dirty
@@ -299,7 +302,7 @@ impl BufferPool {
 
         // update page meta
         let mut page_meta = PageManager::read_metadata_from_buffer(page_data, PageType::Slotted);
-        page_meta.set_next_page(next_page);
+        page_meta.set_next_page(Some(next_page));
         page_meta.set_lsn(lsn);
 
         PageManager::update_metadata_in_buffer(page_data, &page_meta);

@@ -215,3 +215,85 @@ impl WalReader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::page::{PageManager, PageType};
+    use crate::test_helpers::cleanup;
+    use crate::wal::writer::WalWriter;
+
+    fn setup(name: &str) -> (BufferPool, WalWriter) {
+        let pm = PageManager::new(name).unwrap();
+        let bp = BufferPool::new(pm, 64).unwrap();
+        let wal = WalWriter::new(name).unwrap();
+        (bp, wal)
+    }
+
+    #[test]
+    fn test_undo_record_at_undoes_insert() {
+        cleanup("test_undo_record_at");
+        let (mut bp, mut wal) = setup("test_undo_record_at");
+
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let row_bytes = b"a row";
+
+        let (insert_lsn, insert_offset) = wal
+            .append_slotted(
+                WalRecordType::Insert,
+                "users",
+                page_id,
+                0,
+                row_bytes,
+                &[],
+                1,
+            )
+            .unwrap();
+        {
+            let page = bp.get_page_mut(page_id).unwrap();
+            let mut meta = PageManager::read_metadata_from_buffer(page, PageType::Slotted);
+            let offset = meta.free_space_end().unwrap() as usize - row_bytes.len();
+            page[offset..offset + row_bytes.len()].copy_from_slice(row_bytes);
+            PageManager::write_slot(page, 0, offset as u16, row_bytes.len() as u16);
+            meta.update_slot_count();
+            meta.update_free_space_start();
+            meta.update_free_space_end(row_bytes.len());
+            meta.set_lsn(insert_lsn);
+            PageManager::update_metadata_in_buffer(page, &meta);
+        }
+
+        let mut reader = WalReader::new("test_undo_record_at").unwrap();
+        reader
+            .undo_record_at(insert_lsn, insert_offset, &mut bp, 999)
+            .unwrap();
+
+        let page = bp.read_page(page_id).unwrap();
+        let (_, len) = PageManager::read_slot(page, 0);
+        assert_eq!(len, 0, "slot should be marked dead after undo_record_at");
+
+        cleanup("test_undo_record_at");
+    }
+
+    #[test]
+    fn test_undo_record_at_detects_lsn_mismatch() {
+        cleanup("test_undo_record_at_mismatch");
+        let (mut bp, mut wal) = setup("test_undo_record_at_mismatch");
+
+        let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+
+        let (_lsn_a, offset_a) = wal
+            .append_slotted(WalRecordType::Insert, "users", page_id, 0, b"row a", &[], 1)
+            .unwrap();
+        let (lsn_b, _offset_b) = wal
+            .append_slotted(WalRecordType::Insert, "users", page_id, 1, b"row b", &[], 1)
+            .unwrap();
+
+        let mut reader = WalReader::new("test_undo_record_at_mismatch").unwrap();
+
+        // record B's lsn paired with record A's offset — should be rejected
+        let result = reader.undo_record_at(lsn_b, offset_a, &mut bp, 999);
+        assert!(result.is_err());
+
+        cleanup("test_undo_record_at_mismatch");
+    }
+}

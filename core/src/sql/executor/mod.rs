@@ -162,9 +162,14 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use crate::{
-        catalog::row::Value,
-        catalog::schema::{Column, DataType},
-        sql::parser::Statement,
+        catalog::{
+            row::Value,
+            schema::{Column, DataType},
+        },
+        sql::{
+            executor::ExecutionResult,
+            parser::{BinaryOperator, Expr, SelectColumns, Statement},
+        },
         test_helpers::*,
     };
 
@@ -290,5 +295,296 @@ mod tests {
         executor.execute(Statement::Commit, &mut None).unwrap();
 
         cleanup("test_exec_lsns_create");
+    }
+
+    #[test]
+    fn test_rollback_undoes_insert() {
+        cleanup("test_exec_rollback_insert");
+        let mut executor = create_test_executor("test_exec_rollback_insert");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer, true)],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1)],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor.execute(Statement::RollBack, &mut None).unwrap();
+
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0, "insert should have been rolled back");
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_exec_rollback_insert");
+    }
+
+    #[test]
+    fn test_rollback_undoes_update() {
+        cleanup("test_exec_rollback_update");
+        let mut executor = create_test_executor("test_exec_rollback_update");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        Column::new("id", DataType::Integer, true),
+                        Column::new("name", DataType::Text, false),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1), Value::Text("Alice".to_string())],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+        executor
+            .execute(
+                Statement::Update {
+                    table_name: "users".to_string(),
+                    assignments: vec![("name".to_string(), Value::Text("Bob".to_string()))],
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor.execute(Statement::RollBack, &mut None).unwrap();
+
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_value(1),
+                    Some(&Value::Text("Alice".to_string()))
+                );
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_exec_rollback_update");
+    }
+
+    #[test]
+    fn test_rollback_undoes_delete() {
+        cleanup("test_exec_rollback_delete");
+        let mut executor = create_test_executor("test_exec_rollback_delete");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer, true)],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor
+            .execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![Value::Integer(1)],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+        executor
+            .execute(
+                Statement::Delete {
+                    table_name: "users".to_string(),
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Column("id".to_string())),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(Expr::Literal(Value::Integer(1))),
+                    }),
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor.execute(Statement::RollBack, &mut None).unwrap();
+
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "delete should have been rolled back");
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_exec_rollback_delete");
+    }
+
+    #[test]
+    fn test_rollback_undoes_multiple_inserts_in_reverse_order() {
+        cleanup("test_exec_rollback_multi");
+        let mut executor = create_test_executor("test_exec_rollback_multi");
+
+        executor
+            .execute(
+                Statement::CreateTable {
+                    name: "users".to_string(),
+                    columns: vec![Column::new("id", DataType::Integer, true)],
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+        for i in 1..=3 {
+            executor
+                .execute(
+                    Statement::Insert {
+                        table_name: "users".to_string(),
+                        values: vec![Value::Integer(i)],
+                    },
+                    &mut None,
+                )
+                .unwrap();
+        }
+
+        executor.execute(Statement::RollBack, &mut None).unwrap();
+
+        let result = executor
+            .execute(
+                Statement::Select {
+                    table_name: "users".to_string(),
+                    columns: SelectColumns::All,
+                    where_clause: None,
+                },
+                &mut None,
+            )
+            .unwrap();
+
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0, "all 3 inserts should have been rolled back");
+            }
+            _ => panic!("Expected Rows result"),
+        }
+
+        cleanup("test_exec_rollback_multi");
+    }
+
+    #[test]
+    fn test_rollback_clears_txn() {
+        cleanup("test_exec_rollback_clears_txn");
+        let mut executor = create_test_executor("test_exec_rollback_clears_txn");
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+        assert!(executor.database.txn_is_active());
+
+        executor.execute(Statement::RollBack, &mut None).unwrap();
+        assert!(!executor.database.txn_is_active());
+
+        cleanup("test_exec_rollback_clears_txn");
+    }
+
+    #[test]
+    fn test_rollback_with_no_txn_errors() {
+        cleanup("test_exec_rollback_no_txn");
+        let mut executor = create_test_executor("test_exec_rollback_no_txn");
+
+        let result = executor.execute(Statement::RollBack, &mut None);
+        assert!(result.is_err());
+
+        cleanup("test_exec_rollback_no_txn");
+    }
+
+    #[test]
+    fn test_begin_after_rollback_succeeds() {
+        cleanup("test_exec_begin_after_rollback");
+        let mut executor = create_test_executor("test_exec_begin_after_rollback");
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+        executor.execute(Statement::RollBack, &mut None).unwrap();
+
+        let result = executor.execute(Statement::Begin, &mut None);
+        assert!(result.is_ok());
+
+        cleanup("test_exec_begin_after_rollback");
+    }
+
+    #[test]
+    fn test_commit_after_rollback_errors() {
+        cleanup("test_exec_commit_after_rollback");
+        let mut executor = create_test_executor("test_exec_commit_after_rollback");
+
+        executor.execute(Statement::Begin, &mut None).unwrap();
+        executor.execute(Statement::RollBack, &mut None).unwrap();
+
+        let result = executor.execute(Statement::Commit, &mut None);
+        assert!(result.is_err());
+
+        cleanup("test_exec_commit_after_rollback");
     }
 }

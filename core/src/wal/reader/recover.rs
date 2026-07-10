@@ -251,13 +251,7 @@ pub fn recover_page_link(record: &WalRecord, buffer_pool: &mut BufferPool) -> io
     }
 
     // update page meta
-    let next_page = record.next_page().ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            "Link page WAL record should have a next page",
-        )
-    })?;
-    page_meta.set_next_page(next_page);
+    page_meta.set_next_page(record.next_page());
     page_meta.set_lsn(record.lsn());
 
     PageManager::update_metadata_in_buffer(page_data, &page_meta);
@@ -615,7 +609,7 @@ mod tests {
         {
             let page = bp.get_page_mut(page_id).unwrap();
             let mut meta = PageManager::read_metadata_from_buffer(page, PageType::Slotted);
-            meta.set_next_page(next_page_id);
+            meta.set_next_page(Some(next_page_id));
             meta.set_lsn(lsn);
             PageManager::update_metadata_in_buffer(page, &meta);
         }
