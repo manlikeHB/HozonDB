@@ -87,6 +87,10 @@ impl IndexEntry {
         self.root_page_id
     }
 
+    pub fn set_root_page_id(&mut self, root_page_id: u32) {
+        self.root_page_id = root_page_id;
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 

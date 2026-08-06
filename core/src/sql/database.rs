@@ -10,7 +10,7 @@ use crate::{
         schema::Schema,
         table::{TableCatalog, TableMetadata},
     },
-    constants::{self, Lsn, PageId},
+    constants::{self, INDEX_CATALOG_PAGE_ID, Lsn, PageId, TABLE_CATALOG_PAGE_ID},
     index::{btree::BPlusTree, key::IndexKey, node::leaf::RowLocation},
     sql::{executor::helpers, parser::BinaryOperator},
     storage::{
@@ -339,9 +339,9 @@ impl Database {
         self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)
     }
 
-    // Indexes
     pub fn insert_into_index(
         &mut self,
+        table_name: &str,
         index_name: &str,
         key: IndexKey,
         row_location: RowLocation,
@@ -361,7 +361,30 @@ impl Database {
             &mut self.wal_writer,
             txn_id,
         )?;
+        let new_root = btree.root();
+
         self.add_lsns_and_wal_offsets_to_txn(&lsns)?;
+
+        // check if root page id changed due to split and update root page id in catalog
+        if let Some(new_root) = new_root {
+            let current = self
+                .index_catalog
+                .get_indexes_for_table(table_name)
+                .and_then(|entries| entries.iter().find(|e| e.index_name() == index_name))
+                .map(|e| e.root_page_id());
+
+            if current != Some(new_root) {
+                let (lsn, wal_offset) = self.index_catalog.update_root_page_id(
+                    table_name,
+                    index_name,
+                    new_root,
+                    &mut self.buffer_pool,
+                    &mut self.wal_writer,
+                    txn_id,
+                )?;
+                self.add_lsn_and_wal_offset_to_txn(lsn, wal_offset)?;
+            }
+        }
         Ok(())
     }
 
@@ -589,11 +612,59 @@ impl Database {
         let abort_lsn = self.wal_writer.append_abort_txn(txn.id())?;
         self.wal_writer.sync()?;
 
+        // Collect affected pages
+        let mut affected_pages = Vec::new();
+
         // get txn lsn and wal offsets in reverse
         for (lsn, wal_offset) in txn.lsns_and_wal_offsets().iter().rev() {
             // undo using WAL records
-            self.wal_reader
-                .undo_record_at(*lsn, *wal_offset, &mut self.buffer_pool, abort_lsn)?;
+            let some_page_id = self.wal_reader.undo_record_at(
+                *lsn,
+                *wal_offset,
+                &mut self.buffer_pool,
+                abort_lsn,
+            )?;
+
+            if let Some(page_id) = some_page_id {
+                affected_pages.push(page_id);
+            }
+        }
+
+        // Reload In-memory table (page 1) and index (page 2) catalog if affected
+        for page in &affected_pages {
+            match *page {
+                TABLE_CATALOG_PAGE_ID => {
+                    let table_catalog = TableCatalog::load(&mut self.buffer_pool)?;
+                    self.table_catalog = table_catalog;
+                }
+                INDEX_CATALOG_PAGE_ID => {
+                    let index_catalog = IndexCatalog::load(&mut self.buffer_pool)?;
+
+                    // Rebuild every BPlusTree from the reloaded catalog — same as
+                    // startup does. Fixes a stale in-memory root (e.g. a rolled-back
+                    // root split) and clears that index's cache in one move.
+                    let mut indexes = HashMap::new();
+                    for entry in index_catalog.all_indexes() {
+                        let btree =
+                            BPlusTree::load(entry.root_page_id(), entry.column_type().order());
+                        indexes.insert(entry.index_name().to_owned(), btree);
+                    }
+                    self.indexes = indexes;
+                    self.index_catalog = index_catalog;
+                }
+                _ => {}
+            }
+        }
+
+        // Any other undone page might be a B+ tree node (a leaf/internal split or
+        // key update) that never touched the index catalog page. Purge it from
+        // every tree's cache so a stale in-memory node isn't served after the
+        // on-disk page was reverted. O(1) per (index, page) pair — and a no-op
+        // for any index just rebuilt above, since its cache is already empty.
+        for page in &affected_pages {
+            for btree in self.indexes.values_mut() {
+                btree.invalidate_cached_page(*page);
+            }
         }
 
         self.txn = None;

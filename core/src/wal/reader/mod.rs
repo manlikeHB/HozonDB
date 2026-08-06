@@ -1,4 +1,5 @@
 use crate::{
+    constants::PageId,
     storage::buffer_pool::BufferPool,
     wal::{
         constants::MAGIC_NUMBER,
@@ -154,7 +155,7 @@ impl WalReader {
         wal_offset: u64,
         buffer_pool: &mut BufferPool,
         abort_lsn: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<PageId>> {
         let record = self.read_record_at(wal_offset)?;
 
         // Validate record through it's LSN against expected LSN
@@ -164,7 +165,9 @@ impl WalReader {
                 "Record lsn doesn't match expected lsn",
             ));
         }
-        Self::undo_record(record, buffer_pool, abort_lsn)
+        Self::undo_record(&record, buffer_pool, abort_lsn)?;
+
+        Ok(record.page_id())
     }
 
     /// Reads a record out of the WAL log at a specific offset
@@ -182,18 +185,18 @@ impl WalReader {
     }
 
     pub fn undo_record(
-        record: WalRecord,
+        record: &WalRecord,
         buffer_pool: &mut BufferPool,
         abort_lsn: u64,
     ) -> io::Result<()> {
         match record {
-            WalRecord::AllocatePage { .. } => undo_allocate_page(&record, buffer_pool, abort_lsn),
+            WalRecord::AllocatePage { .. } => undo_allocate_page(record, buffer_pool, abort_lsn),
             WalRecord::LinkPage { .. } => undo_link_page(&record, buffer_pool, abort_lsn),
 
             WalRecord::Slotted { record_type, .. } => match record_type {
-                WalRecordType::Insert => undo_insert(&record, buffer_pool, abort_lsn),
-                WalRecordType::Update => undo_update(&record, buffer_pool, abort_lsn),
-                WalRecordType::Delete => undo_delete(&record, buffer_pool, abort_lsn),
+                WalRecordType::Insert => undo_insert(record, buffer_pool, abort_lsn),
+                WalRecordType::Update => undo_update(record, buffer_pool, abort_lsn),
+                WalRecordType::Delete => undo_delete(record, buffer_pool, abort_lsn),
                 other => Err(Error::new(
                     ErrorKind::InvalidData,
                     format!(
@@ -204,7 +207,7 @@ impl WalReader {
             },
 
             WalRecord::Raw { record_type, .. } => match record_type {
-                WalRecordType::FreePage => undo_free_page(&record, buffer_pool, abort_lsn),
+                WalRecordType::FreePage => undo_free_page(record, buffer_pool, abort_lsn),
                 _ => undo_raw(&record, buffer_pool, abort_lsn),
             },
 

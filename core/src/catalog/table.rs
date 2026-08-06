@@ -43,6 +43,11 @@ impl TableCatalog {
             buffer_pool.allocate_raw_page(wal_writer, 0)?;
         }
 
+        Self::load(buffer_pool)
+    }
+
+    /// Load Table Catalog from Buffer pool
+    pub fn load(buffer_pool: &mut BufferPool) -> io::Result<Self> {
         let catalog_data = buffer_pool.read_page(constants::TABLE_CATALOG_PAGE_ID)?;
 
         // check if catalog is empty

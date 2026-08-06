@@ -475,6 +475,10 @@ impl BPlusTree {
         self.root
     }
 
+    pub fn invalidate_cached_page(&mut self, page_id: PageId) {
+        self.cache.remove(&page_id);
+    }
+
     pub fn range_scan(
         &mut self,
         start: Option<&IndexKey>, // None = from beginning

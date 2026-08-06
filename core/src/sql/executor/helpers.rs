@@ -263,6 +263,7 @@ pub fn index_new_row(
             })?;
 
         db.insert_into_index(
+            entry.table_name(),
             entry.index_name(),
             IndexKey::try_from((*val).clone())?,
             row_location,

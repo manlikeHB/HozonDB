@@ -49,7 +49,11 @@ impl Executor {
                 let res = execute_create(self, name, columns);
                 // Commit an implicit transaction
                 if self.database.is_txn_implicit()? {
-                    self.database.commit_txn()?;
+                    if res.is_err() {
+                        self.database.rollback_txn()?;
+                    } else {
+                        self.database.commit_txn()?;
+                    }
                 }
                 res
             }
@@ -59,7 +63,11 @@ impl Executor {
                 let res = execute_insert(&mut self.database, table_name, values, metrics);
                 // Commit an implicit transaction
                 if self.database.is_txn_implicit()? {
-                    self.database.commit_txn()?;
+                    if res.is_err() {
+                        self.database.rollback_txn()?;
+                    } else {
+                        self.database.commit_txn()?;
+                    }
                 }
                 res
             }
@@ -81,7 +89,11 @@ impl Executor {
                 let res = execute_drop_table(&mut self.database, name);
                 // Commit an implicit transaction
                 if self.database.is_txn_implicit()? {
-                    self.database.commit_txn()?;
+                    if res.is_err() {
+                        self.database.rollback_txn()?;
+                    } else {
+                        self.database.commit_txn()?;
+                    }
                 }
                 res
             }
@@ -94,7 +106,11 @@ impl Executor {
                 let res = execute_delete(&mut self.database, table_name, where_clause, metrics);
                 // Commit an implicit transaction
                 if self.database.is_txn_implicit()? {
-                    self.database.commit_txn()?;
+                    if res.is_err() {
+                        self.database.rollback_txn()?;
+                    } else {
+                        self.database.commit_txn()?;
+                    }
                 }
                 res
             }
@@ -115,7 +131,11 @@ impl Executor {
                 );
                 // Commit an implicit transaction
                 if self.database.is_txn_implicit()? {
-                    self.database.commit_txn()?;
+                    if res.is_err() {
+                        self.database.rollback_txn()?;
+                    } else {
+                        self.database.commit_txn()?;
+                    }
                 }
                 res
             }

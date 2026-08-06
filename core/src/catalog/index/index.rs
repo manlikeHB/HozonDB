@@ -23,6 +23,11 @@ impl IndexCatalog {
             buffer_pool.allocate_raw_page(wal_writer, 0)?;
         }
 
+        Self::load(buffer_pool)
+    }
+
+    /// Load Index Catalog from Buffer pool
+    pub fn load(buffer_pool: &mut BufferPool) -> io::Result<Self> {
         let catalog_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
 
         // check if catalog is empty
@@ -193,6 +198,59 @@ impl IndexCatalog {
 
         let (lsn, wal_offset) = wal_writer.append_raw(
             WalRecordType::RemoveIndex,
+            constants::INDEX_CATALOG_PAGE_ID,
+            &new_page,
+            old_data,
+            txn_id,
+        )?;
+
+        self.save(buffer_pool, &new_page, lsn)?;
+        Ok((lsn, wal_offset))
+    }
+
+    /// Updates the root page id for a named index and persists the change.
+    ///
+    /// Called whenever a BPlusTree's root changes (first insert, or a root
+    /// split) so IndexCatalog stays the durable source of truth for where
+    /// each index's root actually lives — otherwise a restart reloads the
+    /// stale root and silently loses everything past the split.
+    pub fn update_root_page_id(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        new_root_page_id: u32,
+        buffer_pool: &mut BufferPool,
+        wal_writer: &mut WalWriter,
+        txn_id: u64,
+    ) -> io::Result<(Lsn, u64)> {
+        let old_data = buffer_pool.read_page(constants::INDEX_CATALOG_PAGE_ID)?;
+
+        if let Some(entries) = self.indexes.get_mut(table_name) {
+            if let Some(entry) = entries.iter_mut().find(|e| e.index_name() == index_name) {
+                entry.set_root_page_id(new_root_page_id);
+            }
+        }
+
+        let catalog_bytes = self.to_bytes();
+
+        // TODO: catalog is limited to a single 4KB page. Needs multi-page catalog
+        // support with a page chain, similar to how table data pages are chained.
+        if catalog_bytes.len() > PAGE_SIZE - constants::OFFSET_RAW_PAGE_START {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "catalog exceeds page size limit",
+            ));
+        }
+
+        // build full new page so old_data and new_data are the same unit
+        let mut new_page = old_data.clone();
+        new_page[constants::OFFSET_RAW_PAGE_START
+            ..constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()]
+            .copy_from_slice(&catalog_bytes);
+        new_page[constants::OFFSET_RAW_PAGE_START + catalog_bytes.len()..].fill(0);
+
+        let (lsn, wal_offset) = wal_writer.append_raw(
+            WalRecordType::UpdateIndexRoot,
             constants::INDEX_CATALOG_PAGE_ID,
             &new_page,
             old_data,

@@ -253,3 +253,79 @@ fn test_empty_table_persists() {
 
     cleanup("persist_empty_table");
 }
+
+#[test]
+fn test_index_root_persists_across_restart_after_split() {
+    cleanup("persist_index_root_split");
+
+    {
+        let mut ex = create_executor("persist_index_root_split");
+        ex.execute(
+            Statement::CreateTable {
+                name: "users".to_string(),
+                // Text primary key -> small btree order (15), splits after a
+                // handful of inserts instead of needing hundreds
+                columns: vec![
+                    Column::new("id", DataType::Text, true),
+                    Column::new("name", DataType::Text, false),
+                ],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        // enough rows to force at least one root split
+        for i in 0..40 {
+            ex.execute(
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    values: vec![
+                        Value::Text(format!("user-{:03}", i)),
+                        Value::Text(format!("Name {}", i)),
+                    ],
+                },
+                &mut None,
+            )
+            .unwrap();
+        }
+
+        ex.execute(Statement::Checkpoint, &mut None).unwrap();
+    }
+
+    {
+        let mut ex = create_executor("persist_index_root_split");
+
+        // every key must still be reachable via the index after reload.
+        for i in 0..40 {
+            let result = ex
+                .execute(
+                    Statement::Select {
+                        table_name: "users".to_string(),
+                        columns: hozondb_core::sql::parser::SelectColumns::All,
+                        where_clause: Some(hozondb_core::sql::parser::Expr::BinaryOp {
+                            left: Box::new(hozondb_core::sql::parser::Expr::Column(
+                                "id".to_string(),
+                            )),
+                            op: hozondb_core::sql::parser::BinaryOperator::Equals,
+                            right: Box::new(hozondb_core::sql::parser::Expr::Literal(Value::Text(
+                                format!("user-{:03}", i),
+                            ))),
+                        }),
+                    },
+                    &mut None,
+                )
+                .unwrap();
+
+            assert_eq!(
+                row_count(result),
+                1,
+                "user-{:03} not found after restart — index root likely stale",
+                i
+            );
+        }
+
+        assert_eq!(row_count(select_all(&mut ex, "users")), 40);
+    }
+
+    cleanup("persist_index_root_split");
+}

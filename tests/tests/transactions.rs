@@ -236,7 +236,6 @@ fn test_rollback_multi_page_insert_removes_all_rows() {
 }
 
 #[test]
-#[ignore]
 fn test_rollback_after_index_split_leaves_index_consistent() {
     cleanup("txn_rollback_index_split");
 
@@ -350,7 +349,6 @@ fn test_explicit_multi_page_commit_persists_across_restart() {
 }
 
 #[test]
-#[ignore = "known gap: rolling back CREATE TABLE doesn't revert the in-memory TableCatalog/indexes"]
 fn test_rollback_create_table_removes_table() {
     cleanup("txn_rollback_create_table");
 
@@ -384,7 +382,6 @@ fn test_rollback_create_table_removes_table() {
 }
 
 #[test]
-#[ignore = "known gap: TableCatalog.last_page isn't reverted by rollback, corrupting the next insert after a multi-page rollback"]
 fn test_insert_after_multi_page_rollback_does_not_corrupt_table() {
     cleanup("txn_rollback_multi_page_reuse");
 
@@ -425,4 +422,184 @@ fn test_insert_after_multi_page_rollback_does_not_corrupt_table() {
     assert_eq!(row_count(select_all(&mut ex, "logs")), 1);
 
     cleanup("txn_rollback_multi_page_reuse");
+}
+
+#[test]
+fn test_failed_create_table_does_not_persist_across_restart() {
+    cleanup("txn_failed_create_atomicity");
+
+    {
+        let mut ex = create_executor("txn_failed_create_atomicity");
+
+        // Boolean PK fails at the index-creation step, which runs *after*
+        // the table catalog entry has already been written and WAL-logged.
+        let result = ex.execute(
+            Statement::CreateTable {
+                name: "bad_table".to_string(),
+                columns: vec![Column::new("flag", DataType::Boolean, true)],
+            },
+            &mut None,
+        );
+
+        assert!(
+            result.is_err(),
+            "expected CREATE TABLE to fail for a Boolean PK"
+        );
+        // crash — no explicit ROLLBACK was ever called, since the executor
+        // doesn't roll back on error; ~test currently fails here already~
+    }
+
+    {
+        let mut ex = create_executor("txn_failed_create_atomicity");
+
+        // If the implicit txn was correctly rolled back, "bad_table" should
+        // not exist. Currently it does, because the executor commits the
+        // implicit transaction unconditionally, even on error.
+        let result = ex.execute(
+            Statement::Select {
+                table_name: "bad_table".to_string(),
+                columns: SelectColumns::All,
+                where_clause: None,
+            },
+            &mut None,
+        );
+
+        assert!(
+            result.is_err(),
+            "bad_table should not exist — the failed CREATE TABLE should have rolled back, not committed"
+        );
+    }
+
+    cleanup("txn_failed_create_atomicity");
+}
+
+#[test]
+fn test_failed_create_table_not_visible_in_same_session() {
+    cleanup("txn_failed_create_in_memory");
+
+    let mut ex = create_executor("txn_failed_create_in_memory");
+
+    let result = ex.execute(
+        Statement::CreateTable {
+            name: "bad_table".to_string(),
+            columns: vec![Column::new("flag", DataType::Boolean, true)],
+        },
+        &mut None,
+    );
+    assert!(
+        result.is_err(),
+        "expected CREATE TABLE to fail for a Boolean PK"
+    );
+
+    // No restart — this checks the in-memory table_catalog directly.
+    // A genuinely nonexistent table produces a clean NotFound with
+    // "does not exist" (see helpers::get_table_first_page_and_cols).
+    // If rollback only undid the WAL/page and not the in-memory catalog,
+    // this will instead fail with some other error (or not fail at all)
+    // because the catalog still thinks bad_table exists.
+    let select_result = ex.execute(
+        Statement::Select {
+            table_name: "bad_table".to_string(),
+            columns: SelectColumns::All,
+            where_clause: None,
+        },
+        &mut None,
+    );
+
+    match select_result {
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::NotFound,
+            "bad_table should be reported as not existing (in-memory catalog should \
+             have been rolled back too), got a different error instead: {e}"
+        ),
+        Ok(_) => {
+            panic!("bad_table should not be queryable — in-memory catalog was not rolled back")
+        }
+    }
+
+    cleanup("txn_failed_create_in_memory");
+}
+
+#[test]
+fn test_rollback_leaf_insert_without_root_change_invalidates_cache() {
+    cleanup("txn_rollback_leaf_cache");
+
+    let mut ex = create_executor("txn_rollback_leaf_cache");
+    ex.execute(
+        Statement::CreateTable {
+            name: "users".to_string(),
+            columns: vec![
+                Column::new("id", DataType::Integer, true),
+                Column::new("name", DataType::Text, false),
+            ],
+        },
+        &mut None,
+    )
+    .unwrap();
+
+    // committed rows — order for an Integer PK is 371, so this single
+    // leaf never splits and the root page never changes
+    for i in 1..=5 {
+        ex.execute(
+            Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(i), Value::Text(format!("user{}", i))],
+            },
+            &mut None,
+        )
+        .unwrap();
+    }
+
+    ex.execute(Statement::Begin, &mut None).unwrap();
+    ex.execute(
+        Statement::Insert {
+            table_name: "users".to_string(),
+            values: vec![Value::Integer(100), Value::Text("rolled back".to_string())],
+        },
+        &mut None,
+    )
+    .unwrap();
+    ex.execute(Statement::RollBack, &mut None).unwrap();
+
+    // this insert only touched the existing leaf page — no root change,
+    // no index catalog page touched. If the tree's node cache wasn't
+    // invalidated on rollback, this lookup would still find the row
+    // straight out of the stale in-memory node, even though the on-disk
+    // page was correctly reverted.
+    let result = ex
+        .execute(
+            Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("id".to_string())),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(Expr::Literal(Value::Integer(100))),
+                }),
+            },
+            &mut None,
+        )
+        .unwrap();
+    assert_eq!(
+        row_count(result),
+        0,
+        "rolled-back key still visible via index — stale cache?"
+    );
+
+    // sanity check: the earlier committed rows are untouched
+    assert_eq!(row_count(select_all(&mut ex, "users")), 5);
+
+    // re-inserting the rolled-back key should succeed cleanly
+    ex.execute(
+        Statement::Insert {
+            table_name: "users".to_string(),
+            values: vec![Value::Integer(100), Value::Text("fresh insert".to_string())],
+        },
+        &mut None,
+    )
+    .unwrap();
+    assert_eq!(row_count(select_all(&mut ex, "users")), 6);
+
+    cleanup("txn_rollback_leaf_cache");
 }
