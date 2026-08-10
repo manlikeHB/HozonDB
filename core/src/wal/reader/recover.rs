@@ -324,6 +324,7 @@ mod tests {
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let _ = bp.allocate_slotted_page(&mut wal, 1).unwrap();
         let (page_id, _, _) = bp.allocate_slotted_page(&mut wal, 1).unwrap();
+        let txn_id = 24;
 
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
@@ -337,14 +338,17 @@ mod tests {
             0,
             row_bytes,
             &[],
-            24,
+            txn_id,
         )
         .unwrap();
+
+        // append commit WAL record
+        wal.append_commit_txn(txn_id).unwrap();
 
         // no flush — simulates crash before checkpoint
         WalReader::new("test_rec_insert")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
@@ -403,7 +407,7 @@ mod tests {
         // recovery starts after checkpoint — insert already applied
         WalReader::new("test_rec_insert_skip")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         // slot count should still be 1 — not applied again
@@ -454,6 +458,8 @@ mod tests {
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
 
+        let txn_id = 24;
+
         // log delete — what recovery will replay
         wal.append_slotted(
             WalRecordType::Delete,
@@ -462,13 +468,16 @@ mod tests {
             0,
             &[],
             row_bytes,
-            24,
+            txn_id,
         )
         .unwrap();
 
+        // append WAL commit record
+        wal.append_commit_txn(txn_id).unwrap();
+
         WalReader::new("test_rec_delete")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         let page = bp.read_page(page_id).unwrap();
@@ -547,7 +556,7 @@ mod tests {
         // recovery starts after checkpoint — delete already applied
         WalReader::new("test_rec_delete_skip")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         // slot should still be dead and offset preserved
@@ -572,9 +581,12 @@ mod tests {
         bp.flush_dirty().unwrap();
         wal.checkpoint().unwrap();
 
+        let txn_id = 543;
         // log link page — what recovery will replay
-        wal.append_link_page(page_id, next_page_id, 543, None)
+        wal.append_link_page(page_id, next_page_id, txn_id, None)
             .unwrap();
+
+        wal.append_commit_txn(txn_id).unwrap();
 
         // verify next_page is None before recovery
         let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
@@ -582,7 +594,7 @@ mod tests {
 
         WalReader::new("test_rec_link")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
@@ -620,7 +632,7 @@ mod tests {
         // recovery starts after checkpoint — link already applied
         WalReader::new("test_rec_link_skip")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         // next_page should still be Some(next_page_id) — not reset
@@ -644,13 +656,22 @@ mod tests {
         new_page[OFFSET_RAW_PAGE_START + 1] = 0xAB;
 
         let old_page = bp.read_page(page_id).unwrap().clone();
-        wal.append_raw(WalRecordType::IndexNode, page_id, &new_page, &old_page, 87)
-            .unwrap();
+        let txn_id = 87;
+        wal.append_raw(
+            WalRecordType::IndexNode,
+            page_id,
+            &new_page,
+            &old_page,
+            txn_id,
+        )
+        .unwrap();
+
+        wal.append_commit_txn(txn_id).unwrap();
 
         // no flush — simulates crash
         WalReader::new("test_rec_raw")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         let page = bp.read_page(page_id).unwrap();
@@ -687,7 +708,7 @@ mod tests {
         // recovery starts after checkpoint — raw write already applied
         WalReader::new("test_rec_raw_skip")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         // data should still be 0xBB — not reset
@@ -729,12 +750,12 @@ mod tests {
 
         WalReader::new("test_rec_abort_skip")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
-        // slot should not have been applied
-        let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
-        assert_eq!(meta.slot_count().unwrap(), 0);
+        let page = bp.read_page(page_id).unwrap();
+        let (_, len) = PageManager::read_slot(page, 0);
+        assert_eq!(len, 0, "aborted insert should have been undone");
 
         cleanup("test_rec_abort_skip");
     }
@@ -768,6 +789,8 @@ mod tests {
         )
         .unwrap();
 
+        wal.append_commit_txn(committed_txn_id).unwrap();
+
         // aborted txn write
         wal.append_slotted(
             WalRecordType::Insert,
@@ -785,7 +808,7 @@ mod tests {
 
         WalReader::new("test_rec_mixed_txns")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         // slot 0 (committed) should exist
@@ -794,8 +817,9 @@ mod tests {
         assert_eq!(len0 as usize, committed_row.len());
 
         // slot 1 (aborted) should not have been applied
-        let meta = bp.read_page_metadata(page_id, PageType::Slotted).unwrap();
-        assert_eq!(meta.slot_count().unwrap(), 1);
+        let page = bp.read_page(page_id).unwrap();
+        let (_, len1) = PageManager::read_slot(page, 1);
+        assert_eq!(len1, 0, "aborted insert should have been undone");
 
         cleanup("test_rec_mixed_txns");
     }
@@ -814,7 +838,7 @@ mod tests {
         // should not error
         WalReader::new("test_rec_abort_no_writes")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         cleanup("test_rec_abort_no_writes");
@@ -837,7 +861,7 @@ mod tests {
 
         let last_txn_id = WalReader::new("test_rec_abort_txn_id")
             .unwrap()
-            .recover(&mut bp)
+            .recover(&mut bp, &mut wal)
             .unwrap();
 
         // last seen txn id should be 5

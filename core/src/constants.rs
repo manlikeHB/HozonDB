@@ -26,6 +26,7 @@ pub const WAL_RECORD_CHECKPOINT_TYPE: u8 = 3;
 pub const WAL_RECORD_LINK_PAGE_TYPE: u8 = 4;
 pub const WAL_RECORD_ALLOCATE_PAGE_TYPE: u8 = 5;
 pub const WAL_RECORD_ABORT_TYPE: u8 = 6;
+pub const WAL_RECORD_COMMIT_TYPE: u8 = 7;
 
 pub type Lsn = u64;
 pub type TxnId = u64;
@@ -33,3 +34,5 @@ pub type TxnId = u64;
 // Sentinel value for Option::None
 pub const NONE_U32: u32 = u32::MAX;
 pub const NONE_U64: u64 = u64::MAX;
+
+pub const SYSTEM_TXN_ID: u64 = 0;

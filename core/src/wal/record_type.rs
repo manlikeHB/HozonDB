@@ -31,6 +31,7 @@ pub enum WalRecordType {
     AllocatePage,
 
     Abort, // for transaction roll back
+    Commit,
 
     // Checkpoint
     Checkpoint,
@@ -68,6 +69,7 @@ impl From<WalRecordType> for u8 {
             WalRecordType::AllocatePage => 19,
             WalRecordType::Abort => 20,
             WalRecordType::UpdateIndexRoot => 21,
+            WalRecordType::Commit => 22,
         }
     }
 }
@@ -98,6 +100,7 @@ impl TryFrom<u8> for WalRecordType {
             19 => Ok(WalRecordType::AllocatePage),
             20 => Ok(WalRecordType::Abort),
             21 => Ok(WalRecordType::UpdateIndexRoot),
+            22 => Ok(WalRecordType::Commit),
             other => Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!("Unknown value for WAL record type: {}", other),
@@ -133,6 +136,7 @@ mod tests {
         assert_eq!(WalRecordType::AllocatePage.to_u8(), 19);
         assert_eq!(WalRecordType::Abort.to_u8(), 20);
         assert_eq!(WalRecordType::UpdateIndexRoot.to_u8(), 21);
+        assert_eq!(WalRecordType::Commit.to_u8(), 22);
     }
 
     #[test]
@@ -206,11 +210,12 @@ mod tests {
             WalRecordType::try_from(21).unwrap(),
             WalRecordType::UpdateIndexRoot
         );
+        assert_eq!(WalRecordType::try_from(22).unwrap(), WalRecordType::Commit);
     }
 
     #[test]
     fn test_wal_record_type_conversion_from_unsupported_u8() {
-        for i in 22..255 {
+        for i in 23..255 {
             assert!(WalRecordType::try_from(i).is_err());
         }
     }

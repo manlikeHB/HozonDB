@@ -233,6 +233,16 @@ impl WalWriter {
         Ok(lsn)
     }
 
+    /// Append a Commit transaction WAL record
+    /// returns the LSN
+    pub fn append_commit_txn(&mut self, txn_id: u64) -> io::Result<u64> {
+        let lsn = self.lsn;
+        let mut record = WalRecord::new_commit(lsn, txn_id);
+        self.append(&mut record)?;
+        self.lsn += 1;
+        Ok(lsn)
+    }
+
     // WAL is synced to disk at commit time (group commit) for explicit transactions.
     // Implicit single-statement transactions sync immediately after each operation.
     fn append(&mut self, record: &mut WalRecord) -> io::Result<u64> {

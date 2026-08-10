@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     catalog::index::index_entry::IndexEntry,
-    constants::{self, Lsn},
+    constants::{self, Lsn, SYSTEM_TXN_ID},
     storage::{buffer_pool::BufferPool, page::PAGE_SIZE},
     wal::{record_type::WalRecordType, writer::WalWriter},
 };
@@ -20,7 +20,8 @@ impl IndexCatalog {
         if buffer_pool.total_num_of_db_pages() == 2 {
             // This is only on start up when there no Transactions yet
             // hence 0 (non-valid) txn_id
-            buffer_pool.allocate_raw_page(wal_writer, 0)?;
+            buffer_pool.allocate_raw_page(wal_writer, SYSTEM_TXN_ID)?;
+            wal_writer.append_commit_txn(SYSTEM_TXN_ID)?;
         }
 
         Self::load(buffer_pool)

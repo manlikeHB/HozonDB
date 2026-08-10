@@ -1,5 +1,5 @@
 use crate::catalog::schema::Schema;
-use crate::constants::{self, Lsn, PageId, TxnId};
+use crate::constants::{self, Lsn, PageId, SYSTEM_TXN_ID, TxnId};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::PAGE_SIZE;
 use crate::wal::record_type::WalRecordType;
@@ -39,8 +39,9 @@ impl TableCatalog {
         // If this is a new database (only page 0 exists), allocate page 1 for catalog
         if buffer_pool.total_num_of_db_pages() == 1 {
             // This is only on start up when there no Transactions yet
-            // hence 0 as the txn_id
-            buffer_pool.allocate_raw_page(wal_writer, 0)?;
+            // hence SYSTEM_TXN_ID (0) as the txn_id
+            buffer_pool.allocate_raw_page(wal_writer, SYSTEM_TXN_ID)?;
+            wal_writer.append_commit_txn(SYSTEM_TXN_ID)?;
         }
 
         Self::load(buffer_pool)

@@ -61,14 +61,14 @@ impl Database {
         let mut txn_id = 0;
         let mut wal_reader_opt = None;
 
+        let mut wal_writer = WalWriter::new(db_name)?;
+
         // recover FIRST — before anything reads from buffer pool
         if Path::new(&format!("{}.wal", db_name)).exists() {
             let mut wal_reader = WalReader::new(db_name)?;
-            txn_id = wal_reader.recover(&mut buffer_pool)?;
+            txn_id = wal_reader.recover(&mut buffer_pool, &mut wal_writer)?;
             wal_reader_opt = Some(wal_reader);
         }
-
-        let mut wal_writer = WalWriter::new(db_name)?;
 
         // if no WAL file existed, create a fresh WalReader after WalWriter initializes it
         let wal_reader = match wal_reader_opt {
@@ -552,6 +552,8 @@ impl Database {
                 "No active transaction to commit",
             ));
         }
+
+        self.wal_writer.append_commit_txn(self.cur_txn_id()?)?;
 
         // flush WAL to disk
         self.wal_writer.sync()?;

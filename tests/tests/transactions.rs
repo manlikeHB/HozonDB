@@ -3,6 +3,8 @@ mod common;
 use common::{cleanup, create_executor, row_count, row_values, select_all};
 use hozondb_core::catalog::row::Value;
 use hozondb_core::catalog::schema::{Column, DataType};
+use hozondb_core::sql::database::Database;
+use hozondb_core::sql::executor::Executor;
 use hozondb_core::sql::parser::{BinaryOperator, Expr, SelectColumns, Statement};
 
 #[test]
@@ -602,4 +604,132 @@ fn test_rollback_leaf_insert_without_root_change_invalidates_cache() {
     assert_eq!(row_count(select_all(&mut ex, "users")), 6);
 
     cleanup("txn_rollback_leaf_cache");
+}
+
+#[test]
+fn test_crash_mid_transaction_does_not_persist_uncommitted_writes() {
+    cleanup("txn_crash_mid_txn");
+
+    {
+        let mut ex = create_executor("txn_crash_mid_txn");
+        ex.execute(
+            Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![Column::new("id", DataType::Integer, true)],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        ex.execute(Statement::Begin, &mut None).unwrap();
+        ex.execute(
+            Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1)],
+            },
+            &mut None,
+        )
+        .unwrap();
+        // crash — no COMMIT, no ROLLBACK. Without a Commit WAL record and
+        // recovery treating unresolved transactions as losers, this insert
+        // gets redone on restart as if it had committed.
+    }
+
+    {
+        let mut ex = create_executor("txn_crash_mid_txn");
+        assert_eq!(
+            row_count(select_all(&mut ex, "users")),
+            0,
+            "uncommitted insert survived a crash — recovery redid a transaction \
+             that was never actually committed"
+        );
+    }
+
+    cleanup("txn_crash_mid_txn");
+}
+
+#[test]
+fn test_crash_mid_transaction_undoes_writes_already_flushed_to_disk() {
+    cleanup("txn_crash_evicted");
+
+    {
+        // tiny buffer pool so ordinary page churn forces eviction — this
+        // exercises the case where a loser transaction's own dirty page
+        // gets written to disk (via eviction) before the crash, not just
+        // logged to the WAL. A fix that only *skips redoing* an
+        // uncommitted transaction (instead of actually undoing whatever
+        // made it to disk) will fail this test but still pass the simpler
+        // crash-mid-transaction test.
+        let db = Database::with_capacity("txn_crash_evicted", 4).unwrap();
+        let mut ex = Executor::new(db);
+
+        ex.execute(
+            Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![Column::new("id", DataType::Integer, true)],
+            },
+            &mut None,
+        )
+        .unwrap();
+        ex.execute(
+            Statement::CreateTable {
+                name: "filler".to_string(),
+                columns: vec![
+                    Column::new("id", DataType::Integer, false),
+                    Column::new("data", DataType::Text, false),
+                ],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        ex.execute(Statement::Begin, &mut None).unwrap();
+
+        // the row we actually care about — written first, then never
+        // touched again, so it's the prime eviction candidate once the
+        // buffer pool fills up with the churn below
+        ex.execute(
+            Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec![Value::Integer(1)],
+            },
+            &mut None,
+        )
+        .unwrap();
+
+        // enough page churn on a 4-frame buffer pool to force multiple
+        // eviction cycles, virtually guaranteeing the users row's page
+        // gets evicted — and its dirty bytes written to disk — before
+        // the "crash" below
+        for i in 0..80 {
+            ex.execute(
+                Statement::Insert {
+                    table_name: "filler".to_string(),
+                    values: vec![Value::Integer(i), Value::Text("x".repeat(100))],
+                },
+                &mut None,
+            )
+            .unwrap();
+        }
+
+        // crash — no COMMIT, no ROLLBACK
+    }
+
+    {
+        let mut ex = create_executor("txn_crash_evicted");
+        assert_eq!(
+            row_count(select_all(&mut ex, "users")),
+            0,
+            "uncommitted row survived a crash — its page was flushed to disk via \
+             eviction before the crash, so skipping redo alone isn't enough; \
+             recovery needs to actually undo it"
+        );
+        assert_eq!(
+            row_count(select_all(&mut ex, "filler")),
+            0,
+            "uncommitted filler rows survived a crash"
+        );
+    }
+
+    cleanup("txn_crash_evicted");
 }

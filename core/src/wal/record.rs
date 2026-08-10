@@ -3,8 +3,8 @@ use std::io::{Error, ErrorKind};
 use crate::{
     constants::{
         NONE_U32, NONE_U64, PageId, WAL_RECORD_ABORT_TYPE, WAL_RECORD_ALLOCATE_PAGE_TYPE,
-        WAL_RECORD_CHECKPOINT_TYPE, WAL_RECORD_LINK_PAGE_TYPE, WAL_RECORD_RAW_TYPE,
-        WAL_RECORD_SLOTTED_TYPE,
+        WAL_RECORD_CHECKPOINT_TYPE, WAL_RECORD_COMMIT_TYPE, WAL_RECORD_LINK_PAGE_TYPE,
+        WAL_RECORD_RAW_TYPE, WAL_RECORD_SLOTTED_TYPE,
     },
     storage::page::PageType,
     wal::record_type::WalRecordType,
@@ -55,6 +55,10 @@ pub enum WalRecord {
         prev_offset: Option<u64>, // byte offset of that record in the WAL file
     },
     Abort {
+        lsn: u64,
+        txn_id: u64,
+    },
+    Commit {
         lsn: u64,
         txn_id: u64,
     },
@@ -140,6 +144,10 @@ impl WalRecord {
 
     pub fn new_abort(lsn: u64, txn_id: u64) -> Self {
         WalRecord::Abort { lsn, txn_id }
+    }
+
+    pub fn new_commit(lsn: u64, txn_id: u64) -> Self {
+        WalRecord::Commit { lsn, txn_id }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -311,6 +319,12 @@ impl WalRecord {
             }
             WalRecord::Abort { lsn, txn_id } => {
                 buf.push(WAL_RECORD_ABORT_TYPE);
+                buf.extend_from_slice(&lsn.to_le_bytes());
+                // add txn_id
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+            }
+            WalRecord::Commit { lsn, txn_id } => {
+                buf.push(WAL_RECORD_COMMIT_TYPE);
                 buf.extend_from_slice(&lsn.to_le_bytes());
                 // add txn_id
                 buf.extend_from_slice(&txn_id.to_le_bytes());
@@ -1083,6 +1097,47 @@ impl WalRecord {
                     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
                 (WalRecord::Abort { lsn, txn_id }, stored_checksum)
             }
+            WAL_RECORD_COMMIT_TYPE => {
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for lsn",
+                    ));
+                }
+
+                let lsn = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+
+                if bytes.len() < offset + 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for txn_id",
+                    ));
+                }
+
+                let txn_id = u64::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+                offset += 8;
+
+                if bytes.len() < offset + 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Not enough bytes for stored checksum",
+                    ));
+                }
+
+                let stored_checksum =
+                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                (WalRecord::Commit { lsn, txn_id }, stored_checksum)
+            }
             other => {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
@@ -1112,6 +1167,7 @@ impl WalRecord {
             WalRecord::LinkPage { lsn, .. } => *lsn,
             WalRecord::AllocatePage { lsn, .. } => *lsn,
             WalRecord::Abort { lsn, .. } => *lsn,
+            WalRecord::Commit { lsn, .. } => *lsn,
         }
     }
 
@@ -1188,6 +1244,7 @@ impl WalRecord {
             WalRecord::LinkPage { txn_id, .. } => Some(*txn_id),
             WalRecord::AllocatePage { txn_id, .. } => Some(*txn_id),
             WalRecord::Abort { txn_id, .. } => Some(*txn_id),
+            WalRecord::Commit { txn_id, .. } => Some(*txn_id),
         }
     }
 
@@ -1507,5 +1564,12 @@ mod tests {
         record.set_prev_link(23, 9872);
         assert_eq!(record.prev_lsn().unwrap(), 23);
         assert_eq!(record.prev_offset().unwrap(), 9872);
+    }
+
+    #[test]
+    fn test_wal_record_commit() {
+        let record = WalRecord::new_commit(1, 35);
+        let bytes = record.to_bytes();
+        assert_eq!(WalRecord::from_bytes(&bytes).unwrap(), record);
     }
 }

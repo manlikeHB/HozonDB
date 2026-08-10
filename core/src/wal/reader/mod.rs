@@ -1,15 +1,16 @@
 use crate::{
-    constants::PageId,
+    constants::{Lsn, PageId, TxnId},
     storage::buffer_pool::BufferPool,
     wal::{
         constants::MAGIC_NUMBER,
         reader::{recover::*, undo::*},
         record::WalRecord,
         record_type::WalRecordType,
+        writer::WalWriter,
     },
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, Error, ErrorKind, Read, Seek, SeekFrom},
     path::Path,
@@ -60,14 +61,22 @@ impl WalReader {
         }
     }
 
-    pub fn recover(&mut self, buffer_pool: &mut BufferPool) -> io::Result<u64> {
+    pub fn recover(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        wal_writer: &mut WalWriter,
+    ) -> io::Result<u64> {
         let mut last_txn_id = 0;
 
         // collect all wal records and aborted txn ids
         let mut records = Vec::new();
-        let mut aborted_txns = HashSet::new();
+        let mut aborted_txns = HashMap::new(); // txn_id -> LSN
+        let mut committed_txns = HashSet::new();
+        let mut txn_lsns_and_wal_offsets: HashMap<TxnId, Vec<(Lsn, u64)>> = HashMap::new();
 
         loop {
+            let record_offset = self.file.seek(SeekFrom::Current(0))?;
+
             let mut record_len_bytes = [0u8; 4];
             match self.file.read_exact(&mut record_len_bytes) {
                 Ok(_) => {}
@@ -85,14 +94,23 @@ impl WalReader {
             let record = WalRecord::from_bytes(&record_bytes)?;
 
             match record {
-                WalRecord::Abort { txn_id, .. } => {
-                    aborted_txns.insert(txn_id);
+                WalRecord::Abort { txn_id, lsn } => {
+                    aborted_txns.insert(txn_id, lsn);
+                    continue;
+                }
+                WalRecord::Commit { txn_id, .. } => {
+                    committed_txns.insert(txn_id);
+                    continue;
                 }
                 _ => {}
             }
 
             if let Some(txn_id) = record.txn_id() {
-                last_txn_id = txn_id
+                last_txn_id = txn_id;
+                txn_lsns_and_wal_offsets
+                    .entry(txn_id)
+                    .or_default()
+                    .push((record.lsn(), record_offset));
             }
 
             records.push(record);
@@ -100,13 +118,6 @@ impl WalReader {
 
         // walk the records and re apply changes
         for record in records {
-            // skip records with Aborted txn_id
-            if let Some(txn_id) = record.txn_id() {
-                if aborted_txns.contains(&txn_id) {
-                    continue;
-                }
-            }
-
             match record {
                 WalRecord::Checkpoint { .. } => {}
                 WalRecord::Slotted { record_type, .. } => {
@@ -135,11 +146,32 @@ impl WalReader {
                 } => {
                     recover_allocate_page(page_id, page_type, buffer_pool, lsn)?;
                 }
-                WalRecord::Abort { txn_id, .. } => {
-                    return Err(io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("Abort Wal record type with txn_id:{} not skipped", txn_id),
-                    ));
+                WalRecord::Abort { .. } => {}  // skip abort record
+                WalRecord::Commit { .. } => {} // skip abort record
+            }
+        }
+
+        // undo losers and aborted txns
+        for (txn_id, lsns_and_wal_offsets) in txn_lsns_and_wal_offsets {
+            if committed_txns.contains(&txn_id) {
+                continue;
+            }
+
+            let abort_lsn = if let Some(txn_abort_lsn) = aborted_txns.get(&txn_id) {
+                *txn_abort_lsn
+            } else {
+                // loser txn — no existing Abort record
+                wal_writer.append_abort_txn(txn_id)?
+            };
+
+            for (lsn, wal_offset) in lsns_and_wal_offsets.iter().rev() {
+                // Undo Aborted txn
+                if aborted_txns.contains_key(&txn_id) {
+                    self.undo_record_at(*lsn, *wal_offset, buffer_pool, abort_lsn)?;
+                } else {
+                    // Undo loser Txn
+                    let abort_lsn = wal_writer.append_abort_txn(txn_id)?;
+                    self.undo_record_at(*lsn, *wal_offset, buffer_pool, abort_lsn)?;
                 }
             }
         }
@@ -211,10 +243,12 @@ impl WalReader {
                 _ => undo_raw(&record, buffer_pool, abort_lsn),
             },
 
-            WalRecord::Checkpoint { .. } | WalRecord::Abort { .. } => Err(Error::new(
-                ErrorKind::InvalidData,
-                "attempted to undo a Checkpoint/Abort record — these should never appear in a txn's undo chain",
-            )),
+            WalRecord::Checkpoint { .. } | WalRecord::Abort { .. } | WalRecord::Commit { .. } => {
+                Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "attempted to undo a Checkpoint/Abort/Commit record — these should never appear in a txn's undo chain",
+                ))
+            }
         }
     }
 }
