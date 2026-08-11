@@ -105,6 +105,12 @@ impl<'a> BenchmarkRunner<'a> {
         results.push(self.benchmark_delete_bulk()?);
         results.push(self.benchmark_delete_single()?);
 
+        // WRITE benchmarks — explicit transaction vs no transaction
+        // (isolates the group-commit win: N fsyncs vs 1)
+        let txn_batch_size = self.num_rows / 10;
+        results.push(self.benchmark_insert_n_no_txn(txn_batch_size)?);
+        results.push(self.benchmark_insert_n_explicit_txn(txn_batch_size)?);
+
         Ok(results)
     }
 
@@ -329,6 +335,72 @@ impl<'a> BenchmarkRunner<'a> {
         Ok(BenchmarkResult {
             operation: "INSERT (single row)".to_string(),
             metrics: metrics.unwrap(),
+            rows_affected,
+        })
+    }
+
+    // N separate INSERT statements, each auto-committed on its own —
+    // today's baseline: one fsync per statement.
+    fn benchmark_insert_n_no_txn(&mut self, n: usize) -> io::Result<BenchmarkResult> {
+        let mut metrics = Some(QueryMetrics::new());
+        // offset well clear of every other benchmark's id range
+        let start_id = self.num_rows + 1_000;
+
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            let stmt = Statement::Insert {
+                table_name: self.temp_table_name.clone(),
+                values: vec![
+                    Value::Integer((start_id + i) as i32),
+                    Value::Text("NoTxnUser".to_string()),
+                    Value::Integer(25),
+                ],
+            };
+            let _ = self.executor.execute(stmt, &mut metrics)?;
+        }
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let mut metrics = metrics.unwrap();
+        metrics.duration_ms = elapsed_ms;
+        let rows_affected = metrics.rows_modified;
+
+        Ok(BenchmarkResult {
+            operation: format!("INSERT x{} (no txn)", n),
+            metrics,
+            rows_affected,
+        })
+    }
+
+    // Same N inserts, wrapped in one explicit BEGIN/COMMIT — a single
+    // fsync for the whole batch instead of N.
+    fn benchmark_insert_n_explicit_txn(&mut self, n: usize) -> io::Result<BenchmarkResult> {
+        let mut metrics = Some(QueryMetrics::new());
+        // offset well clear of the no-txn batch above and every other benchmark
+        let start_id = self.num_rows + 2_000 + n;
+
+        let start = std::time::Instant::now();
+        self.executor.execute(Statement::Begin, &mut None)?;
+        for i in 0..n {
+            let stmt = Statement::Insert {
+                table_name: self.temp_table_name.clone(),
+                values: vec![
+                    Value::Integer((start_id + i) as i32),
+                    Value::Text("TxnUser".to_string()),
+                    Value::Integer(25),
+                ],
+            };
+            let _ = self.executor.execute(stmt, &mut metrics)?;
+        }
+        self.executor.execute(Statement::Commit, &mut None)?;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let mut metrics = metrics.unwrap();
+        metrics.duration_ms = elapsed_ms;
+        let rows_affected = metrics.rows_modified;
+
+        Ok(BenchmarkResult {
+            operation: format!("INSERT x{} (explicit txn)", n),
+            metrics,
             rows_affected,
         })
     }
