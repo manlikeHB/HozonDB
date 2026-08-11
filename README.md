@@ -77,10 +77,28 @@ WAL record types:
 - `Checkpoint` — recovery boundary marker
 - `LinkPage` — page chain pointer change
 - `AllocatePage` — page lifecycle
+- `Commit` / `Abort` — transaction boundary markers; recovery uses these to decide which transactions' writes to keep versus undo
 
-On startup, `WalReader` replays records from the last checkpoint. Each record is applied only if the target page's stored LSN is older than the record's LSN — idempotent by design.
+On startup, `WalReader` replays every record from the last checkpoint forward, regardless of which transaction it belongs to — each record is applied only if the target page's stored LSN is older than the record's LSN, idempotent by design. After redo, any transaction that never wrote a `Commit` record — whether it was explicitly rolled back or the process crashed mid-transaction — is undone using the same page-level `old_data` mechanism a live `ROLLBACK` uses.
 
 CRC32 checksum per record detects torn writes. Recovery stops at the last valid record if corruption is detected.
+
+---
+
+## Transactions
+
+`BEGIN` / `COMMIT` / `ROLLBACK` are fully supported. Every statement runs inside a transaction — implicit and auto-committed if no `BEGIN` is open, explicit otherwise.
+
+```sql
+hozondb> BEGIN;
+hozondb> INSERT INTO users VALUES (3, 'Charlie');
+hozondb> ROLLBACK;
+```
+
+- `ROLLBACK` undoes a transaction's writes using the `old_data` captured in each WAL record, walked in reverse.
+- `COMMIT` writes a WAL `Commit` record and fsyncs once for the whole transaction — this is what makes group commit possible (see Benchmark Results below).
+- Crash recovery distinguishes committed transactions from unresolved ones the same way a live rollback does, so a crash between `BEGIN` and `COMMIT` never gets silently replayed as if it had committed.
+- Only one transaction can be open at a time across the whole database — see Known gaps.
 
 ---
 
@@ -90,16 +108,20 @@ CRC32 checksum per record detects torn writes. Recovery stops at the last valid 
 
 | Operation | Duration | BP Hits | Pages Dirtied |
 |---|---|---|---|
-| SELECT full scan | 11.06ms | 66 | — |
+| SELECT full scan | 10.09ms | 66 | — |
 | SELECT idx seek (point lookup) | 0.02ms | 1 | — |
-| INSERT (single row) | 8.52ms | 1 | 1 |
-| UPDATE (fits slot) | 13.02ms | 1 | 1 |
-| UPDATE (exceeds slot) | 29.95ms | 2 | 3 |
-| UPDATE bulk 10% (1000 rows) | 12,227.99ms | 1000 | 8 |
-| DELETE (single row) | 9.89ms | 1 | 1 |
-| DELETE bulk 10% (1000 rows) | 7,740.22ms | 1000 | 8 |
+| INSERT (single row) | 4.23ms | 1 | 1 |
+| UPDATE (fits slot) | 5.06ms | 1 | 1 |
+| UPDATE (exceeds slot) | 5.06ms | 2 | 3 |
+| UPDATE bulk 10% (1000 rows) | 263.94ms | 1000 | 8 |
+| DELETE (single row) | 5.89ms | 1 | 1 |
+| DELETE bulk 10% (1000 rows) | 140.16ms | 1000 | 8 |
+| INSERT x1000, no transaction | 5,027.92ms | 1000 | 7 |
+| INSERT x1000, one explicit transaction | 217.04ms | 1000 | 8 |
 
-The bulk write cost is the price of the durability guarantee — every WAL append is a synchronous fsync to disk. Group commit (batching fsyncs per transaction) is the planned fix once transactions land.
+Group commit landed with transaction support. Every WAL append used to fsync individually, so writes touching many rows paid one fsync per row — the bulk UPDATE and DELETE numbers above dropped ~46x and ~55x from their pre-transaction baselines (12,227.99ms → 263.94ms, 7,740.22ms → 140.16ms) purely from deferring the fsync to the end of the (implicit, single-statement) transaction.
+
+The cleanest isolated comparison is the last two rows: the same 1,000 `INSERT`s, same code path, the only difference is whether they're wrapped in an explicit transaction. Without one, each insert fsyncs on its own — 5,027.92ms. Wrapped in `BEGIN` / `COMMIT`, it's one fsync for the whole batch — 217.04ms, ~23x faster.
 
 ---
 
@@ -115,11 +137,15 @@ The bulk write cost is the price of the durability guarantee — every WAL appen
 - Full SQL CRUD with WHERE filtering and range operators
 - Buffer pool with clock sweep eviction
 - Write-ahead log with physiological logging, CRC32 checksums, and checkpointing
-- Crash recovery via LSN-based redo pass
+- `BEGIN` / `COMMIT` / `ROLLBACK` transactions, with WAL-based undo on rollback
+- Group commit — WAL fsync deferred to transaction commit instead of every write
+- Crash recovery via WAL redo followed by undo of any transaction that never committed
 - gRPC client-server interface (tonic + tokio)
 - `hsql` interactive CLI over gRPC
 
 **Known gaps:**
+- Only one transaction can be open at a time across the whole database. The gRPC server also has no session ownership — the mutex is only held for a single RPC, so a second client's statement issued between another client's `BEGIN` and `COMMIT` can silently land inside that open transaction instead of erroring
+- No isolation levels — no snapshotting or locking; concurrent access has no formal guarantees beyond the single-active-transaction constraint above
 - Dead slot compaction — deleted rows leave dead slots permanently; free space is never reclaimed within a page
 - `DROP TABLE` orphans B+ tree index pages — node pages are never freed, only the catalog entry is removed
 - Single-page catalog limit — table and index catalogs are each limited to 4KB; overflow returns an error
@@ -130,7 +156,7 @@ The bulk write cost is the price of the durability guarantee — every WAL appen
 - `pin_count` in `Frame` exists but is never enforced — safe now (single-threaded), gap when concurrency arrives
 
 **Planned:**
-- `BEGIN` / `COMMIT` / `ROLLBACK` transaction support — unlocks group commit and gives `old_data` in WAL records a purpose (rollback)
+- Concurrent transactions — real isolation levels, and session ownership on the gRPC server (currently one global transaction slot for the whole database)
 - `CREATE INDEX` — explicit index creation on any column
 - Distributed replication (Raft consensus)
 
